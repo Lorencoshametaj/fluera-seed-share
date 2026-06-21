@@ -59,9 +59,13 @@ Deno.serve(async (req: Request): Promise<Response> => {
     });
   }
   if (path.endsWith("/.well-known/assetlinks.json")) {
+    // Comma-separate ANDROID_SHA256 to authorize MULTIPLE signing certs at once
+    // (e.g. release + your debug keystore, so App Links auto-verify on a
+    // `flutter run` build too — not just the Play release).
+    const fingerprints = ANDROID_SHA256.split(",").map((s) => s.trim()).filter(Boolean);
     return json([{
       relation: ["delegate_permission/common.handle_all_urls"],
-      target: { namespace: "android_app", package_name: BUNDLE_ID, sha256_cert_fingerprints: [ANDROID_SHA256] },
+      target: { namespace: "android_app", package_name: BUNDLE_ID, sha256_cert_fingerprints: fingerprints },
     }]);
   }
 
