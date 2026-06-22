@@ -69,6 +69,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }]);
   }
 
+  // ── /s/{hash}/og.png → social card with the LIVE numbers baked into the
+  //    image (additive + best-effort: any failure 302s to the raw thumbnail). ──
+  const ogm = path.match(new RegExp(`/s/(${HASH_RE.source})/og\\.png$`));
+  if (ogm) return await ogImageResponse(ogm[1]);
+
   // ── /s/{hash} (tolerate any function-name prefix Supabase may prepend) ──
   const m = path.match(new RegExp(`/s/(${HASH_RE.source})/?$`));
   if (!m) return Response.redirect(SITE, 302);
@@ -113,6 +118,169 @@ async function fetchTemplate(hash: string): Promise<SeedRow | null> {
 
 const publicUrl = (p: string) => `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${p}`;
 
+// ── OG card image: /s/{hash}/og.png ─────────────────────────────────────────
+// A 1200×630 PNG = the seed's notes thumbnail with the LIVE numbers baked INTO
+// the pixels, so the social proof travels with the image even where the caption
+// is dropped. Rendered at REQUEST time → always-fresh counts. Every heavy dep
+// is DYNAMICALLY imported + memoized INSIDE the handler, so a CDN/runtime
+// failure can only degrade THIS route (it 302-falls back to the raw thumbnail) —
+// never the HTML / deep-link routes, which never touch any of this. resvg (pure
+// WASM, the one verified-deploy-safe choice on Deno Deploy) rasterizes a
+// hand-built SVG; the base PNG is inlined as a data URI (resvg won't fetch
+// remote hrefs); the star is an SVG <path> (resvg has no colour-emoji font).
+const RESVG_MOD_URL = "https://esm.sh/@resvg/resvg-wasm@2.6.2";
+const RESVG_WASM_URL = "https://esm.sh/@resvg/resvg-wasm@2.6.2/index_bg.wasm";
+const OG_FONT_URL =
+  "https://cdn.jsdelivr.net/npm/@vercel/og@0.6.2/dist/noto-sans-v27-latin-regular.ttf";
+
+// deno-lint-ignore no-explicit-any
+let _resvgMod: Promise<any> | null = null;
+let _wasmReady: Promise<unknown> | null = null;
+let _ogFont: Promise<Uint8Array> | null = null;
+
+// Load (once per isolate) the resvg module + WASM + a Latin TTF. Each piece is
+// memoized and RESET on failure so a transient CDN blip can retry; initWasm is
+// idempotent-once, so a double-init across retries is tolerated.
+// deno-lint-ignore no-explicit-any
+async function loadResvg(): Promise<{ Resvg: any; font: Uint8Array }> {
+  const mod = await (_resvgMod ??= import(RESVG_MOD_URL).catch((e) => {
+    _resvgMod = null;
+    throw e;
+  }));
+  _wasmReady ??= Promise.resolve(mod.initWasm(fetch(RESVG_WASM_URL))).catch(
+    (e: unknown) => {
+      if (String(e).includes("Already initialized")) return;
+      _wasmReady = null;
+      throw e;
+    },
+  );
+  await _wasmReady;
+  const font = await (_ogFont ??= fetch(OG_FONT_URL)
+    .then((r) => r.arrayBuffer())
+    .then((b) => new Uint8Array(b))
+    .catch((e) => {
+      _ogFont = null;
+      throw e;
+    }));
+  return { Resvg: mod.Resvg, font };
+}
+
+async function ogImageResponse(hash: string): Promise<Response> {
+  // Resolve the base image first — it doubles as the graceful-fallback target.
+  let baseUrl = OG_FALLBACK;
+  try {
+    const row = await fetchTemplate(hash);
+    if (row) {
+      baseUrl = row.og_path
+        ? publicUrl(row.og_path)
+        : row.thumb_path
+        ? publicUrl(row.thumb_path)
+        : OG_FALLBACK;
+      const png = await buildOgPng(row, baseUrl);
+      return new Response(png, {
+        status: 200,
+        headers: {
+          "Content-Type": "image/png",
+          "Cache-Control": "public, max-age=300, s-maxage=300",
+        },
+      });
+    }
+  } catch (_) {
+    // fall through to the redirect
+  }
+  // Graceful degradation: crawlers follow the 302 to the raw thumbnail, so the
+  // unfurl always has a valid image even when compositing fails. Short cache so
+  // a transient failure is not pinned.
+  return new Response(null, {
+    status: 302,
+    headers: { Location: baseUrl, "Cache-Control": "public, max-age=60" },
+  });
+}
+
+async function buildOgPng(
+  row: SeedRow,
+  baseUrl: string,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const { Resvg, font } = await loadResvg();
+  const imgBytes = new Uint8Array(await (await fetch(baseUrl)).arrayBuffer());
+  const dataUri = `data:${mimeOf(imgBytes)};base64,${toBase64(imgBytes)}`;
+
+  const title = truncate(
+    (row.title ?? "Template di studio").trim() || "Template di studio",
+    30,
+  );
+  const concepts = Math.max(0, row.concept_count ?? 0);
+  const installs = Math.max(0, row.install_count ?? 0);
+  const rating = (row.rating_count ?? 0) > 0
+    ? (row.rating_sum ?? 0) / (row.rating_count ?? 1)
+    : 0;
+  const parts: string[] = [];
+  if (rating > 0) parts.push(rating.toFixed(1));
+  if (installs > 0) {
+    parts.push(`${fmtIt(installs)} student${installs === 1 ? "e" : "i"}`);
+  }
+  if (concepts > 0) parts.push(`${concepts} concett${concepts === 1 ? "o" : "i"}`);
+  const stats = parts.join("     ·     ");
+  const showStar = rating > 0;
+  const statsX = showStar ? 110 : 64;
+  // hand-coded 5-point star (resvg renders only fontBuffers glyphs → no emoji).
+  const star =
+    "M0,-15 L4.4,-4.6 L15,-4.6 L6.3,2.4 L9.3,13 L0,6.9 L-9.3,13 L-6.3,2.4 L-15,-4.6 L-4.4,-4.6 Z";
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="630" viewBox="0 0 1200 630">` +
+    `<defs><linearGradient id="sh" x1="0" y1="0" x2="0" y2="1">` +
+    `<stop offset="0" stop-color="#000" stop-opacity="0.5"/><stop offset="0.28" stop-color="#000" stop-opacity="0"/>` +
+    `<stop offset="0.62" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.82"/>` +
+    `</linearGradient></defs>` +
+    `<image x="0" y="0" width="1200" height="630" preserveAspectRatio="xMidYMid slice" href="${dataUri}" xlink:href="${dataUri}"/>` +
+    `<rect width="1200" height="630" fill="url(#sh)"/>` +
+    `<text x="64" y="104" font-family="Noto Sans" font-size="58" font-weight="700" fill="#ffffff">${esc(title)}</text>` +
+    (showStar
+      ? `<g transform="translate(82,556)"><path d="${star}" fill="#FBBF24"/></g>`
+      : "") +
+    `<text x="${statsX}" y="568" font-family="Noto Sans" font-size="36" fill="#ffffff">${esc(stats)}</text>` +
+    `</svg>`;
+
+  const resvg = new Resvg(svg, {
+    fitTo: { mode: "width", value: 1200 },
+    background: "rgba(0,0,0,0)",
+    font: {
+      fontBuffers: [font],
+      loadSystemFonts: false,
+      defaultFontFamily: "Noto Sans",
+    },
+  });
+  return resvg.render().asPng();
+}
+
+// Base64 a byte array WITHOUT spreading (String.fromCharCode(...big) overflows
+// the call stack) — chunk at 32KiB.
+function toBase64(b: Uint8Array): string {
+  let s = "";
+  const CH = 0x8000;
+  for (let i = 0; i < b.length; i += CH) {
+    s += String.fromCharCode.apply(
+      null,
+      b.subarray(i, i + CH) as unknown as number[],
+    );
+  }
+  return btoa(s);
+}
+// resvg needs the data-URI MIME to match the real bytes or it renders nothing.
+// Our thumbnails are always PNG; JPEG is detected defensively. (resvg can't
+// decode WebP, but the renderer only ever emits PNG, so that path can't occur.)
+function mimeOf(b: Uint8Array): string {
+  if (b[0] === 0xff && b[1] === 0xd8) return "image/jpeg";
+  return "image/png";
+}
+// Italian thousands shorthand: reuse fmt() but comma-decimal ("1,2k").
+function fmtIt(n: number): string {
+  return fmt(n).replace(".", ",");
+}
+function truncate(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s;
+}
+
 // ── Rendering ───────────────────────────────────────────────────────────────
 
 function renderPage(row: SeedRow, hash: string, ogImageUrl: string, platform: "ios" | "android" | "other"): string {
@@ -153,14 +321,14 @@ function renderPage(row: SeedRow, hash: string, ogImageUrl: string, platform: "i
   <meta property="og:url" content="${esc(self)}" />
   <meta property="og:title" content="${esc(title)}" />
   <meta property="og:description" content="${esc(description)}" />
-  <meta property="og:image" content="${esc(ogImageUrl)}" />
+  <meta property="og:image" content="https://share.fluera.dev/s/${hash}/og.png" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
   <meta property="og:image:alt" content="${esc(title)}" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="${esc(title)}" />
   <meta name="twitter:description" content="${esc(description)}" />
-  <meta name="twitter:image" content="${esc(ogImageUrl)}" />
+  <meta name="twitter:image" content="https://share.fluera.dev/s/${hash}/og.png" />
   <meta name="apple-itunes-app" content="app-id=${esc(APPLE_APP_ID || "fluera")}, app-argument=${esc(self)}" />
   <style>
     :root { color-scheme: dark; }
