@@ -50,7 +50,8 @@ interface SeedRow {
 }
 
 Deno.serve(async (req: Request): Promise<Response> => {
-  const path = new URL(req.url).pathname;
+  const reqUrl = new URL(req.url);
+  const path = reqUrl.pathname;
 
   // ── Deep-link verification (App / Universal Links claim share.fluera.dev) ──
   if (path.endsWith("/.well-known/apple-app-site-association")) {
@@ -91,7 +92,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
       ? publicUrl(row.thumb_path)
       : OG_FALLBACK;
   const platform = classify(req.headers.get("user-agent") ?? "");
-  return html(200, renderPage(row, hash, ogImageUrl, platform));
+  // C1: attribution is an OPTIONAL "?ref={referralCode}" query param. Read it
+  // here and forward it into every store/app-open URL so an install attributes
+  // back to the sharer. Sanitize (alnum + a few safe chars) to keep referrer
+  // payloads clean and avoid open-redirect/HTML-injection surprises.
+  const ref = sanitizeRef(reqUrl.searchParams.get("ref"));
+  return html(200, renderPage(row, hash, ogImageUrl, platform, ref));
 });
 
 // ── Supabase ────────────────────────────────────────────────────────────────
@@ -283,28 +289,61 @@ function truncate(s: string, n: number): string {
 
 // ── Rendering ───────────────────────────────────────────────────────────────
 
-function renderPage(row: SeedRow, hash: string, ogImageUrl: string, platform: "ios" | "android" | "other"): string {
-  const self = `https://share.fluera.dev/s/${hash}`;
+function renderPage(
+  row: SeedRow,
+  hash: string,
+  ogImageUrl: string,
+  platform: "ios" | "android" | "other",
+  ref: string,
+): string {
+  // C1: canonical share link carries the OPTIONAL "?ref={code}" so the app's
+  // Universal/App-Link open + any onward reshare keep the attribution chain.
+  const self = `https://share.fluera.dev/s/${hash}${ref ? `?ref=${encodeURIComponent(ref)}` : ""}`;
   const title = (row.title ?? "Template di studio").trim() || "Template di studio";
   const author = row.is_official ? "Fluera" : row.author_code ? `@${row.author_code.slice(0, 8)}` : "Anonimo";
   const concepts = Math.max(0, row.concept_count ?? 0);
   const installs = Math.max(0, row.install_count ?? 0);
   const rating = (row.rating_count ?? 0) > 0 ? (row.rating_sum ?? 0) / (row.rating_count ?? 1) : 0;
-  const description = (row.description ?? "").trim() ||
-    `Un template di studio${row.discipline ? ` di ${row.discipline}` : ""} con ${concepts} concett${concepts === 1 ? "o" : "i"}. Installalo in Fluera e parte un ripasso programmato — il trapianto cognitivo nel tuo modello di studio.`;
+  const ratingN = Math.max(0, row.rating_count ?? 0);
 
-  const playUrl = `https://play.google.com/store/apps/details?id=${BUNDLE_ID}&referrer=${encodeURIComponent(`s=${hash}`)}`;
-  const iosUrl = APPLE_APP_ID ? `https://apps.apple.com/app/id${APPLE_APP_ID}#s=${hash}` : SITE;
-  // Mobile primary CTA = this same https URL: the app intercepts it (Universal /
-  // App Link on share.fluera.dev) when installed; otherwise the browser reloads
-  // this page and the store buttons are the fallback.
-  const primaryHref = platform === "other" ? SITE : self;
+  // SOCIAL PROOF in the unfurl: crawlers render og:title / og:description but
+  // NOT the chips below — so the live counts must be folded INTO those tags or
+  // they never reach the chat-preview card. Build a compact proof prefix
+  // (e.g. "★4.8 · 12k installazioni · 5 concetti") and prepend it.
+  const proofParts = [
+    rating > 0 ? `★${rating.toFixed(1)}${ratingN > 0 ? ` (${fmt(ratingN)})` : ""}` : "",
+    installs > 0 ? `${fmt(installs)} student${installs === 1 ? "e" : "i"}` : "",
+    concepts > 0 ? `${concepts} concett${concepts === 1 ? "o" : "i"}` : "",
+  ].filter(Boolean);
+  const proof = proofParts.join(" · ");
+
+  const baseDescription = (row.description ?? "").trim() ||
+    `Un template di studio${row.discipline ? ` di ${row.discipline}` : ""} con ${concepts} concett${concepts === 1 ? "o" : "i"}. Installalo in Fluera e parte un ripasso programmato — il trapianto cognitivo nel tuo modello di studio.`;
+  // og:* / twitter:* SOCIAL-PROOF-augmented strings (the card). On-page <title>
+  // and the visible <p class="desc"> stay clean (chips already show the proof).
+  const ogTitle = proof ? `${title} · ${proof}` : title;
+  const ogDescription = proof ? `${proof} — ${baseDescription}` : baseDescription;
+
+  // C1 ref forwarding: thread "ref" into BOTH the Play Store referrer payload
+  // and the iOS app-argument / fragment so the install attributes to the sharer.
+  const referrer = `s=${hash}${ref ? `&ref=${ref}` : ""}`;
+  const playUrl = `https://play.google.com/store/apps/details?id=${BUNDLE_ID}&referrer=${encodeURIComponent(referrer)}`;
+  const iosFrag = `s=${hash}${ref ? `&ref=${encodeURIComponent(ref)}` : ""}`;
+  const iosUrl = APPLE_APP_ID ? `https://apps.apple.com/app/id${APPLE_APP_ID}#${iosFrag}` : SITE;
+  // COLD-MOBILE CTA: on mobile the primary button used to point at `self` (this
+  // page) — when the app is NOT installed the Universal/App Link silently fails
+  // and the browser just reloads the page (a dead CTA). Now mobile's primary
+  // href is the platform STORE (carrying seed + ref), and a tiny JS fallback
+  // (below) first tries to open the app and, if still here after ~700ms, sends
+  // the visitor to that store. Desktop/other keeps the marketing site.
+  const storeHref = platform === "ios" ? iosUrl : playUrl;
+  const primaryHref = platform === "other" ? SITE : storeHref;
   const primaryLabel = platform === "other" ? "Scopri Fluera" : "Apri in Fluera";
 
   const chips = [
     row.discipline ? chip(row.discipline) : "",
     concepts > 0 ? chip(`${concepts} concetti`) : "",
-    installs > 0 ? chip(`${fmt(installs)} installazioni`) : "",
+    installs > 0 ? chip(`${fmt(installs)} student${installs === 1 ? "e" : "i"}`) : "",
     rating > 0 ? chip(`★ ${rating.toFixed(1)}`) : "",
   ].join("");
 
@@ -314,20 +353,20 @@ function renderPage(row: SeedRow, hash: string, ogImageUrl: string, platform: "i
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${esc(title)} · Fluera</title>
-  <meta name="description" content="${esc(description)}" />
+  <meta name="description" content="${esc(ogDescription)}" />
   <link rel="canonical" href="${esc(self)}" />
   <meta property="og:type" content="article" />
   <meta property="og:site_name" content="Fluera" />
   <meta property="og:url" content="${esc(self)}" />
-  <meta property="og:title" content="${esc(title)}" />
-  <meta property="og:description" content="${esc(description)}" />
+  <meta property="og:title" content="${esc(ogTitle)}" />
+  <meta property="og:description" content="${esc(ogDescription)}" />
   <meta property="og:image" content="https://share.fluera.dev/s/${hash}/og.png" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
   <meta property="og:image:alt" content="${esc(title)}" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="${esc(title)}" />
-  <meta name="twitter:description" content="${esc(description)}" />
+  <meta name="twitter:title" content="${esc(ogTitle)}" />
+  <meta name="twitter:description" content="${esc(ogDescription)}" />
   <meta name="twitter:image" content="https://share.fluera.dev/s/${hash}/og.png" />
   <meta name="apple-itunes-app" content="app-id=${esc(APPLE_APP_ID || "fluera")}, app-argument=${esc(self)}" />
   <style>
@@ -358,14 +397,40 @@ function renderPage(row: SeedRow, hash: string, ogImageUrl: string, platform: "i
     <h1>${esc(title)}</h1>
     <p class="by">di ${esc(author)}</p>
     ${chips ? `<div class="chips">${chips}</div>` : ""}
-    <p class="desc">${esc(description)}</p>
+    <p class="desc">${esc(baseDescription)}</p>
     <div class="cta">
-      <a class="btn primary" href="${esc(primaryHref)}">${esc(primaryLabel)}</a>
+      <a class="btn primary" id="cta" href="${esc(primaryHref)}">${esc(primaryLabel)}</a>
       <a class="btn ghost" href="${esc(playUrl)}">Google Play</a>
       ${APPLE_APP_ID ? `<a class="btn ghost" href="${esc(iosUrl)}">App Store</a>` : ""}
     </div>
     <p class="note">Installando in Fluera, i concetti di questo template vengono trapiantati nel tuo modello di studio — con un ripasso programmato per domani.</p>
-  </div>
+  </div>${
+    platform === "other"
+      ? ""
+      : `
+  <script>
+    // COLD-MOBILE CTA fallback: when the app is installed, tapping the primary
+    // button is intercepted by the Universal/App Link (share.fluera.dev/s/…)
+    // and this page unloads before the timer fires. When NOT installed the app
+    // open is a no-op, so after ~700ms we send the visitor to the platform
+    // store (which already carries the seed hash + ref attribution).
+    (function () {
+      var cta = document.getElementById("cta");
+      if (!cta) return;
+      var appLink = ${JSON.stringify(self)};
+      var store = ${JSON.stringify(storeHref)};
+      cta.addEventListener("click", function (e) {
+        e.preventDefault();
+        var t = setTimeout(function () { window.location.replace(store); }, 700);
+        var cancel = function () {
+          if (document.hidden) clearTimeout(t);
+        };
+        document.addEventListener("visibilitychange", cancel, { once: true });
+        window.location.href = appLink;
+      });
+    })();
+  </script>`
+  }
 </body>
 </html>`;
 }
@@ -382,6 +447,13 @@ function classify(ua: string): "ios" | "android" | "other" {
   if (/iphone|ipad|ipod/i.test(ua)) return "ios";
   if (/android/i.test(ua)) return "android";
   return "other";
+}
+// C1: attribution referral code. Keep only URL/referrer-safe chars and cap the
+// length — the value flows into the Play referrer payload and app-open URLs.
+function sanitizeRef(raw: string | null): string {
+  if (!raw) return "";
+  const cleaned = raw.replace(/[^A-Za-z0-9._~-]/g, "");
+  return cleaned.slice(0, 64);
 }
 function fmt(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
