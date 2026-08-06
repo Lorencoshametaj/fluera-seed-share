@@ -9,6 +9,12 @@
 //       so the per-template og:* tags MUST be server-rendered — this is why a
 //       static host (fluera.dev is GitHub Pages) can't do it and we need a
 //       serverless runtime. We already have Supabase → a Deno Edge Function.
+//   • GET /i/{code}                              → the referral redirect (M3):
+//       the end-card/QR link burned into every shared time-lapse. UA-sniffs to
+//       the right store carrying the code in the Play install referrer. Lives
+//       HERE (not on fluera.dev) for the same reason as /s: GitHub Pages is
+//       static — the old Vercel api/i.ts was never deployable on it, so every
+//       shipped QR pointed at a 404 until this route existed.
 //   • GET /.well-known/apple-app-site-association → iOS Universal Links claim
 //   • GET /.well-known/assetlinks.json            → Android App Links claim
 //
@@ -22,6 +28,9 @@
 //   SUPABASE_URL + SUPABASE_ANON_KEY are injected automatically.
 // ============================================================================
 
+// Import STATICO: dev'essere risolto al build, non a runtime (vedi loadResvg).
+import { initWasm, Resvg } from "https://esm.sh/@resvg/resvg-wasm@2.6.2";
+
 const BUCKET = "public-study-seeds";
 const SITE = "https://fluera.dev";
 const BUNDLE_ID = Deno.env.get("ANDROID_PACKAGE") ?? "com.fluera.fluera";
@@ -31,6 +40,9 @@ const ANDROID_SHA256 = Deno.env.get("ANDROID_SHA256") ??
   "EB:AD:BC:7F:CB:BA:F4:A6:B7:B5:62:8B:50:92:50:F8:28:B7:9D:A3:0B:76:92:BC:61:B7:81:FD:C6:4C:EE:C2";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
+// Auto-injected in Supabase Edge Functions; used ONLY by the anon report POST
+// handler to call the service-role-only file_takedown_notice RPC.
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 const OG_FALLBACK = `${SITE}/og/default.png`;
 const HASH_RE = /[A-Za-z0-9]{8,64}/;
 
@@ -55,8 +67,13 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
   // ── Deep-link verification (App / Universal Links claim share.fluera.dev) ──
   if (path.endsWith("/.well-known/apple-app-site-association")) {
+    // /u/* = creator pages: the app produces share.fluera.dev/u/{author_code}
+    // links (creator_profile_screen) and handles them in-app (creatorCodeOf) —
+    // claiming them here is what makes an installed app open them at all. A
+    // server-rendered /u page for NON-installed visitors is a follow-up; until
+    // then those visitors fall through to the marketing-site redirect below.
     return json({
-      applinks: { apps: [], details: [{ appID: `${APPLE_TEAM_ID}.${BUNDLE_ID}`, paths: ["/s/*"] }] },
+      applinks: { apps: [], details: [{ appID: `${APPLE_TEAM_ID}.${BUNDLE_ID}`, paths: ["/s/*", "/i/*", "/u/*"] }] },
     });
   }
   if (path.endsWith("/.well-known/assetlinks.json")) {
@@ -68,6 +85,54 @@ Deno.serve(async (req: Request): Promise<Response> => {
       relation: ["delegate_permission/common.handle_all_urls"],
       target: { namespace: "android_app", package_name: BUNDLE_ID, sha256_cert_fingerprints: fingerprints },
     }]);
+  }
+
+  // ── /i/{code} → UA-sniffed store redirect carrying the referral code ───────
+  // The end-card/QR hop of the referral loop (M3). Android is the ONE platform
+  // with a real deferred channel: the Play `&referrer=` payload survives the
+  // store round-trip and reaches the freshly-installed app via the Install
+  // Referrer API (`code=<code>`, optionally `&seed=<id>` so the installer lands
+  // into the watched template — the app parses both this format and the
+  // `s=…&ref=…` one the /s page emits). iOS has no referrer: with APPLE_APP_ID
+  // set we send the store (code rides only the QR-direct path), else the
+  // marketing site. Desktop → the site with `?i={code}` for a "open on your
+  // phone" re-encode. The click is logged fire-and-forget into referral_clicks
+  // (migration 131, service-role-only writes) — the mouth of the k-funnel.
+  const rim = path.match(/\/i\/([A-Za-z0-9]{4,16})\/?$/);
+  if (rim) {
+    const code = rim[1];
+    const seed = sanitizeRef(reqUrl.searchParams.get("seed"));
+    const platform = classify(req.headers.get("user-agent") ?? "");
+    logReferralClick(req, code, platform);
+    let target: string;
+    if (platform === "android") {
+      const referrer = `code=${code}${seed ? `&seed=${seed}` : ""}`;
+      target = `https://play.google.com/store/apps/details?id=${BUNDLE_ID}&referrer=${encodeURIComponent(referrer)}`;
+    } else if (platform === "ios" && APPLE_APP_ID) {
+      // No reliable iOS referrer; the fragment is a best-effort marker only.
+      target = `https://apps.apple.com/app/id${APPLE_APP_ID}#i=${code}`;
+    } else {
+      target = `${SITE}/?i=${encodeURIComponent(code)}`;
+    }
+    // 302 (not 301): the target is per-UA and must never be cached.
+    return new Response(null, {
+      status: 302,
+      headers: { Location: target, "Cache-Control": "no-store" },
+    });
+  }
+
+  // ── /report (public, no-login DSA Art.16 / DMCA takedown intake) ───────────
+  // A report channel linked from every /s/{hash} page. GET renders a minimal
+  // self-contained form (the seed hash is carried in the query); POST validates,
+  // rate-limits, and forwards the notice to the SERVICE-ROLE RPC
+  // file_takedown_notice — the ONLY database write an anonymous reporter can
+  // make. SECURITY: add a CAPTCHA (hCaptcha / Cloudflare Turnstile) here BEFORE
+  // any heavy public exposure — the in-memory per-IP limiter below is a floor
+  // (per-isolate, resets on cold start), not a real abuse defense.
+  if (/\/report\/?$/.test(path)) {
+    if (req.method === "POST") return await handleReportPost(req);
+    const qHash = (reqUrl.searchParams.get("hash") ?? "").trim().toLowerCase();
+    return html(200, reportForm(REPORT_HASH_RE.test(qHash) ? qHash : ""));
   }
 
   // ── /s/{hash}/og.png → social card with the LIVE numbers baked into the
@@ -134,26 +199,29 @@ const publicUrl = (p: string) => `${SUPABASE_URL}/storage/v1/object/public/${BUC
 // WASM, the one verified-deploy-safe choice on Deno Deploy) rasterizes a
 // hand-built SVG; the base PNG is inlined as a data URI (resvg won't fetch
 // remote hrefs); the star is an SVG <path> (resvg has no colour-emoji font).
-const RESVG_MOD_URL = "https://esm.sh/@resvg/resvg-wasm@2.6.2";
 const RESVG_WASM_URL = "https://esm.sh/@resvg/resvg-wasm@2.6.2/index_bg.wasm";
 const OG_FONT_URL =
   "https://cdn.jsdelivr.net/npm/@vercel/og@0.6.2/dist/noto-sans-v27-latin-regular.ttf";
 
-// deno-lint-ignore no-explicit-any
-let _resvgMod: Promise<any> | null = null;
 let _wasmReady: Promise<unknown> | null = null;
 let _ogFont: Promise<Uint8Array> | null = null;
 
-// Load (once per isolate) the resvg module + WASM + a Latin TTF. Each piece is
-// memoized and RESET on failure so a transient CDN blip can retry; initWasm is
-// idempotent-once, so a double-init across retries is tolerated.
-// deno-lint-ignore no-explicit-any
-async function loadResvg(): Promise<{ Resvg: any; font: Uint8Array }> {
-  const mod = await (_resvgMod ??= import(RESVG_MOD_URL).catch((e) => {
-    _resvgMod = null;
-    throw e;
-  }));
-  _wasmReady ??= Promise.resolve(mod.initWasm(fetch(RESVG_WASM_URL))).catch(
+// Load (once per isolate) the WASM + a Latin TTF. Memoized and RESET on failure
+// so a transient CDN blip can retry; initWasm is idempotent-once, so a
+// double-init across retries is tolerated.
+//
+// ⚠️ Il MODULO si importa STATICAMENTE in cima al file, non con `import()` a
+// runtime. Prima era dinamico, per isolare un guasto del CDN a questa sola
+// route — ma la piattaforma Deno Deploy **compila al deploy**, e uno specifier
+// remoto importato a runtime non entra nel grafo compilato: falliva SEMPRE, e
+// il `catch` di `ogImageResponse` lo trasformava in un 302 silenzioso verso la
+// miniatura nuda. Risultato misurato il 2026-08-05: og.png non ha mai composto
+// nulla, e la prova sociale non è mai finita dentro l'immagine.
+// Import statico = se il CDN è giù il DEPLOY fallisce, forte e subito, invece
+// di degradare per mesi senza che nessuno lo sappia.
+// WASM e font restano `fetch` a runtime: sono dati, non moduli.
+async function loadResvg(): Promise<{ Resvg: typeof Resvg; font: Uint8Array }> {
+  _wasmReady ??= Promise.resolve(initWasm(fetch(RESVG_WASM_URL))).catch(
     (e: unknown) => {
       if (String(e).includes("Already initialized")) return;
       _wasmReady = null;
@@ -168,7 +236,7 @@ async function loadResvg(): Promise<{ Resvg: any; font: Uint8Array }> {
       _ogFont = null;
       throw e;
     }));
-  return { Resvg: mod.Resvg, font };
+  return { Resvg, font };
 }
 
 async function ogImageResponse(hash: string): Promise<Response> {
@@ -191,8 +259,12 @@ async function ogImageResponse(hash: string): Promise<Response> {
         },
       });
     }
-  } catch (_) {
-    // fall through to the redirect
+  } catch (e) {
+    // Il 302 qui sotto è una degradazione VOLUTA (l'unfurl ha sempre
+    // un'immagine valida), ma senza questa riga è indistinguibile dal
+    // funzionamento normale: è così che la composizione è rimasta rotta senza
+    // che nessuno lo sapesse. Ora un fallback lascia una traccia.
+    console.error(`og.png compositing failed for ${hash}: ${e}`);
   }
   // Graceful degradation: crawlers follow the 302 to the raw thumbnail, so the
   // unfurl always has a valid image even when compositing fails. Short cache so
@@ -203,6 +275,11 @@ async function ogImageResponse(hash: string): Promise<Response> {
   });
 }
 
+// `asPng()` di resvg dichiara `Uint8Array<ArrayBufferLike>`, che NON è un
+// `BodyInit` valido per `Response` (potrebbe essere su SharedArrayBuffer). Si
+// ricopia in un Uint8Array su ArrayBuffer: una copia da poche centinaia di KB,
+// irrilevante. Finché il modulo era importato dinamicamente il tipo era `any` e
+// niente di tutto questo si vedeva — l'import statico l'ha fatto emergere.
 async function buildOgPng(
   row: SeedRow,
   baseUrl: string,
@@ -256,7 +333,7 @@ async function buildOgPng(
       defaultFontFamily: "Noto Sans",
     },
   });
-  return resvg.render().asPng();
+  return new Uint8Array(resvg.render().asPng());
 }
 
 // Base64 a byte array WITHOUT spreading (String.fromCharCode(...big) overflows
@@ -330,14 +407,27 @@ function renderPage(
   const playUrl = `https://play.google.com/store/apps/details?id=${BUNDLE_ID}&referrer=${encodeURIComponent(referrer)}`;
   const iosFrag = `s=${hash}${ref ? `&ref=${encodeURIComponent(ref)}` : ""}`;
   const iosUrl = APPLE_APP_ID ? `https://apps.apple.com/app/id${APPLE_APP_ID}#${iosFrag}` : SITE;
-  // COLD-MOBILE CTA: on mobile the primary button used to point at `self` (this
-  // page) — when the app is NOT installed the Universal/App Link silently fails
-  // and the browser just reloads the page (a dead CTA). Now mobile's primary
-  // href is the platform STORE (carrying seed + ref), and a tiny JS fallback
-  // (below) first tries to open the app and, if still here after ~700ms, sends
-  // the visitor to that store. Desktop/other keeps the marketing site.
-  const storeHref = platform === "ios" ? iosUrl : playUrl;
-  const primaryHref = platform === "other" ? SITE : storeHref;
+  // COLD-MOBILE CTA. A same-URL "try the app first" JS hop can never work
+  // from this page: on Android navigating to the page's own URL just RELOADS
+  // it (the new document commits in <700ms on any decent network, killing the
+  // store-fallback timer — a CTA that reloads the page instead of converting),
+  // and iOS Universal Links deliberately do not trigger on same-domain
+  // navigation. So, no JS:
+  //   • Android → a Chrome `intent://` URL: opens the app when installed
+  //     (delivering this exact /s URL, ref included), else the browser follows
+  //     S.browser_fallback_url to the Play page (which carries seed + ref in
+  //     the install referrer). Handled natively by Chrome & friends.
+  //   • iOS → the App Store directly (the apple-itunes-app Smart App Banner
+  //     above covers the installed-app case); marketing site if no store id.
+  //   • Desktop/other → the marketing site.
+  const androidIntent = `intent://share.fluera.dev/s/${hash}${
+    ref ? `?ref=${encodeURIComponent(ref)}` : ""
+  }#Intent;scheme=https;package=${BUNDLE_ID};S.browser_fallback_url=${encodeURIComponent(playUrl)};end`;
+  const primaryHref = platform === "android"
+    ? androidIntent
+    : platform === "ios"
+      ? iosUrl
+      : SITE;
   const primaryLabel = platform === "other" ? "Scopri Fluera" : "Apri in Fluera";
 
   const chips = [
@@ -387,6 +477,8 @@ function renderPage(
     .btn.primary { background:#6366f1; color:#fff; }
     .btn.ghost { background:#ffffff0f; color:#f4f4f5; border:1px solid #ffffff1f; }
     .note { color:#71717a; font-size:13px; text-align:center; margin-top:18px; }
+    .report { text-align:center; margin-top:22px; }
+    .report a { color:#71717a; font-size:13px; }
     a { color:inherit; }
   </style>
 </head>
@@ -399,38 +491,13 @@ function renderPage(
     ${chips ? `<div class="chips">${chips}</div>` : ""}
     <p class="desc">${esc(baseDescription)}</p>
     <div class="cta">
-      <a class="btn primary" id="cta" href="${esc(primaryHref)}">${esc(primaryLabel)}</a>
+      <a class="btn primary" href="${esc(primaryHref)}">${esc(primaryLabel)}</a>
       <a class="btn ghost" href="${esc(playUrl)}">Google Play</a>
       ${APPLE_APP_ID ? `<a class="btn ghost" href="${esc(iosUrl)}">App Store</a>` : ""}
     </div>
     <p class="note">Installando in Fluera, i concetti di questo template vengono trapiantati nel tuo modello di studio — con un ripasso programmato per domani.</p>
-  </div>${
-    platform === "other"
-      ? ""
-      : `
-  <script>
-    // COLD-MOBILE CTA fallback: when the app is installed, tapping the primary
-    // button is intercepted by the Universal/App Link (share.fluera.dev/s/…)
-    // and this page unloads before the timer fires. When NOT installed the app
-    // open is a no-op, so after ~700ms we send the visitor to the platform
-    // store (which already carries the seed hash + ref attribution).
-    (function () {
-      var cta = document.getElementById("cta");
-      if (!cta) return;
-      var appLink = ${JSON.stringify(self)};
-      var store = ${JSON.stringify(storeHref)};
-      cta.addEventListener("click", function (e) {
-        e.preventDefault();
-        var t = setTimeout(function () { window.location.replace(store); }, 700);
-        var cancel = function () {
-          if (document.hidden) clearTimeout(t);
-        };
-        document.addEventListener("visibilitychange", cancel, { once: true });
-        window.location.href = appLink;
-      });
-    })();
-  </script>`
-  }
+    <p class="report"><a href="https://share.fluera.dev/report?hash=${esc(hash)}">Segnala questo contenuto</a></p>
+  </div>
 </body>
 </html>`;
 }
@@ -439,6 +506,255 @@ const chip = (s: string) => `<span class="chip">${esc(s)}</span>`;
 
 function statusPage(headline: string, body: string): string {
   return `<!doctype html><html lang="it"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="robots" content="noindex" /><title>${esc(headline)} · Fluera</title><style>body{margin:0;background:#0a0a0b;color:#f4f4f5;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center}div{max-width:420px;padding:24px}h1{font-size:22px;margin:0 0 8px}p{color:#a1a1aa;margin:0 0 20px}a{color:#818cf8}</style></head><body><div><h1>${esc(headline)}</h1><p>${esc(body)}</p><a href="${SITE}">Vai a Fluera →</a></div></body></html>`;
+}
+
+// ── Public report channel (DSA Art.16 / DMCA) ────────────────────────────────
+// Anonymous, no-login takedown intake reachable from every share page. Kept
+// fully self-contained (inline HTML/CSS, no imports) and dark-themed to match
+// the share surface. NOTE: gate this with a CAPTCHA (hCaptcha / Cloudflare
+// Turnstile) before heavy public exposure — the rate-limit below is only a
+// per-isolate floor.
+
+const REPORT_HASH_RE = /^[a-f0-9]{8,64}$/;
+// Reason taxonomy (value → visible IT label). Mirrors the seed_takedown_notices
+// reason set; a 'copyright' report maps to notice_type 'dmca', everything else
+// to 'illegal_content'.
+const REPORT_REASONS: ReadonlyArray<[string, string]> = [
+  ["child-safety", "Sicurezza dei minori (CSAM / adescamento)"],
+  ["sexual", "Contenuto sessuale o esplicito"],
+  ["violence", "Violenza o incitamento alla violenza"],
+  ["hate", "Incitamento all'odio"],
+  ["copyright", "Violazione di copyright (DMCA)"],
+  ["pii", "Dati personali / violazione della privacy"],
+  ["spam", "Spam o truffa"],
+  ["other", "Altro"],
+];
+const REPORT_REASON_SET = new Set(REPORT_REASONS.map(([v]) => v));
+
+// Basic per-IP, per-isolate rate limit. This is a FLOOR only (resets on cold
+// start, isolate-local); it is NOT a substitute for a CAPTCHA.
+const REPORT_RL_MAX = 6;
+const REPORT_RL_WINDOW_MS = 10 * 60 * 1000;
+const _reportHits = new Map<string, number[]>();
+
+function reportRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const recent = (_reportHits.get(ip) ?? []).filter((t) => now - t < REPORT_RL_WINDOW_MS);
+  recent.push(now);
+  _reportHits.set(ip, recent);
+  // Opportunistic cleanup so a busy isolate can't grow the map unbounded.
+  if (_reportHits.size > 5000) {
+    for (const [k, v] of _reportHits) {
+      if (v.every((t) => now - t >= REPORT_RL_WINDOW_MS)) _reportHits.delete(k);
+    }
+  }
+  return recent.length > REPORT_RL_MAX;
+}
+
+function clientIp(req: Request): string {
+  const xff = req.headers.get("x-forwarded-for") ?? "";
+  const first = xff.split(",")[0].trim();
+  return first || req.headers.get("x-real-ip") || "unknown";
+}
+
+async function handleReportPost(req: Request): Promise<Response> {
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch {
+    return html(400, statusPage("Segnalazione non valida", "Modulo non leggibile. Riprova."));
+  }
+  const hash = String(form.get("hash") ?? "").trim().toLowerCase();
+  const reason = String(form.get("reason") ?? "").trim();
+  const email = String(form.get("email") ?? "").trim();
+  const detail = String(form.get("detail") ?? "").trim();
+
+  // Rate-limit FIRST — before any validation — so malformed / spam POSTs are
+  // throttled too (a spammer can't dodge the limiter by sending an invalid
+  // reason and getting a cheap 400 before the limiter runs).
+  if (reportRateLimited(clientIp(req))) {
+    return html(429, statusPage("Troppe segnalazioni", "Troppe segnalazioni da questa rete. Riprova tra qualche minuto."));
+  }
+
+  // hash + reason are mandatory; contact + detail are optional (anonymous
+  // reports are allowed under DSA Art.16). The RPC re-validates + hard-caps.
+  if (!REPORT_HASH_RE.test(hash)) {
+    return html(400, statusPage("Segnalazione non valida", "Il riferimento del contenuto non è valido."));
+  }
+  if (!REPORT_REASON_SET.has(reason)) {
+    return html(400, reportForm(hash, "Seleziona un motivo valido per la segnalazione."));
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    return html(500, statusPage("Errore", "Server non configurato."));
+  }
+  const ok = await fileTakedownNotice(
+    hash,
+    reason,
+    email ? email.slice(0, 320) : null,
+    detail ? detail.slice(0, 5000) : null,
+  );
+  if (!ok) {
+    return html(502, statusPage("Invio non riuscito", "Si è verificato un problema tecnico. Riprova tra poco."));
+  }
+  return html(
+    200,
+    statusPage(
+      "Grazie, abbiamo ricevuto la tua segnalazione",
+      "Il nostro team la esaminerà al più presto. Se hai lasciato un contatto, potremmo scriverti per aggiornamenti.",
+    ),
+  );
+}
+
+// The anonymous POST touches the DB ONLY through this validated service-role
+// RPC. Mirrors fetchTemplate's raw-REST style (this function deliberately avoids
+// the supabase-js dependency): a POST to /rest/v1/rpc/<fn> IS an rpc() call.
+async function fileTakedownNotice(
+  hash: string,
+  reason: string,
+  email: string | null,
+  detail: string | null,
+): Promise<boolean> {
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/file_takedown_notice`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        p_hash: hash,
+        p_channel: "share_page",
+        p_notice_type: reason === "copyright" ? "dmca" : "illegal_content",
+        p_reason: reason,
+        p_reporter_contact: email,
+        p_body: detail,
+      }),
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+
+function reportForm(hash: string, error?: string): string {
+  const options = REPORT_REASONS
+    .map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`)
+    .join("");
+  return `<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>Segnala un contenuto · Fluera</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:#0a0a0b; color:#f4f4f5; font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+    .wrap { max-width:560px; margin:0 auto; padding:32px 20px 64px; }
+    .brand { display:flex; align-items:center; gap:8px; font-weight:600; color:#a1a1aa; margin-bottom:20px; }
+    h1 { font-size:24px; line-height:1.25; margin:0 0 8px; }
+    p.lead { color:#a1a1aa; margin:0 0 24px; }
+    label { display:block; font-size:14px; font-weight:600; margin:18px 0 6px; }
+    select, input, textarea { width:100%; background:#18181b; color:#f4f4f5; border:1px solid #ffffff1f; border-radius:12px; padding:12px 13px; font:inherit; }
+    textarea { min-height:120px; resize:vertical; }
+    .hint { color:#71717a; font-size:12px; margin:6px 0 0; }
+    .err { background:#7f1d1d; color:#fecaca; border:1px solid #ffffff1f; border-radius:12px; padding:12px 14px; margin:0 0 18px; font-size:14px; }
+    .btn { display:block; width:100%; margin-top:26px; background:#6366f1; color:#fff; border:none; font-weight:600; padding:15px 18px; border-radius:14px; font:inherit; cursor:pointer; }
+    .foot { color:#71717a; font-size:12px; margin-top:20px; }
+    a { color:#818cf8; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">🌱 Fluera · Segnalazione</div>
+    <h1>Segnala questo contenuto</h1>
+    <p class="lead">Puoi segnalare un template di studio anche senza account. La segnalazione è anonima, salvo che tu non lasci un contatto.</p>
+    ${error ? `<div class="err">${esc(error)}</div>` : ""}
+    <form method="post">
+      <input type="hidden" name="hash" value="${esc(hash)}" />
+      <label for="reason">Motivo</label>
+      <select id="reason" name="reason" required>
+        <option value="" disabled selected>Seleziona un motivo…</option>
+        ${options}
+      </select>
+      <label for="email">Email di contatto (facoltativa)</label>
+      <input id="email" name="email" type="email" maxlength="320" autocomplete="email" placeholder="tu@esempio.com" />
+      <p class="hint">Lasciala se vuoi ricevere aggiornamenti sull'esito. Non è obbligatoria.</p>
+      <label for="detail">Dettagli</label>
+      <textarea id="detail" name="detail" maxlength="5000" placeholder="Descrivi il problema (facoltativo ma utile)."></textarea>
+      <button class="btn" type="submit">Invia segnalazione</button>
+    </form>
+    <p class="foot">Le segnalazioni sono esaminate dal team di moderazione. Per richieste legali (DMCA / 17 U.S.C. §512) o reclami ai sensi del DSA puoi anche scrivere a abuse@fluera.dev.</p>
+  </div>
+</body>
+</html>`;
+}
+
+// ── referral click log ───────────────────────────────────────────────────────
+// Fire-and-forget INSERT into referral_clicks (migration 131 — service-role
+// writes only, no anon path: the telemetry_events allowlist would silently
+// reject an unlisted event type, and log_telemetry_event is authenticated-only,
+// which is exactly why the old Vercel api/i.ts click log could never have
+// worked). Registered with EdgeRuntime.waitUntil when available so the write
+// survives the 302 being returned; must NEVER delay or fail the redirect.
+//
+// Signal hygiene at the mouth of the funnel:
+//   • link PREVIEWERS (WhatsApp/Telegram/Discord/…) and crawlers fetch every
+//     pasted /i URL — logging them would inflate clicks the moment a link is
+//     shared, before any human taps. UA-filtered out (they identify honestly).
+//   • a per-IP, per-isolate rate limit (a FLOOR, same caveat as /report's)
+//     keeps a curl loop from growing the table unbounded / pumping a code's
+//     numbers for free.
+//   • failures are logged to the function console, NOT swallowed: deploying
+//     this function BEFORE migration 131 would otherwise read as "zero
+//     clicks" for weeks (the PGRST202-class silent failure this repo already
+//     lived through once).
+const BOT_UA_RE =
+  /bot|crawl|spider|preview|facebookexternalhit|whatsapp|telegram|slack|discord|twitter|linkedin|pinterest|vkshare|curl|wget|python-requests|okhttp\/|headless/i;
+const CLICK_RL_MAX = 30;
+const CLICK_RL_WINDOW_MS = 10 * 60 * 1000;
+const _clickHits = new Map<string, number[]>();
+
+function clickRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const recent = (_clickHits.get(ip) ?? []).filter((t) => now - t < CLICK_RL_WINDOW_MS);
+  recent.push(now);
+  _clickHits.set(ip, recent);
+  if (_clickHits.size > 5000) {
+    for (const [k, v] of _clickHits) {
+      if (v.every((t) => now - t >= CLICK_RL_WINDOW_MS)) _clickHits.delete(k);
+    }
+  }
+  return recent.length > CLICK_RL_MAX;
+}
+
+function logReferralClick(req: Request, code: string, platform: string): void {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return;
+  const ua = req.headers.get("user-agent") ?? "";
+  if (req.method !== "GET" || BOT_UA_RE.test(ua)) return;
+  if (clickRateLimited(clientIp(req))) return;
+  const p = fetch(`${SUPABASE_URL}/rest/v1/referral_clicks`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({ code, platform }),
+  }).then((resp) => {
+    if (!resp.ok) {
+      console.error(`referral_clicks insert failed: HTTP ${resp.status} (migration 131 deployed?)`);
+    }
+  }).catch((e) => {
+    console.error(`referral_clicks insert error: ${e}`);
+  });
+  // deno-lint-ignore no-explicit-any
+  const er = (globalThis as any).EdgeRuntime;
+  if (er && typeof er.waitUntil === "function") er.waitUntil(p);
 }
 
 // ── utils ─────────────────────────────────────────────────────────────────────

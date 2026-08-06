@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/denoland/deno/main/cli/schemas/config-file.v1.json",
+  "deploy": {
+    "org": "lorencoshametaj",
+    "app": "fluera-seed-share",
+    "runtime": {
+      "mode": "dynamic",
+      "entrypoint": "index.ts"
+    }
+  }
+}
