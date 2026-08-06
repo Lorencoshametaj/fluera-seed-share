@@ -242,21 +242,21 @@ async function sitemapResponse(): Promise<Response> {
     return new Response("sitemap unavailable", { status: 503 });
   }
   try {
-    const q = new URLSearchParams({
-      select: "hash,updated_at",
-      is_official: "eq.true",
-      revoked_at: "is.null",
-      order: "updated_at.desc",
-      limit: String(SITEMAP_LIMIT),
-    });
+    // Via RPC, non con una SELECT sulla tabella: in produzione la lettura
+    // diretta risponde `42501 permission denied` con la chiave anon (misurato
+    // il 2026-08-06). L'RPC `list_official_seed_urls` (migration 135) espone
+    // SOLO hash + updated_at dei pack ufficiali pubblicamente visibili.
     const resp = await fetch(
-      `${SUPABASE_URL}/rest/v1/public_study_seeds?${q}`,
+      `${SUPABASE_URL}/rest/v1/rpc/list_official_seed_urls`,
       {
+        method: "POST",
         headers: {
           apikey: SUPABASE_ANON_KEY,
           Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          "Content-Type": "application/json",
           Accept: "application/json",
         },
+        body: JSON.stringify({ p_limit: SITEMAP_LIMIT }),
       },
     );
     if (!resp.ok) throw new Error(`REST ${resp.status}`);
