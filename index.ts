@@ -87,6 +87,46 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }]);
   }
 
+  // ── /robots.txt + /sitemap.xml → rendere TROVABILI le pagine template ──────
+  // Ogni `/s/{hash}` è già una pagina server-rendered con og:* e canonical, ma
+  // finora nessun motore poteva scoprirla: niente sitemap, niente robots, e
+  // nessun link in entrata. Il "long-tail SEO evergreen" dei design doc non è
+  // mai esistito — le pagine c'erano, irraggiungibili.
+  //
+  // La sitemap si genera dal catalogo, quindi ogni pack pubblicato entra da
+  // solo: nessun passo manuale, nessun file da rigenerare.
+  //
+  // 🔒 COSA si indicizza: solo i pack UFFICIALI/curati. La query gira con la
+  // chiave ANON, quindi la RLS (`047`: approved OR curated, revoked_at NULL) è
+  // già un filtro — ma non basta come politica: indicizzare l'UGC significa
+  // dare visibilità sui motori a contenuti caricati dagli utenti, che è una
+  // decisione di moderazione, non di SEO. Finché il marketplace è curated-first
+  // si indicizza solo ciò di cui rispondiamo noi.
+  if (/\/robots\.txt$/.test(path)) {
+    return new Response(
+      [
+        "User-agent: *",
+        "Allow: /s/",
+        // `/i/` è un redirect verso gli store e `/u/` non ha ancora una pagina
+        // server per i non-installati: entrambi sprecherebbero crawl budget.
+        "Disallow: /i/",
+        "Disallow: /u/",
+        "Disallow: /report",
+        "",
+        "Sitemap: https://share.fluera.dev/sitemap.xml",
+        "",
+      ].join("\n"),
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "public, max-age=3600",
+        },
+      },
+    );
+  }
+  if (/\/sitemap\.xml$/.test(path)) return await sitemapResponse();
+
   // ── /i/{code} → UA-sniffed store redirect carrying the referral code ───────
   // The end-card/QR hop of the referral loop (M3). Android is the ONE platform
   // with a real deferred channel: the Play `&referrer=` payload survives the
@@ -188,6 +228,65 @@ async function fetchTemplate(hash: string): Promise<SeedRow | null> {
 }
 
 const publicUrl = (p: string) => `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${p}`;
+
+// ── sitemap ──────────────────────────────────────────────────────────────────
+// Elenca i pack ufficiali/curati leggendoli con la chiave ANON: quello che la
+// RLS non lascia vedere non finisce nella sitemap, per costruzione. Un guasto
+// non deve mai restituire una sitemap VUOTA spacciata per valida — un urlset
+// senza URL dice al motore «non ho niente», e deindicizza. Quindi su errore si
+// risponde 503: il crawler ritenta, non conclude.
+const SITEMAP_LIMIT = 5000;
+
+async function sitemapResponse(): Promise<Response> {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    return new Response("sitemap unavailable", { status: 503 });
+  }
+  try {
+    const q = new URLSearchParams({
+      select: "hash,updated_at",
+      is_official: "eq.true",
+      revoked_at: "is.null",
+      order: "updated_at.desc",
+      limit: String(SITEMAP_LIMIT),
+    });
+    const resp = await fetch(
+      `${SUPABASE_URL}/rest/v1/public_study_seeds?${q}`,
+      {
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          Accept: "application/json",
+        },
+      },
+    );
+    if (!resp.ok) throw new Error(`REST ${resp.status}`);
+    const rows = (await resp.json()) as Array<
+      { hash: string; updated_at: string | null }
+    >;
+    const urls = rows
+      .filter((r) => HASH_RE.test(r.hash))
+      .map((r) => {
+        const lastmod = r.updated_at
+          ? `\n    <lastmod>${esc(r.updated_at.slice(0, 10))}</lastmod>`
+          : "";
+        return `  <url>\n    <loc>https://share.fluera.dev/s/${esc(r.hash)}</loc>${lastmod}\n  </url>`;
+      })
+      .join("\n");
+    return new Response(
+      `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>\n`,
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "application/xml; charset=utf-8",
+          "Cache-Control": "public, max-age=600, s-maxage=3600",
+        },
+      },
+    );
+  } catch (e) {
+    console.error(`sitemap failed: ${e}`);
+    return new Response("sitemap unavailable", { status: 503 });
+  }
+}
 
 // ── OG card image: /s/{hash}/og.png ─────────────────────────────────────────
 // A 1200×630 PNG = the seed's notes thumbnail with the LIVE numbers baked INTO
