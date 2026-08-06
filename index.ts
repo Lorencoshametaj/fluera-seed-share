@@ -72,8 +72,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
     // claiming them here is what makes an installed app open them at all. A
     // server-rendered /u page for NON-installed visitors is a follow-up; until
     // then those visitors fall through to the marketing-site redirect below.
+    // /collab/* = inviti a una sessione dal vivo. A differenza di /c/ (che si
+    // GUARDA e basta, quindi rivendicarlo faceva solo rimbalzare l'utente), qui
+    // l'app è l'unico posto dove l'invito ha senso: rivendicarlo evita che chi
+    // ce l'ha già passi dalla pagina di consegna.
     return json({
-      applinks: { apps: [], details: [{ appID: `${APPLE_TEAM_ID}.${BUNDLE_ID}`, paths: ["/s/*", "/i/*", "/u/*"] }] },
+      applinks: { apps: [], details: [{ appID: `${APPLE_TEAM_ID}.${BUNDLE_ID}`, paths: ["/s/*", "/i/*", "/u/*", "/collab/*"] }] },
     });
   }
   if (path.endsWith("/.well-known/assetlinks.json")) {
@@ -115,6 +119,10 @@ Deno.serve(async (req: Request): Promise<Response> => {
         // `/i/` è un redirect verso gli store e `/u/` non ha ancora una pagina
         // server per i non-installati: entrambi sprecherebbero crawl budget.
         "Disallow: /i/",
+        // `/collab/` sono stanze PRIVATE fra due persone. Un roomId finito in
+        // un motore di ricerca è un invito aperto a chiunque: qui il Disallow
+        // non è crawl budget, è la porta chiusa.
+        "Disallow: /collab/",
         "Disallow: /get",
         "Disallow: /u/",
         "Disallow: /report",
@@ -166,6 +174,71 @@ Deno.serve(async (req: Request): Promise<Response> => {
       bumpGhostView(cm[1]);
     }
     return html(200, renderGhostPage(share, cm[1]));
+  }
+
+  // ── /collab/{roomId} → invito a una sessione P2P dal vivo ──────────────────
+  // L'INVITO PIÙ FORTE CHE L'APP SAPPIA PRODURRE, e fino a oggi inconsegnabile.
+  // L'unica implementazione in produzione (`p2p_connector.dart`) emetteva
+  // `fluera://collab/{roomId}`: uno schema custom, che molti messenger non
+  // rendono nemmeno toccabile e che, toccato senza l'app, fallisce e basta.
+  // `createUniversalLink` — la funzione che produce l'https — aveva un test
+  // verde e ZERO chiamanti. Nessuna route esisteva da nessuna parte, e l'AASA
+  // di iOS rivendicava `/collab/*` su fluera.dev, che risponde 404.
+  //
+  // PERCHÉ QUESTO ANELLO VALE PIÙ DEGLI ALTRI: è l'unico artefatto il cui
+  // valore non si può avere senza installare. Un seed si screenshotta, un
+  // time-lapse si guarda e si dimentica; una tela condivisa in tempo reale
+  // richiede l'app da entrambe le parti, e la chiede nel momento di massima
+  // intenzione — «stiamo studiando adesso».
+  //
+  // CHI VEDE QUESTA PAGINA: quasi nessuno di chi ha già l'app. Il manifest
+  // rivendica `/collab/` con autoVerify, quindi su Android l'app si apre
+  // direttamente e la pagina non viene mai caricata; su iOS lo stesso via AASA.
+  // Resta chi l'app non ce l'ha — ed è esattamente il pubblico da convertire.
+  //
+  // IL CASO CHE L'HTTPS DA SOLO NON COPRE: i browser interni di Instagram,
+  // Facebook e (a volte) WhatsApp non onorano gli App Links. Chi HA l'app e
+  // apre l'invito lì dentro atterra comunque qui. Per loro il bottone «Apri
+  // nell'app» punta allo schema custom, che in quel contesto funziona: i due
+  // meccanismi si coprono a vicenda invece di escludersi.
+  //
+  // ONESTÀ SULLA DURATA: una stanza P2P è effimera e il server non ne sa
+  // NULLA (il segnale passa da Supabase Realtime, non da qui). Non possiamo
+  // dire se la sessione è ancora aperta, quindi la pagina non lo promette —
+  // dichiararlo è più utile che far scoprire il vuoto dopo l'installazione.
+  // DUE FORME sulla stessa route, di proposito:
+  //   • /collab/{roomId}                  → sessione P2P dal vivo (effimera)
+  //   • /collab/{canvasId}?token=…&role=… → invito su una tela salvata (CRDT)
+  // Al server non serve distinguerle: non sa nulla né della stanza né della
+  // tela, e in entrambi i casi il suo lavoro è consegnare la persona all'app.
+  // L'app le distingue da sola — c'è un token o non c'è.
+  //
+  // ⚠️ LA QUERY VA INOLTRATA INTATTA nel link «apri nell'app». Il token È
+  // l'invito: perderlo produce la peggiore delle uscite, un link che apre
+  // l'app e non concede niente, indistinguibile da un difetto dell'app.
+  // L'id qui accetta anche `-` e `_` perché un canvas id non è un room id di
+  // 8 caratteri: è un identificatore lungo, spesso un UUID.
+  const colm = path.match(/\/collab\/([A-Za-z0-9_-]{4,64})\/?$/);
+  if (colm) {
+    const platform = classify(req.headers.get("user-agent") ?? "");
+    const androidLive = (Deno.env.get("ANDROID_STORE_LIVE") ?? "") === "true";
+    const store = platform === "android" && androidLive
+      ? `https://play.google.com/store/apps/details?id=${BUNDLE_ID}`
+      : platform === "ios" && APPLE_APP_ID
+      ? `https://apps.apple.com/app/id${APPLE_APP_ID}`
+      : `${SITE}/beta`;
+    // Solo i parametri del contratto d'invito, ri-serializzati: rimbalzare la
+    // query grezza dentro un href significherebbe far scrivere a un estraneo
+    // dentro l'attributo di un tag.
+    const invite = new URLSearchParams();
+    for (const k of ["token", "role", "inviter"]) {
+      const v = reqUrl.searchParams.get(k);
+      if (v && /^[A-Za-z0-9_-]{1,128}$/.test(v)) invite.set(k, v);
+    }
+    return html(
+      200,
+      renderCollabPage(colm[1], store, platform, invite.toString()),
+    );
   }
 
   // ── /get → «portami l'app», senza attribuzione ─────────────────────────────
@@ -277,11 +350,19 @@ Deno.serve(async (req: Request): Promise<Response> => {
   const row = await fetchTemplate(hash);
   if (!row) return html(410, statusPage("Non più disponibile", "Questo template è stato rimosso o non è più pubblico."));
 
+  // L'ultimo ramo era `OG_FALLBACK`, cioè il banner marketing generico: chi
+  // apriva il link vedeva un'immagine di repertorio identica per ogni template.
+  // Il render dal vivo di `/s/{hash}/og.png` — quello che il crawler riceve già
+  // oggi per `og:image` — almeno ci stampa sopra il titolo e i numeri veri.
+  // ⚠️ Non è la vera riparazione: i pack curati pubblicati senza `--thumb` non
+  // hanno miniatura in storage, e il posto dove sistemarlo è la pubblicazione,
+  // non questa pagina. Il percorso dell'app ne carica una (`_study_seed.dart`),
+  // quindi i seed degli utenti non passano mai di qui.
   const ogImageUrl = row.og_path
     ? publicUrl(row.og_path)
     : row.thumb_path
       ? publicUrl(row.thumb_path)
-      : OG_FALLBACK;
+      : `https://share.fluera.dev/s/${hash}/og.png`;
   const platform = classify(req.headers.get("user-agent") ?? "");
   // C1: attribution is an OPTIONAL "?ref={referralCode}" query param. Read it
   // here and forward it into every store/app-open URL so an install attributes
@@ -418,6 +499,112 @@ function renderGhostPage(row: GhostShareRow, hash: string): string {
     <h1>${esc(title)}</h1>
     <p class="desc">${esc(desc)}</p>
     <p class="foot">Fatta con <a href="${SITE}">Fluera</a> — il learning canvas che ti ri-studia.</p>
+  </div>
+</body>
+</html>`;
+}
+
+// ── Pagina di consegna di un invito alla collaborazione ──────────────────────
+// Il server non sa NULLA della stanza: la sessione è P2P e il segnale passa da
+// Supabase Realtime, non da qui. Quindi questa pagina non può — e non deve —
+// promettere che la sessione sia ancora aperta. Dice cosa sta per succedere e
+// dà due strade, senza fingere di sapere quale funzionerà.
+//
+// Le meta og:* NON sono decorazione: sono metà del motivo per cui l'https batte
+// lo schema custom. Un `fluera://collab/x9k2` incollato in chat resta testo
+// grigio; questo link diventa una scheda con un titolo che spiega cos'è. Il
+// destinatario capisce l'invito PRIMA di decidere se toccarlo.
+//
+// noindex: le stanze sono private. Non c'è nulla da indicizzare e un roomId in
+// un motore di ricerca sarebbe un invito aperto a chiunque.
+function renderCollabPage(
+  roomId: string,
+  storeUrl: string,
+  platform: "android" | "ios" | "other",
+  inviteQuery: string,
+): string {
+  // Il canonical NON riporta la query: il token è un segreto, e un canonical
+  // che lo contenesse lo consegnerebbe a qualunque strumento legga l'HTML.
+  const self = `https://share.fluera.dev/collab/${roomId}`;
+  const isCanvasInvite = inviteQuery.length > 0;
+  const title = "Ti hanno invitato a studiare insieme";
+  const desc = isCanvasInvite
+    ? "Un quaderno condiviso su Fluera: si scrive sullo stesso foglio, ognuno dal proprio dispositivo."
+    : "Una tela condivisa su Fluera: due persone che scrivono sullo stesso foglio, in tempo reale.";
+  // Lo schema custom sopravvive per UNA ragione precisa: i browser interni di
+  // Instagram/Facebook non onorano gli App Links, quindi chi HA l'app e apre
+  // l'invito lì dentro atterra qui invece che nell'app. Per loro questo
+  // bottone è l'unica via, ed è anche l'unico contesto in cui `fluera://`
+  // funziona meglio dell'https.
+  const appUrl = `fluera://collab/${roomId}${
+    isCanvasInvite ? `?${inviteQuery}` : ""
+  }`;
+  const installLabel = platform === "other"
+    ? "Non ce l'hai? Scopri Fluera"
+    : "Non ce l'hai? Installa Fluera";
+  // Un invito su tela salvata aspetta: si può installare l'app, fare l'accesso
+  // e riaprire il link entro la scadenza. Una stanza P2P no — vive solo finché
+  // l'altro tiene aperta la tela, e prometterlo sarebbe una bugia.
+  const durationNote = isCanvasInvite
+    ? "L'invito scade: se lo apri più tardi, chiedi un link nuovo a chi te l'ha mandato."
+    : "La sessione è dal vivo: l'invito vale finché chi ti ha invitato tiene aperta la tela.";
+
+  return `<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <!-- Il token dell'invito vive nell'URL. Senza questo, ogni clic sul bottone
+       dello store lo spedirebbe a Google/Apple nell'header Referer — e i
+       riferimenti finiscono nei log di terzi, dove non si revocano. -->
+  <meta name="referrer" content="no-referrer" />
+  <title>${esc(title)} · Fluera</title>
+  <meta name="description" content="${esc(desc)}" />
+  <link rel="canonical" href="${esc(self)}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="Fluera" />
+  <meta property="og:url" content="${esc(self)}" />
+  <meta property="og:title" content="${esc(title)}" />
+  <meta property="og:description" content="${esc(desc)}" />
+  <meta property="og:image" content="${esc(OG_FALLBACK)}" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${esc(title)}" />
+  <meta name="twitter:description" content="${esc(desc)}" />
+  <meta name="twitter:image" content="${esc(OG_FALLBACK)}" />
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:#0a0a0b; color:#f4f4f5; font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+    .wrap { max-width:520px; margin:0 auto; padding:56px 20px 64px; text-align:center; }
+    .brand { display:flex; align-items:center; justify-content:center; gap:8px; font-weight:600; color:#a1a1aa; margin-bottom:32px; }
+    h1 { font-size:26px; line-height:1.25; margin:0 0 10px; }
+    p.desc { color:#d4d4d8; margin:0 0 8px; }
+    .room { display:inline-block; font:600 14px/1 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.12em; color:#a5b4fc; background:#ffffff0d; border:1px solid #ffffff14; border-radius:999px; padding:9px 16px; margin:14px 0 30px; }
+    .cta { display:block; padding:15px 20px; border-radius:14px; font-weight:600; text-decoration:none; margin-bottom:12px; }
+    .primary { background:#6366f1; color:#fff; }
+    .secondary { background:#ffffff0d; border:1px solid #ffffff1f; color:#e4e4e7; }
+    .note { color:#71717a; font-size:13px; margin-top:26px; }
+    .foot { color:#52525b; font-size:12px; margin-top:34px; }
+    .foot a { color:#818cf8; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">✍️ Fluera</div>
+    <h1>${esc(title)}</h1>
+    <p class="desc">${esc(desc)}</p>
+    ${
+    isCanvasInvite
+      ? ""
+      : `<div class="room">STANZA ${esc(roomId.toUpperCase())}</div>`
+  }
+    <a class="cta primary" href="${esc(appUrl)}">Apri in Fluera</a>
+    <a class="cta secondary" href="${esc(storeUrl)}">${esc(installLabel)}</a>
+    <p class="note">${esc(durationNote)}</p>
+    <p class="foot">Con <a href="${SITE}">Fluera</a> — il learning canvas che ti ri-studia.</p>
   </div>
 </body>
 </html>`;
