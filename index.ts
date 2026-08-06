@@ -107,9 +107,15 @@ Deno.serve(async (req: Request): Promise<Response> => {
       [
         "User-agent: *",
         "Allow: /s/",
+        // `/c/` sono Ghost Map di studenti: contenuto personale, non catalogo.
+        // Si aprono a chi ha il link, non si danno ai motori di ricerca — è la
+        // stessa distinzione fra pubblicare e rendere trovabile che vale per
+        // l'UGC nella sitemap.
+        "Disallow: /c/",
         // `/i/` è un redirect verso gli store e `/u/` non ha ancora una pagina
         // server per i non-installati: entrambi sprecherebbero crawl budget.
         "Disallow: /i/",
+        "Disallow: /get",
         "Disallow: /u/",
         "Disallow: /report",
         "",
@@ -126,6 +132,76 @@ Deno.serve(async (req: Request): Promise<Response> => {
     );
   }
   if (/\/sitemap\.xml$/.test(path)) return await sitemapResponse();
+
+  // ── /c/{hash} → la Ghost Map pubblica ──────────────────────────────────────
+  // L'app produce questi link da una UI viva (ShareGhostMapSheet) da mesi, e
+  // non esisteva NESSUN viewer: né su fluera.dev (statico) né qui. Ogni link
+  // condiviso era un 404 — e su Android peggio, perché la verifica App Links è
+  // per-host: il link apriva l'app, che poi rimbalzava l'utente nel browser
+  // sul 404.
+  //
+  // La pagina è volutamente più semplice di `/s`: una Ghost Map non è un
+  // artefatto da installare, è qualcosa da GUARDARE. Niente CTA verso lo store
+  // come azione primaria — l'immagine è il contenuto, il link all'app è un
+  // invito discreto in fondo.
+  const cm = path.match(new RegExp(`/c/(${HASH_RE.source})/?$`));
+  if (cm) {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      return html(500, statusPage("Errore", "Server non configurato."));
+    }
+    const share = await fetchGhostShare(cm[1]);
+    if (!share) {
+      return html(
+        410,
+        statusPage(
+          "Non più disponibile",
+          "Questa mappa è stata rimossa o non è più pubblica.",
+        ),
+      );
+    }
+    // Il conteggio si incrementa solo per i VISITATORI, non per i crawler che
+    // fanno l'unfurl: chi condivide deve leggere visite, non lavoro di bot.
+    // (Un'anteprima incollata in una chat di gruppo genera N fetch di bot.)
+    if (!BOT_UA_RE.test(req.headers.get("user-agent") ?? "")) {
+      bumpGhostView(cm[1]);
+    }
+    return html(200, renderGhostPage(share, cm[1]));
+  }
+
+  // ── /get → «portami l'app», senza attribuzione ─────────────────────────────
+  // Fallback dei QR e dei link condivisi quando NON esiste un codice creator
+  // (nessuna sessione, o RPC non disponibile). Prima era `https://fluera.dev`:
+  // la homepage di marketing, cioè un vicolo cieco — chi scansionava non
+  // trovava né l'app né lo store, e il QR sembrava funzionare.
+  //
+  // ⚠️ IL MOTIVO PER CUI QUESTA ROUTE ESISTE non è «una pagina più adatta»:
+  // è che **un QR bruciato nei pixel è permanente**. Vive in video già
+  // pubblicati e in immagini già mandate, e non lo si può più correggere.
+  // Quindi non deve MAI puntare a una destinazione finale, ma a un
+  // reindirizzatore che possiamo cambiare da qui. Il giorno che lo store
+  // apre, ogni QR mai stampato comincia a funzionare senza ristampare niente.
+  //
+  // ONESTÀ SULLO STATO REALE: mandare allo store mentre l'app è in internal
+  // testing porta a un 404 di Play — peggio della homepage, perché sembra che
+  // l'app non esista. Finché `ANDROID_STORE_LIVE` non è "true" si atterra su
+  // /beta, che è la verità corrente: «puoi chiedere l'accesso». Alla apertura
+  // dello store si cambia UNA variabile d'ambiente, non il codice.
+  //
+  // Nessun referrer: non c'è nulla da attribuire, e inventare un'attribuzione
+  // falsa sarebbe peggio di non averne.
+  if (/\/get\/?$/.test(path)) {
+    const platform = classify(req.headers.get("user-agent") ?? "");
+    const androidLive = (Deno.env.get("ANDROID_STORE_LIVE") ?? "") === "true";
+    const target = platform === "android" && androidLive
+      ? `https://play.google.com/store/apps/details?id=${BUNDLE_ID}`
+      : platform === "ios" && APPLE_APP_ID
+      ? `https://apps.apple.com/app/id${APPLE_APP_ID}`
+      : `${SITE}/beta`;
+    return new Response(null, {
+      status: 302,
+      headers: { Location: target, "Cache-Control": "no-store" },
+    });
+  }
 
   // ── /i/{code} → UA-sniffed store redirect carrying the referral code ───────
   // The end-card/QR hop of the referral loop (M3). Android is the ONE platform
@@ -144,15 +220,25 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const seed = sanitizeRef(reqUrl.searchParams.get("seed"));
     const platform = classify(req.headers.get("user-agent") ?? "");
     logReferralClick(req, code, platform);
+    // ⚠️ Stesso gate di `/get`: mandare allo store mentre l'app è in internal
+    // testing produce un 404 di Play, cioè un QR che dichiara «questa app non
+    // esiste». Finché `ANDROID_STORE_LIVE` non è "true" si atterra su /beta.
+    // L'attribuzione NON si perde: il click è già stato scritto in
+    // `referral_clicks` con il code (riga sopra), quindi la bocca del funnel
+    // resta misurata anche quando l'installazione è impossibile — sapremo chi
+    // ha portato scansioni durante la beta chiusa.
+    const androidLive = (Deno.env.get("ANDROID_STORE_LIVE") ?? "") === "true";
     let target: string;
-    if (platform === "android") {
+    if (platform === "android" && androidLive) {
       const referrer = `code=${code}${seed ? `&seed=${seed}` : ""}`;
       target = `https://play.google.com/store/apps/details?id=${BUNDLE_ID}&referrer=${encodeURIComponent(referrer)}`;
     } else if (platform === "ios" && APPLE_APP_ID) {
       // No reliable iOS referrer; the fragment is a best-effort marker only.
       target = `https://apps.apple.com/app/id${APPLE_APP_ID}#i=${code}`;
-    } else {
+    } else if (platform === "other") {
       target = `${SITE}/?i=${encodeURIComponent(code)}`;
+    } else {
+      target = `${SITE}/beta`;
     }
     // 302 (not 301): the target is per-UA and must never be cached.
     return new Response(null, {
@@ -228,6 +314,114 @@ async function fetchTemplate(hash: string): Promise<SeedRow | null> {
 }
 
 const publicUrl = (p: string) => `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${p}`;
+
+// ── Ghost Map pubblica ───────────────────────────────────────────────────────
+const GHOST_BUCKET = "public-ghost-shares";
+const ghostUrl = (p: string) =>
+  `${SUPABASE_URL}/storage/v1/object/public/${GHOST_BUCKET}/${p}`;
+
+interface GhostShareRow {
+  hash: string;
+  png_path: string;
+  og_path: string;
+  summary_redacted: boolean | null;
+  created_at: string | null;
+  view_count: number | null;
+}
+
+async function fetchGhostShare(hash: string): Promise<GhostShareRow | null> {
+  try {
+    const resp = await fetch(
+      `${SUPABASE_URL}/rest/v1/rpc/get_public_ghost_share`,
+      {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ p_hash: hash }),
+      },
+    );
+    if (!resp.ok) return null;
+    const rows = (await resp.json()) as GhostShareRow[];
+    return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+/// Incremento fire-and-forget: non deve mai ritardare la pagina.
+function bumpGhostView(hash: string): void {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return;
+  const p = fetch(`${SUPABASE_URL}/rest/v1/rpc/bump_ghost_share_view`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ p_hash: hash }),
+  }).then(() => undefined).catch(() => undefined);
+  // deno-lint-ignore no-explicit-any
+  const er = (globalThis as any).EdgeRuntime;
+  if (er && typeof er.waitUntil === "function") er.waitUntil(p);
+}
+
+function renderGhostPage(row: GhostShareRow, hash: string): string {
+  const self = `https://share.fluera.dev/c/${hash}`;
+  const img = row.og_path ? ghostUrl(row.og_path) : OG_FALLBACK;
+  const full = row.png_path ? ghostUrl(row.png_path) : img;
+  const title = "Una mappa di cosa manca";
+  const desc = row.summary_redacted === false
+    ? "Una Ghost Map di Fluera: cosa è capito, cosa manca, e i collegamenti fra i concetti."
+    : "Una Ghost Map di Fluera: la forma di quello che serve ancora studiare. I titoli sono oscurati.";
+
+  return `<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${esc(title)} · Fluera</title>
+  <meta name="description" content="${esc(desc)}" />
+  <link rel="canonical" href="${esc(self)}" />
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="Fluera" />
+  <meta property="og:url" content="${esc(self)}" />
+  <meta property="og:title" content="${esc(title)}" />
+  <meta property="og:description" content="${esc(desc)}" />
+  <meta property="og:image" content="${esc(img)}" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${esc(title)}" />
+  <meta name="twitter:description" content="${esc(desc)}" />
+  <meta name="twitter:image" content="${esc(img)}" />
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:#0a0a0b; color:#f4f4f5; font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+    .wrap { max-width:900px; margin:0 auto; padding:24px 20px 64px; }
+    .brand { display:flex; align-items:center; gap:8px; font-weight:600; color:#a1a1aa; margin-bottom:20px; }
+    .map { width:100%; border-radius:16px; border:1px solid #ffffff14; background:#18181b; display:block; }
+    h1 { font-size:24px; line-height:1.25; margin:22px 0 6px; }
+    p.desc { color:#d4d4d8; margin:0 0 20px; }
+    .foot { color:#71717a; font-size:13px; margin-top:26px; text-align:center; }
+    .foot a { color:#818cf8; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">🗺️ Fluera · Ghost Map</div>
+    <img class="map" src="${esc(full)}" alt="${esc(title)}" loading="eager" />
+    <h1>${esc(title)}</h1>
+    <p class="desc">${esc(desc)}</p>
+    <p class="foot">Fatta con <a href="${SITE}">Fluera</a> — il learning canvas che ti ri-studia.</p>
+  </div>
+</body>
+</html>`;
+}
 
 // ── sitemap ──────────────────────────────────────────────────────────────────
 // Elenca i pack ufficiali/curati leggendoli con la chiave ANON: quello che la
