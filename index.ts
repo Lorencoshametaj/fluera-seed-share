@@ -77,7 +77,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     // l'app è l'unico posto dove l'invito ha senso: rivendicarlo evita che chi
     // ce l'ha già passi dalla pagina di consegna.
     return json({
-      applinks: { apps: [], details: [{ appID: `${APPLE_TEAM_ID}.${BUNDLE_ID}`, paths: ["/s/*", "/i/*", "/u/*", "/collab/*"] }] },
+      applinks: { apps: [], details: [{ appID: `${APPLE_TEAM_ID}.${BUNDLE_ID}`, paths: ["/s/*", "/i/*", "/u/*", "/collab/*", "/p", "/p/*"] }] },
     });
   }
   if (path.endsWith("/.well-known/assetlinks.json")) {
@@ -123,6 +123,10 @@ Deno.serve(async (req: Request): Promise<Response> => {
         // un motore di ricerca è un invito aperto a chiunque: qui il Disallow
         // non è crawl budget, è la porta chiusa.
         "Disallow: /collab/",
+        // `/p` e' una scheda privata condivisa con una persona. Non c'e' nulla
+        // da indicizzare — il server non conosce nemmeno il token — e un
+        // crawler qui spenderebbe budget su una pagina identica ogni volta.
+        "Disallow: /p",
         "Disallow: /get",
         "Disallow: /u/",
         "Disallow: /report",
@@ -174,6 +178,54 @@ Deno.serve(async (req: Request): Promise<Response> => {
       bumpGhostView(cm[1]);
     }
     return html(200, renderGhostPage(share, cm[1]));
+  }
+
+  // ── /p → una scheda del catalogo PRIVATO ───────────────────────────────────
+  //
+  // ⚠️ IL SERVER NON VEDE IL TOKEN, e non e' un difetto: sta nel FRAMMENTO
+  // (`/p#<token>`), che il browser non trasmette. Un token nel percorso
+  // finirebbe nei log di questa funzione a ogni apertura — comprese le fetch
+  // automatiche di unfurl che ogni messenger fa su un URL incollato, che chi
+  // manda non vede e non puo' revocare.
+  //
+  // Da cui, per costruzione: questa pagina non puo' mostrare titolo, miniatura
+  // ne' numero di concetti. Le og:* sono generiche, e la scheda che appare in
+  // chat dice «qualcuno ti ha condiviso una scheda» e nulla di piu'. E' cosi'
+  // che una condivisione fra due persone non diventa visibile a un gruppo di
+  // quaranta.
+  //
+  // CHI ARRIVA QUI: quasi solo chi NON ha l'app. Il manifest Android e l'AASA
+  // rivendicano `/p`, quindi con l'app installata il sistema la apre
+  // direttamente passando l'URI INTERO — frammento compreso — e questa pagina
+  // non viene mai caricata. Restano i non-installati e i browser interni di
+  // Instagram/Facebook, che gli App Links non li onorano: per quest'ultimi il
+  // bottone «Apri in Fluera» punta allo schema custom, che li' funziona.
+  //
+  // ONESTA' SULL'INSTALLAZIONE: il frammento NON sopravvive al giro dallo
+  // store. Chi installa da qui deve riaprire il link, e la pagina glielo dice
+  // prima invece di lasciarglielo scoprire davanti a un'app vuota.
+  // ⚠️ Path NORMALIZZATO, poi confronto ESATTO — non un suffisso.
+  //
+  // In produzione (Deno Deploy, dominio alla radice) il path è `/p`; sotto
+  // `functions serve` in locale è `/functions/v1/seed-share/p`. Un `===` nudo
+  // sarebbe impossibile da provare prima di distribuirlo, ma un suffisso
+  // `/\/p\/?$/` catturerebbe anche `/i/p` e `/u/p` — e questa rotta gira PRIMA
+  // di entrambe, quindi le ruberebbe in silenzio. Si toglie il prefisso e si
+  // confronta per intero: provabile in locale e stretto in produzione.
+  // Si toglie QUALUNQUE prefisso che finisca col nome della funzione: in
+  // produzione non ce n'è (dominio alla radice), in locale dipende da come
+  // `functions serve` monta la rotta, e cablare un prefisso esatto significa
+  // scriverne uno che vale solo su una delle due.
+  const rotta = path.replace(/^.*\/seed-share/, "");
+  if (rotta === "/p" || rotta === "/p/") {
+    const platform = classify(req.headers.get("user-agent") ?? "");
+    const androidLive = (Deno.env.get("ANDROID_STORE_LIVE") ?? "") === "true";
+    const store = platform === "android" && androidLive
+      ? `https://play.google.com/store/apps/details?id=${BUNDLE_ID}`
+      : platform === "ios" && APPLE_APP_ID
+      ? `https://apps.apple.com/app/id${APPLE_APP_ID}`
+      : `${SITE}/beta`;
+    return html(200, renderPrivateSeedPage(store, platform));
   }
 
   // ── /collab/{roomId} → invito a una sessione P2P dal vivo ──────────────────
@@ -500,6 +552,121 @@ function renderGhostPage(row: GhostShareRow, hash: string): string {
     <p class="desc">${esc(desc)}</p>
     <p class="foot">Fatta con <a href="${SITE}">Fluera</a> — il learning canvas che ti ri-studia.</p>
   </div>
+</body>
+</html>`;
+}
+
+// ── Pagina di consegna di una scheda PRIVATA ─────────────────────────────────
+// Il server non sa nulla della scheda — nemmeno quale sia: il token e' nel
+// frammento e non arriva fin qui. Quindi la pagina non promette contenuto, non
+// lo carica e non lo puo' mostrare. Il suo unico lavoro e' consegnare la
+// persona all'app, che e' l'unico posto dove l'anteprima esiste.
+//
+// noindex + no-referrer: il frammento non finisce nell'header Referer per
+// costruzione (i browser non lo includono), ma la direttiva resta perche' la
+// query un domani potrebbe portare qualcosa, e un presidio che c'e' gia' non va
+// tolto per eleganza.
+function renderPrivateSeedPage(
+  storeUrl: string,
+  platform: "android" | "ios" | "other",
+): string {
+  const self = "https://share.fluera.dev/p";
+  const title = "Qualcuno ti ha condiviso una scheda di studio";
+  // ⚠️ Descrizione VOLUTAMENTE priva di contenuto: e' cio' che l'unfurl mostra
+  // in chat. Dire di piu' significherebbe dirlo a tutto il gruppo.
+  const desc =
+    "Una scheda privata su Fluera. Solo chi ha il link puo' vederla, e chi l'ha " +
+    "mandata puo' togliere l'accesso quando vuole.";
+  const installLabel = platform === "other"
+    ? "Non ce l'hai? Scopri Fluera"
+    : "Non ce l'hai? Installa Fluera";
+
+  return `<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <meta name="referrer" content="no-referrer" />
+  <title>${esc(title)} \u00b7 Fluera</title>
+  <meta name="description" content="${esc(desc)}" />
+  <link rel="canonical" href="${esc(self)}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="Fluera" />
+  <meta property="og:url" content="${esc(self)}" />
+  <meta property="og:title" content="${esc(title)}" />
+  <meta property="og:description" content="${esc(desc)}" />
+  <meta property="og:image" content="${esc(OG_FALLBACK)}" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${esc(title)}" />
+  <meta name="twitter:description" content="${esc(desc)}" />
+  <meta name="twitter:image" content="${esc(OG_FALLBACK)}" />
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:#0a0a0b; color:#f4f4f5; font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+    .wrap { max-width:520px; margin:0 auto; padding:56px 20px 64px; text-align:center; }
+    .brand { display:flex; align-items:center; justify-content:center; gap:8px; font-weight:600; color:#a1a1aa; margin-bottom:32px; }
+    h1 { font-size:26px; line-height:1.25; margin:0 0 10px; }
+    p.desc { color:#d4d4d8; margin:0 0 8px; }
+    .lock { display:inline-block; font:600 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; letter-spacing:.04em; color:#a5b4fc; background:#ffffff0d; border:1px solid #ffffff14; border-radius:999px; padding:9px 16px; margin:16px 0 30px; }
+    .cta { display:block; padding:15px 20px; border-radius:14px; font-weight:600; text-decoration:none; margin-bottom:12px; }
+    .primary { background:#6366f1; color:#fff; }
+    .secondary { background:#ffffff0d; border:1px solid #ffffff1f; color:#e4e4e7; }
+    .note { color:#71717a; font-size:13px; margin-top:26px; }
+    .warn { display:none; color:#fca5a5; font-size:14px; background:#7f1d1d26; border:1px solid #7f1d1d; border-radius:12px; padding:14px 16px; margin:0 0 22px; }
+    .foot { color:#52525b; font-size:12px; margin-top:34px; }
+    .foot a { color:#818cf8; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">\u270d\ufe0f Fluera</div>
+    <h1>${esc(title)}</h1>
+    <p class="desc">${esc(desc)}</p>
+    <div class="lock">\ud83d\udd12 Privata \u00b7 revocabile \u00b7 non compare in nessuna ricerca</div>
+
+    <!-- Compare SOLO se il frammento manca: alcuni client accorciano un URL e
+         tagliano via tutto dopo il '#'. Senza questo avviso il destinatario
+         installerebbe l'app per poi non trovare nulla, e darebbe la colpa
+         all'app invece che al link mutilato. -->
+    <div class="warn" id="rotto">
+      Il link sembra incompleto: manca la parte dopo il <code>#</code>.
+      Chiedi a chi te l'ha mandato di reincollarlo per intero.
+    </div>
+
+    <a class="cta primary" id="apri" href="#">Apri in Fluera</a>
+    <a class="cta secondary" href="${esc(storeUrl)}" rel="noreferrer">${esc(installLabel)}</a>
+
+    <p class="note">
+      Vedrai l'anteprima prima di decidere se installarla nei tuoi appunti.
+      <br />
+      Se installi Fluera adesso, <strong>riapri questo link</strong> dopo:
+      la parte segreta non sopravvive al passaggio dallo store.
+    </p>
+
+    <p class="foot">
+      Fluera \u00b7 <a href="${esc(SITE)}">fluera.dev</a>
+    </p>
+  </div>
+
+  <script>
+    // Il token vive SOLO qui, nel browser. Non viene inviato da nessuna parte:
+    // non c'e' fetch, non c'e' analytics, e il bottone dello store porta
+    // rel="noreferrer". L'unica cosa che ne facciamo e' passarlo all'app.
+    (function () {
+      var tok = (location.hash || "").replace(/^#/, "");
+      var apri = document.getElementById("apri");
+      if (/^[a-f0-9]{48}$/.test(tok)) {
+        apri.setAttribute("href", "fluera://p#" + tok);
+      } else {
+        document.getElementById("rotto").style.display = "block";
+        apri.style.display = "none";
+      }
+    })();
+  </script>
 </body>
 </html>`;
 }
