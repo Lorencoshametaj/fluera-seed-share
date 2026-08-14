@@ -217,6 +217,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
   // `functions serve` monta la rotta, e cablare un prefisso esatto significa
   // scriverne uno che vale solo su una delle due.
   const rotta = path.replace(/^.*\/seed-share/, "");
+
+  // La card dell'unfurl per una scheda privata. Va PRIMA del confronto su
+  // "/p", che e' esatto e quindi non la intercetterebbe comunque — ma tenerle
+  // adiacenti evita che un domani qualcuno allarghi "/p" e se la mangi.
+  if (rotta === "/p/og.png") return await privateOgResponse();
+
   if (rotta === "/p" || rotta === "/p/") {
     const platform = classify(req.headers.get("user-agent") ?? "");
     const androidLive = (Deno.env.get("ANDROID_STORE_LIVE") ?? "") === "true";
@@ -556,6 +562,60 @@ function renderGhostPage(row: GhostShareRow, hash: string): string {
 </html>`;
 }
 
+// ── Card d'anteprima di una scheda privata ───────────────────────────────────
+//
+// 1200x630 interamente SINTETICA: nessuna immagine di base, solo forme e testo.
+// Non puo' perdere nulla del contenuto perche' non ne conosce nulla — il token
+// sta nel frammento e non arriva mai al server.
+//
+// Cache LUNGA: non cambia mai. La sorella `/s/{hash}/og.png` sta a 300 s perche'
+// ci cuoce dentro i contatori vivi; qui non c'e' niente di vivo da rinfrescare.
+//
+// Degrada come la sorella: qualunque guasto del WASM o del font diventa un 302
+// verso il banner generico, mai un 500 su un link che qualcuno ha appena
+// toccato.
+async function privateOgResponse(): Promise<Response> {
+  try {
+    const { Resvg, font } = await loadResvg();
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">` +
+      `<rect width="1200" height="630" fill="#0a0a0b"/>` +
+      `<rect x="0" y="0" width="1200" height="6" fill="#6366f1"/>` +
+      // Lucchetto disegnato a PATH, non come emoji: resvg non ha un font a
+      // colori, e una emoji uscirebbe come rettangolo vuoto.
+      `<g transform="translate(540,138)">` +
+      `<path d="M30 62 V44 a30 30 0 0 1 60 0 V62" fill="none" stroke="#a5b4fc" stroke-width="13" stroke-linecap="round"/>` +
+      `<rect x="8" y="62" width="104" height="84" rx="16" fill="#a5b4fc"/>` +
+      `<circle cx="60" cy="98" r="10" fill="#0a0a0b"/>` +
+      `<rect x="55" y="102" width="10" height="24" rx="5" fill="#0a0a0b"/>` +
+      `</g>` +
+      `<text x="600" y="386" text-anchor="middle" font-family="Noto Sans" font-size="62" font-weight="700" fill="#f4f4f5">Scheda privata</text>` +
+      `<text x="600" y="446" text-anchor="middle" font-family="Noto Sans" font-size="32" fill="#a1a1aa">Qualcuno ti ha condiviso i suoi appunti</text>` +
+      `<text x="600" y="492" text-anchor="middle" font-family="Noto Sans" font-size="32" fill="#a1a1aa">Solo chi ha il link può vederla</text>` +
+      `<text x="600" y="576" text-anchor="middle" font-family="Noto Sans" font-size="28" font-weight="700" fill="#6366f1">Fluera</text>` +
+      `</svg>`;
+
+    const resvg = new Resvg(svg, {
+      fitTo: { mode: "width", value: 1200 },
+      background: "rgba(0,0,0,0)",
+      font: {
+        fontBuffers: [font],
+        loadSystemFonts: false,
+        defaultFontFamily: "Noto Sans",
+      },
+    });
+    return new Response(new Uint8Array(resvg.render().asPng()), {
+      status: 200,
+      headers: {
+        "Content-Type": "image/png",
+        "Cache-Control": "public, max-age=86400, s-maxage=86400",
+      },
+    });
+  } catch (e) {
+    console.error(`\ud83d\udd12 private og render failed: ${e}`);
+    return Response.redirect(OG_FALLBACK, 302);
+  }
+}
+
 // ── Pagina di consegna di una scheda PRIVATA ─────────────────────────────────
 // Il server non sa nulla della scheda — nemmeno quale sia: il token e' nel
 // frammento e non arriva fin qui. Quindi la pagina non promette contenuto, non
@@ -571,6 +631,12 @@ function renderPrivateSeedPage(
   platform: "android" | "ios" | "other",
 ): string {
   const self = "https://share.fluera.dev/p";
+  // ⚠️ NON `OG_FALLBACK`: quello e' il banner marketing della home, e chi
+  // riceveva un link privato vedeva in chat l'immagine del sito — il link si
+  // leggeva come «ti ho mandato la homepage». Questa card e' generica quanto
+  // quella (non puo' mostrare contenuto: il token e' nel frammento e qui non
+  // arriva) ma dice CHE COS'E', che e' la differenza fra generico e sbagliato.
+  const ogImg = "https://share.fluera.dev/p/og.png";
   const title = "Qualcuno ti ha condiviso una scheda di studio";
   // ⚠️ Descrizione VOLUTAMENTE priva di contenuto: e' cio' che l'unfurl mostra
   // in chat. Dire di piu' significherebbe dirlo a tutto il gruppo.
@@ -596,13 +662,13 @@ function renderPrivateSeedPage(
   <meta property="og:url" content="${esc(self)}" />
   <meta property="og:title" content="${esc(title)}" />
   <meta property="og:description" content="${esc(desc)}" />
-  <meta property="og:image" content="${esc(OG_FALLBACK)}" />
+  <meta property="og:image" content="${esc(ogImg)}" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="${esc(title)}" />
   <meta name="twitter:description" content="${esc(desc)}" />
-  <meta name="twitter:image" content="${esc(OG_FALLBACK)}" />
+  <meta name="twitter:image" content="${esc(ogImg)}" />
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
