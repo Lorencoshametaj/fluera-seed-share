@@ -2104,22 +2104,38 @@ async function handleMcp(req: Request): Promise<Response> {
   // il token OAuth (L2, connettori web). Si prova prima quella di forma nota,
   // così un JWT non paga mai un round-trip alla RPC.
   let userId: string | null = null;
+  // 🔎 Il MOTIVO del rifiuto viaggia col rifiuto. «Non autorizzato» e basta
+  // costringe chi si collega a indovinare fra tre cose diverse — token
+  // scaduto, consenso ritirato, chiave revocata — e due di quelle si
+  // risolvono in dieci secondi SE si sa quale sia.
+  let motivo = "nessuna credenziale: manca l'header Authorization";
   if (token.startsWith("fmcp_")) {
     userId = await mcpResolveToken(token);
+    if (!userId) {
+      motivo = "chiave personale non valida o revocata, oppure il consenso " +
+        "«Assistente AI collegato» e spento in Fluera";
+    }
   } else if (token.length > 0) {
     const claims = await jwtVerify(token);
-    if (claims) {
+    if (!claims) {
+      motivo = "token non valido, scaduto, o emesso per un altro server";
+    } else {
       const sub = String(claims.sub);
       // Il consenso vale anche qui: il JWT prova CHI sei, non che il permesso
       // sia ancora vivo. Stessa regola della chiave personale, stessa cache.
-      if (await mcpOauthConsentOk(sub)) userId = sub;
+      if (await mcpOauthConsentOk(sub)) {
+        userId = sub;
+      } else {
+        motivo = "il consenso «Assistente AI collegato» non e attivo su " +
+          "questo account: accendilo in Fluera -> Impostazioni -> Privacy";
+      }
     }
   }
   if (!userId) {
     // 🔎 La spec MCP pretende che il 401 dica DOVE trovare i metadati della
     // risorsa: è così che un client scopre l'authorization server senza che
     // nessuno glielo configuri a mano.
-    return new Response(JSON.stringify({ error: "unauthorized" }), {
+    return new Response(JSON.stringify({ error: "unauthorized", error_description: motivo }), {
       status: 401,
       headers: {
         ...MCP_CORS,
@@ -2159,10 +2175,18 @@ async function handleMcp(req: Request): Promise<Response> {
     method?: string;
     params?: Record<string, unknown>;
   };
+  const sessione = req.headers.get("mcp-session-id") ??
+    hexOf(crypto.getRandomValues(new Uint8Array(16)));
   const reply = (payload: Record<string, unknown>, status = 200) =>
     new Response(JSON.stringify(payload), {
       status,
-      headers: { ...MCP_CORS, "content-type": "application/json", "mcp-session-id": "fluera" },
+      headers: {
+        ...MCP_CORS,
+        "content-type": "application/json",
+        // La spec vuole un identificativo di sessione unico e imprevedibile:
+        // una costante e formalmente scorretta e alcuni client la rifiutano.
+        "mcp-session-id": sessione,
+      },
     });
   if (id === undefined) return new Response(null, { status: 202, headers: MCP_CORS }); // notifiche
 
