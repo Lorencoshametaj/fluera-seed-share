@@ -1669,8 +1669,15 @@ const MCP_STAGE_LABEL: Record<string, string> = {
 };
 const mcpStageLabel = (s: string) => MCP_STAGE_LABEL[s] ?? s;
 
-type McpDue = { title: string; next_review_ms: number; stage: string };
+type McpDue = {
+  title: string;
+  next_review_ms: number;
+  stage: string;
+  stability_days: number;
+  lapses: number;
+};
 type McpErr = { title: string; next_review_ms: number };
+type McpUnseen = { title: string };
 type McpTopic = { topic: string; accuracy_band: string; trend: string };
 type McpPayload = {
   name: string;
@@ -1683,6 +1690,8 @@ type McpPayload = {
   errors_due: McpErr[];
   errors_due_total: number;
   weak_topics: McpTopic[];
+  never_studied: McpUnseen[];
+  never_studied_total: number;
 };
 type McpRow = {
   block_id: string;
@@ -1707,6 +1716,14 @@ const MCP_MAX_TEXT = 200;
 const MCP_MAX_LIST = 50; // gemello di kDigestDueCap lato Dart
 const mcpText = (v: unknown): string =>
   typeof v === "string" ? v.slice(0, MCP_MAX_TEXT) : "";
+/// Un CONTEGGIO che arriva dal device: intero, non negativo, sotto un tetto
+/// dichiarato. Fuori range ⇒ 0, non il tetto: un valore assurdo non deve
+/// diventare un valore plausibile (un ripiego plausibile e' peggio di uno
+/// zero, perche' nessuno lo riconosce come ripiego).
+const mcpCount = (v: unknown, max: number): number =>
+  typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= max
+    ? Math.floor(v)
+    : 0;
 
 // La proiezione a schema chiuso: gemella di `projectRow` dello spike e del
 // contratto Dart (`digestPayloadKeys` in study_digest_builder.dart).
@@ -1716,6 +1733,7 @@ export function mcpProjectRow(raw: Record<string, unknown>): McpRow {
   const p = mcpPick<McpPayload>(rawPayload, [
     "name", "exam_date_ms", "outcome", "readiness", "feasibility",
     "due", "due_total", "errors_due", "errors_due_total", "weak_topics",
+    "never_studied", "never_studied_total",
   ]);
   p.readiness = mcpPick(((p.readiness ?? {}) as unknown) as Record<string, unknown>,
     ["ready", "at_risk", "never_studied"]) as McpPayload["readiness"];
@@ -1723,8 +1741,18 @@ export function mcpProjectRow(raw: Record<string, unknown>): McpRow {
   p.due = ((p.due ?? []) as Record<string, unknown>[])
     .slice(0, MCP_MAX_LIST)
     .map((d) => {
-      const e = mcpPick<McpDue>(d, ["title", "next_review_ms", "stage"]);
+      const e = mcpPick<McpDue>(d, [
+        "title", "next_review_ms", "stage", "stability_days", "lapses",
+      ]);
       e.title = mcpText(e.title);
+      // 🔒 Il cap dei VALORI vale anche per i due numeri nuovi: `payload_json`
+      // e' scritto da `authenticated` e la RLS non ne vincola la forma, quindi
+      // «stabilita' 9e99 giorni» o «-3 cadute» arriverebbero verbatim nel
+      // contesto dell'assistente. Interi, non negativi, con un tetto
+      // dichiarato: 3650 giorni (dieci anni) e' oltre qualunque stabilita'
+      // che FSRS produca su uno studente vero.
+      e.stability_days = mcpCount(e.stability_days, 3650);
+      e.lapses = mcpCount(e.lapses, 9999);
       return e;
     });
   p.errors_due = ((p.errors_due ?? []) as Record<string, unknown>[])
@@ -1741,6 +1769,17 @@ export function mcpProjectRow(raw: Record<string, unknown>): McpRow {
       e.topic = mcpText(e.topic);
       return e;
     });
+  p.never_studied = ((p.never_studied ?? []) as Record<string, unknown>[])
+    .slice(0, MCP_MAX_LIST)
+    .map((x) => {
+      const e = mcpPick<McpUnseen>(x, ["title"]);
+      e.title = mcpText(e.title);
+      return e;
+    });
+  p.never_studied_total =
+    typeof p.never_studied_total === "number"
+      ? p.never_studied_total
+      : p.never_studied.length;
   p.due_total = typeof p.due_total === "number" ? p.due_total : p.due.length;
   p.errors_due_total =
     typeof p.errors_due_total === "number" ? p.errors_due_total : p.errors_due.length;
@@ -1905,6 +1944,22 @@ function mcpCourseSummary(r: McpRow, now: number): Record<string, unknown> {
       mai_studiati: p.readiness.never_studied,
     },
     nota_prontezza: "«mai studiati» = mai visti: non è la stessa cosa di «a rischio».",
+    // 🆕 I mai studiati PER NOME: un conteggio non dice da dove cominciare,
+    // che è l'unica cosa utile da dire su un concetto mai visto. Assente in
+    // modalità «solo conteggi» (il device non manda titoli) e assente quando
+    // non ce ne sono: una chiave vuota si legge come «ho guardato e non c'è».
+    ...(p.never_studied.length
+      ? {
+        mai_studiati_quali: p.never_studied.slice(0, 20).map((u) => u.title),
+        ...(p.never_studied_total > Math.min(p.never_studied.length, 20)
+          ? {
+            nota_mai_studiati:
+              `Elenco parziale: ${Math.min(p.never_studied.length, 20)} nomi su ` +
+              `${p.never_studied_total}.`,
+          }
+          : {}),
+      }
+      : {}),
     fattibilita: p.feasibility,
     in_scadenza_ora: p.due.filter((d) => d.next_review_ms <= now).length,
     errori_da_ricontrollare: p.errors_due.filter((e) => e.next_review_ms <= now).length,
@@ -1965,6 +2020,13 @@ export function mcpCallTool(
           corso: r.payload.name,
           stadio: mcpStageLabel(d.stage),
           in_ritardo_da_giorni: Math.max(0, Math.floor((now - d.next_review_ms) / 86_400_000)),
+          // 📏 Quanto regge questo ricordo secondo il modello, in giorni
+          // interi, e quante volte è già caduto. Sono i due numeri che
+          // cambiano il CONSIGLIO: 2 giorni contro 40 è «stasera» contro
+          // «lascialo stare»; 4 cadute vogliono dire che quel concetto va
+          // ripreso da un'altra angolazione, non ripassato uguale.
+          regge_giorni: d.stability_days,
+          ...(d.lapses > 0 ? { gia_caduto_volte: d.lapses } : {}),
           apri_in_fluera: mcpOpenInApp(r.canvas_id),
         }))
       ).sort((a, b) => b.in_ritardo_da_giorni - a.in_ritardo_da_giorni);
@@ -1974,12 +2036,61 @@ export function mcpCallTool(
           corso: r.payload.name,
         }))
       );
+      // 🆕 I mai studiati: non sono «in scadenza» — non hanno una scadenza —
+      // ma sono meta' della risposta alla domanda che questo strumento
+      // riceve davvero, che e' «cosa faccio adesso». Sezione SEPARATA e
+      // nominata: mescolarli con le scadenze sarebbe la confusione che
+      // `nota_prontezza` esiste per impedire.
+      const daIniziare = scope.flatMap((r) =>
+        r.payload.never_studied.map((u) => ({
+          concetto: u.title,
+          corso: r.payload.name,
+          apri_in_fluera: mcpOpenInApp(r.canvas_id),
+        }))
+      );
       const CAP = 20;
+      // 🕳️ «0 in scadenza» NON vuol dire «sei a posto», e la differenza non
+      // e' accademica: misurato dal vivo il 2026-08-22, con zero scadenze e
+      // due concetti mai visti a 18 giorni dall'esame, l'assistente ha
+      // concluso «quindi sei a posto per ora». Era vero alla lettera e
+      // sbagliato come consiglio. Un'assenza va DICHIARATA insieme a cio'
+      // che non copre, altrimenti si legge come una rassicurazione — la
+      // stessa regola per cui un cap silenzioso si legge come completezza.
+      const esameVicino = scope
+        .map((r) => mcpDaysLeft(r.payload.exam_date_ms, now))
+        .filter((g): g is number => typeof g === "number" && g >= 0)
+        .sort((a, b) => a - b)[0];
+      const maiVisti = scope.reduce((n, r) => n + r.payload.readiness.never_studied, 0);
+      const aRischio = scope.reduce((n, r) => n + r.payload.readiness.at_risk, 0);
+      const nienteInScadenza = due.length === 0 && errors.length === 0;
+      const notaZero = nienteInScadenza && (maiVisti > 0 || aRischio > 0 ||
+          (typeof esameVicino === "number" && esameVicino <= 30))
+        ? {
+          nota_zero:
+            "Nessun ripasso DOVUTO adesso non vuol dire che non ci sia niente da fare: " +
+            [
+              maiVisti > 0 ? `${maiVisti} concetti non sono mai stati visti` : null,
+              aRischio > 0 ? `${aRischio} sono sotto soglia` : null,
+              typeof esameVicino === "number" && esameVicino <= 30
+                ? `l'esame più vicino è fra ${esameVicino} giorni`
+                : null,
+            ].filter(Boolean).join(", ") +
+            ". Non dire allo studente che è a posto: dillo solo se non c'è " +
+            "nessuna di queste tre cose.",
+        }
+        : {};
       return mcpWrap(scope.length ? scope : rows, {
         in_scadenza_ora: due.slice(0, CAP),
         totale_in_scadenza: due.length,
         ...(due.length > CAP ? { nota_cap: `Mostrati ${CAP} di ${due.length}.` } : {}),
         errori_da_ricontrollare: errors,
+        ...(daIniziare.length
+          ? {
+            mai_studiati_da_iniziare: daIniziare.slice(0, CAP),
+            totale_mai_studiati: daIniziare.length,
+          }
+          : {}),
+        ...notaZero,
       }, now);
     }
 
@@ -2031,7 +2142,7 @@ export const MCP_TOOL_DEFS = [
   {
     name: "list_courses",
     description:
-      "Elenca i corsi dello studente su Fluera: data d'esame, giorni rimanenti, prontezza a conteggi (sopra soglia / a rischio / mai studiati), fattibilità, esito. Un corso «superato» è fuori dalla pianificazione.",
+      "Elenca i corsi dello studente su Fluera: data d'esame, giorni rimanenti, prontezza a conteggi (sopra soglia / a rischio / mai studiati), i NOMI dei concetti mai studiati, fattibilità, esito. Un corso «superato» è fuori dalla pianificazione.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -2048,7 +2159,7 @@ export const MCP_TOOL_DEFS = [
   {
     name: "get_due_now",
     description:
-      "I concetti in scadenza ADESSO e gli errori da ricontrollare, lista globale annotata per corso (mai in silo: Fluera alterna le materie di proposito). Opzionale: filtra per corso. Chiudi ogni piano col link apri_in_fluera.",
+      "Cosa fare ADESSO: i concetti in scadenza (con `regge_giorni` = per quanti giorni il modello dice che il ricordo tiene, e `gia_caduto_volte`), gli errori da ricontrollare, e i concetti MAI studiati da cui iniziare. Lista globale annotata per corso (mai in silo: Fluera alterna le materie di proposito). Opzionale: filtra per corso. Zero in scadenza NON significa «a posto»: leggi `nota_zero` se c'è. Chiudi ogni piano col link apri_in_fluera.",
     inputSchema: {
       type: "object",
       properties: { course: { type: "string" } },
