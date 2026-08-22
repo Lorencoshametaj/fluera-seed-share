@@ -61,7 +61,13 @@ interface SeedRow {
   rating_count: number | null;
 }
 
-Deno.serve(async (req: Request): Promise<Response> => {
+// 🔬 2026-08-22 — `servi` estratta e `Deno.serve` dietro `import.meta.main`:
+// finché il gestore era anonimo dentro la chiamata, questo file non poteva
+// essere importato senza mettersi in ascolto, e quindi la sezione MCP non
+// aveva UN test (i cancelli del canarino vivevano solo nello spike throwaway
+// — audit «Atlas al setaccio»). In produzione il comportamento è identico:
+// l'entrypoint esegue il modulo come main.
+export const servi = async (req: Request): Promise<Response> => {
   const reqUrl = new URL(req.url);
   const path = reqUrl.pathname;
 
@@ -325,36 +331,55 @@ Deno.serve(async (req: Request): Promise<Response> => {
       : `${SITE}/beta`;
     const q = new URLSearchParams();
     const rawConcept = reqUrl.searchParams.get("concept");
-    if (rawConcept && rawConcept.length <= 120 && !/[\x00-\x1f<>"']/.test(rawConcept)) {
-      q.set("concept", rawConcept);
-    }
+    const concept =
+      rawConcept && rawConcept.length <= 120 && !/[\x00-\x1f<>"']/.test(rawConcept)
+        ? rawConcept
+        : null;
+    if (concept) q.set("concept", concept);
     const appHref = `fluera://r/${rem[1]}${q.size ? `?${q.toString()}` : ""}`;
+    // 🌍 Chi arriva QUI non ha l'app (con l'app installata il link la apre
+    // direttamente: App/Universal Links). La pagina parlava al device
+    // sbagliato — «se l'app è installata, aprilo da lì» — e buttava via il
+    // concetto, che è l'unica cosa che rende il link diverso dagli altri
+    // (audit «Atlas al setaccio», P3). Lingua dal browser: l'italiano fisso
+    // su una pagina pubblica è un'isola.
+    const it = (req.headers.get("accept-language") ?? "").toLowerCase().startsWith("it");
+    const t = it
+      ? {
+        lang: "it",
+        titolo: concept ? `«${esc(concept)}» ti aspetta` : "Il tuo ripasso ti aspetta",
+        corpo: concept
+          ? "Questo link riapre i tuoi appunti su questo concetto, dentro Fluera."
+          : "Questo link riapre un tuo quaderno dentro Fluera.",
+        gia: "Ho già l'app",
+        store: "Scarica Fluera",
+        nota: "Il ripasso che conta si fa qui: a libro chiuso, con la tua calligrafia.",
+      }
+      : {
+        lang: "en",
+        titolo: concept ? `“${esc(concept)}” is waiting` : "Your review is waiting",
+        corpo: concept
+          ? "This link reopens your notes on this concept, inside Fluera."
+          : "This link reopens one of your notebooks inside Fluera.",
+        gia: "I already have the app",
+        store: "Get Fluera",
+        nota: "The review that counts happens here: closed-book, in your own handwriting.",
+      };
     return html(
       200,
-      `<!doctype html><html lang="it"><head><meta charset="utf-8">
+      `<!doctype html><html lang="${t.lang}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Riapri il quaderno — Fluera</title>
-<style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#F6F7F9;color:#1B2030}main{text-align:center;padding:2rem;max-width:26rem}a.btn{display:inline-block;margin-top:1rem;padding:.7rem 1.4rem;border-radius:10px;background:#2F4DC0;color:#fff;text-decoration:none;font-weight:600}p{color:#5C6475}</style>
+<title>${esc(t.titolo)} — Fluera</title>
+<style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#F6F7F9;color:#1B2030}main{text-align:center;padding:2rem;max-width:26rem}h1{font-size:1.5rem;line-height:1.25}a.btn{display:inline-block;margin-top:1rem;padding:.7rem 1.4rem;border-radius:10px;background:#2F4DC0;color:#fff;text-decoration:none;font-weight:600}a.alt{display:inline-block;margin-top:1rem;color:#2F4DC0}p{color:#5C6475}@media(prefers-color-scheme:dark){body{background:#101319;color:#E8EAF1}p{color:#9AA3B5}}</style>
 </head><body><main>
-<h1>Il tuo ripasso ti aspetta</h1>
-<p>Questo link riapre un tuo quaderno dentro Fluera. Se l'app è installata, aprilo da lì:</p>
-<a class="btn" href="${appHref}">Apri in Fluera</a>
-<p style="margin-top:1.5rem"><a href="${store}">Non hai l'app? Prendila qui</a></p>
+<h1>${esc(t.titolo)}</h1>
+<p>${esc(t.corpo)}</p>
+<a class="btn" href="${store}">${esc(t.store)}</a>
+<p style="margin-top:1.5rem"><a class="alt" href="${appHref}">${esc(t.gia)}</a></p>
+<p style="font-size:.85rem;margin-top:1.5rem">${esc(t.nota)}</p>
 </main></body></html>`,
     );
-  }
-
-  // ── /mcp → il connettore MCP («Atlas risponde» L1, 2026-08-22) ─────────────
-  // Server MCP (Streamable HTTP, risposte application/json, niente SSE) che
-  // serve l'ESTRATTO di studio: lettore SOTTILE di `study_digest` (migration
-  // 162) — niente matematica FSRS qui, solo confronti di date. Auth: token
-  // personale `fmcp_…` coniato in-app (`create_mcp_token`, migration 164),
-  // risolto con la RPC `mcp_resolve_token` via service_role. SOLO tool di
-  // lettura: un «segnami come saputo» detto in chat non deve poter comprare
-  // carte — il gemello server del cancello ExamUnlockGate.
-  if (/\/mcp\/?$/.test(path)) {
-    return await handleMcp(req);
   }
 
   // ── /get → «portami l'app», senza attribuzione ─────────────────────────────
@@ -486,7 +511,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
   // payloads clean and avoid open-redirect/HTML-injection surprises.
   const ref = sanitizeRef(reqUrl.searchParams.get("ref"));
   return html(200, renderPage(row, hash, ogImageUrl, platform, ref));
-});
+};
+
+if (import.meta.main) Deno.serve(servi);
 
 // ── Supabase ────────────────────────────────────────────────────────────────
 
@@ -1624,9 +1651,20 @@ function mcpPick<T>(src: Record<string, unknown>, keys: string[]): T {
   return out as T;
 }
 
+// 🔒 Il cap dei VALORI, non solo delle chiavi (audit P1-5). `payload_json` è
+// scritto da `authenticated` e la RLS non ne vincola la forma: senza questo,
+// un titolo lungo quanto si vuole — cioè inchiostro dello studente — passava
+// verbatim nel contesto del SUO assistente. Non è una difesa da injection
+// (il testo di uno studente può sempre contenere frasi imperative), è il
+// tetto che impedisce a una riga malformata di diventare un payload enorme.
+const MCP_MAX_TEXT = 200;
+const MCP_MAX_LIST = 50; // gemello di kDigestDueCap lato Dart
+const mcpText = (v: unknown): string =>
+  typeof v === "string" ? v.slice(0, MCP_MAX_TEXT) : "";
+
 // La proiezione a schema chiuso: gemella di `projectRow` dello spike e del
 // contratto Dart (`digestPayloadKeys` in study_digest_builder.dart).
-function mcpProjectRow(raw: Record<string, unknown>): McpRow {
+export function mcpProjectRow(raw: Record<string, unknown>): McpRow {
   const row = mcpPick<McpRow>(raw, ["block_id", "canvas_id", "computed_at_ms", "payload"]);
   const rawPayload = (raw.payload_json ?? raw.payload ?? {}) as Record<string, unknown>;
   const p = mcpPick<McpPayload>(rawPayload, [
@@ -1635,12 +1673,28 @@ function mcpProjectRow(raw: Record<string, unknown>): McpRow {
   ]);
   p.readiness = mcpPick(((p.readiness ?? {}) as unknown) as Record<string, unknown>,
     ["ready", "at_risk", "never_studied"]) as McpPayload["readiness"];
-  p.due = ((p.due ?? []) as Record<string, unknown>[]).map((d) =>
-    mcpPick<McpDue>(d, ["title", "next_review_ms", "stage"]));
-  p.errors_due = ((p.errors_due ?? []) as Record<string, unknown>[]).map((e) =>
-    mcpPick<McpErr>(e, ["title", "next_review_ms"]));
-  p.weak_topics = ((p.weak_topics ?? []) as Record<string, unknown>[]).map((w) =>
-    mcpPick<McpTopic>(w, ["topic", "accuracy_band", "trend"]));
+  p.name = mcpText(p.name);
+  p.due = ((p.due ?? []) as Record<string, unknown>[])
+    .slice(0, MCP_MAX_LIST)
+    .map((d) => {
+      const e = mcpPick<McpDue>(d, ["title", "next_review_ms", "stage"]);
+      e.title = mcpText(e.title);
+      return e;
+    });
+  p.errors_due = ((p.errors_due ?? []) as Record<string, unknown>[])
+    .slice(0, MCP_MAX_LIST)
+    .map((x) => {
+      const e = mcpPick<McpErr>(x, ["title", "next_review_ms"]);
+      e.title = mcpText(e.title);
+      return e;
+    });
+  p.weak_topics = ((p.weak_topics ?? []) as Record<string, unknown>[])
+    .slice(0, MCP_MAX_LIST)
+    .map((x) => {
+      const e = mcpPick<McpTopic>(x, ["topic", "accuracy_band", "trend"]);
+      e.topic = mcpText(e.topic);
+      return e;
+    });
   p.due_total = typeof p.due_total === "number" ? p.due_total : p.due.length;
   p.errors_due_total =
     typeof p.errors_due_total === "number" ? p.errors_due_total : p.errors_due.length;
@@ -1705,7 +1759,7 @@ async function mcpLoadDigest(userId: string): Promise<McpRow[] | null> {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
   const url = `${SUPABASE_URL}/rest/v1/study_digest` +
     `?user_id=eq.${encodeURIComponent(userId)}` +
-    `&select=block_id,canvas_id,computed_at_ms,payload_json&order=block_id`;
+    `&select=block_id,canvas_id,computed_at_ms,payload_json&order=block_id&limit=100`;
   const resp = await fetch(url, {
     headers: {
       apikey: SUPABASE_SERVICE_ROLE_KEY,
@@ -1722,15 +1776,44 @@ async function mcpLoadDigest(userId: string): Promise<McpRow[] | null> {
 
 const mcpIso = (ms: number | null | undefined) =>
   ms == null ? null : new Date(ms).toISOString().slice(0, 10);
+// 📅 La data d'ESAME è un giorno del calendario dello studente, non un
+// istante: il picker salva mezzanotte LOCALE, che in UTC cade il giorno
+// prima per ogni fuso a est di Greenwich — «esame: D−1» per ogni studente
+// italiano (audit P1-6). +12h prima dello slice riporta il giorno giusto
+// per gli offset in (−12, +12]. Solo per `esame`: i bucket del forecast
+// restano su mcpIso, dove l'istante è quello vero.
+export const mcpExamDay = (ms: number | null | undefined) =>
+  ms == null ? null : new Date(ms + 43_200_000).toISOString().slice(0, 10);
 const mcpDaysLeft = (examMs: number | null, now: number) =>
   examMs == null ? null : Math.ceil((examMs - now) / 86_400_000);
 const mcpOpenInApp = (canvasId: string) => `https://share.fluera.dev/r/${canvasId}`;
 
-function mcpWrap(rows: McpRow[], body: Record<string, unknown>): Record<string, unknown> {
+function mcpWrap(
+  rows: McpRow[],
+  body: Record<string, unknown>,
+  now: number,
+): Record<string, unknown> {
   const oldest = rows.length ? Math.min(...rows.map((r) => r.computed_at_ms)) : 0;
+  // 🕰️ La freschezza va DETTA, non lasciata dedurre da un timestamp ISO che
+  // l'assistente non guarderà (audit P3): l'età in giorni è un numero che
+  // entra nel ragionamento, e sopra la soglia diventa un'istruzione esplicita.
+  // Il digest si ripubblica a ogni chokepoint di studio: tre giorni di
+  // silenzio significano che il device non studia o non pubblica.
+  const etaGiorni = oldest
+    ? Math.floor((now - oldest) / 86_400_000)
+    : null;
   return {
     ...body,
     computed_at: oldest ? new Date(oldest).toISOString() : null,
+    eta_giorni: etaGiorni,
+    ...(etaGiorni !== null && etaGiorni >= 3
+      ? {
+        nota_freschezza:
+          `Questo estratto è vecchio di ${etaGiorni} giorni: il device non ` +
+          "pubblica da allora. Trattalo come una fotografia vecchia, dillo " +
+          "allo studente, e non presentare le scadenze come se fossero di oggi.",
+      }
+      : {}),
     nota: MCP_EPISTEMIC,
     metodo: MCP_METHOD_NOTE,
   };
@@ -1742,7 +1825,7 @@ function mcpCourseSummary(r: McpRow, now: number): Record<string, unknown> {
     return {
       corso: p.name,
       stato: "superato 🎉",
-      esame: mcpIso(p.exam_date_ms),
+      esame: mcpExamDay(p.exam_date_ms),
       nota_corso: "Fuori dalla pianificazione: l'esame è passato.",
     };
   }
@@ -1759,6 +1842,11 @@ function mcpCourseSummary(r: McpRow, now: number): Record<string, unknown> {
     fattibilita: p.feasibility,
     in_scadenza_ora: p.due.filter((d) => d.next_review_ms <= now).length,
     errori_da_ricontrollare: p.errors_due.filter((e) => e.next_review_ms <= now).length,
+    // 📊 I totali che il DEVICE ha calcolato prima di cappare la lista: senza,
+    // «5 in scadenza» poteva essere «5 fra i primi 50» spacciato per tutto.
+    ...(p.due_total > p.due.length
+      ? { nota_totale: `Elenco parziale: ${p.due.length} voci su ${p.due_total}.` }
+      : {}),
     apri_in_fluera: mcpOpenInApp(r.canvas_id),
   };
 }
@@ -1775,7 +1863,7 @@ class McpRpcError extends Error {
   }
 }
 
-function mcpCallTool(
+export function mcpCallTool(
   rows: McpRow[],
   name: string,
   args: Record<string, unknown>,
@@ -1784,15 +1872,24 @@ function mcpCallTool(
   const active = rows.filter((r) => r.payload.outcome !== "passed");
   switch (name) {
     case "list_courses":
-      return mcpWrap(rows, { corsi: rows.map((r) => mcpCourseSummary(r, now)) });
+      return mcpWrap(rows, { corsi: rows.map((r) => mcpCourseSummary(r, now)) }, now);
 
     case "get_readiness": {
       const r = mcpFindCourse(rows, String(args.course ?? ""));
-      if (!r) return mcpWrap(rows, { errore: `Corso non trovato: "${args.course}". Usa list_courses.` });
-      return mcpWrap([r], mcpCourseSummary(r, now));
+      if (!r) return mcpWrap(rows, { errore: `Corso non trovato: "${args.course}". Usa list_courses.` }, now);
+      return mcpWrap([r], mcpCourseSummary(r, now), now);
     }
 
     case "get_due_now": {
+      // 🕳️ Un corso non trovato NON deve produrre zeri: «0 in scadenza» e
+      // «non conosco questo corso» sono due fatti diversi, e il secondo
+      // travestito da primo fa dire all'assistente «sei a posto» (audit P3).
+      if (args.course && !mcpFindCourse(active, String(args.course))) {
+        return mcpWrap(rows, {
+          errore: `Corso non trovato fra quelli attivi: "${args.course}". ` +
+            "Usa list_courses: potrebbe avere un altro nome, o essere già superato.",
+        }, now);
+      }
       const scope = args.course
         ? [mcpFindCourse(active, String(args.course))].filter(Boolean) as McpRow[]
         : active;
@@ -1817,7 +1914,7 @@ function mcpCallTool(
         totale_in_scadenza: due.length,
         ...(due.length > CAP ? { nota_cap: `Mostrati ${CAP} di ${due.length}.` } : {}),
         errori_da_ricontrollare: errors,
-      });
+      }, now);
     }
 
     case "get_review_forecast": {
@@ -1833,10 +1930,15 @@ function mcpCallTool(
           }
         }
       }
-      return mcpWrap(active.length ? active : rows, { previsione_ritorni: buckets });
+      return mcpWrap(active.length ? active : rows, { previsione_ritorni: buckets }, now);
     }
 
     case "get_weak_topics": {
+      if (args.course && !mcpFindCourse(active, String(args.course))) {
+        return mcpWrap(rows, {
+          errore: `Corso non trovato fra quelli attivi: "${args.course}". Usa list_courses.`,
+        }, now);
+      }
       const scope = args.course
         ? [mcpFindCourse(active, String(args.course))].filter(Boolean) as McpRow[]
         : active;
@@ -1851,7 +1953,7 @@ function mcpCallTool(
       return mcpWrap(scope.length ? scope : rows, {
         topic_deboli: topics,
         nota_fonte: "Solo topic con evidenza sufficiente dagli esami recenti in Fluera.",
-      });
+      }, now);
     }
 
     default:
@@ -1859,7 +1961,7 @@ function mcpCallTool(
   }
 }
 
-const MCP_TOOL_DEFS = [
+export const MCP_TOOL_DEFS = [
   {
     name: "list_courses",
     description:
@@ -1926,9 +2028,11 @@ async function handleMcp(req: Request): Promise<Response> {
     ? authHeader.slice(7).trim()
     : "";
   // Il limiter PRIMA della validazione (convenzione del file: uno spammer non
-  // deve schivarlo con un 401 economico). Chiave = token se plausibile,
-  // altrimenti l'IP.
-  const rlKey = token.length > 10 ? token : `ip:${clientIp(req)}`;
+  // deve schivarlo con un 401 economico). ⚠️ Chiave = SEMPRE l'IP, MAI il
+  // token grezzo: con la chiave sul token, ruotare stringhe inventate dava un
+  // bucket fresco a ogni tentativo — il 429 non scattava mai e ogni tentativo
+  // pagava una RPC di risoluzione (audit «Atlas al setaccio», P1-4).
+  const rlKey = `ip:${clientIp(req)}`;
   if (mcpRateLimited(rlKey)) {
     return new Response(JSON.stringify({ error: "rate_limited" }), {
       status: 429,
@@ -1953,6 +2057,20 @@ async function handleMcp(req: Request): Promise<Response> {
   } catch {
     return new Response(
       JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "JSON malformato" } }),
+      { status: 400, headers: { ...MCP_CORS, "content-type": "application/json" } },
+    );
+  }
+
+  // 📦 Un batch JSON-RPC è un ARRAY: senza questo cade nel ramo «notifica» e
+  // riceve un 202 muto, cioè il client aspetta per sempre risposte che non
+  // arriveranno. Meglio un errore esplicito: non supportiamo i batch.
+  if (Array.isArray(msg)) {
+    return new Response(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "batch non supportato: invia una richiesta per volta" },
+      }),
       { status: 400, headers: { ...MCP_CORS, "content-type": "application/json" } },
     );
   }
@@ -1999,11 +2117,18 @@ async function handleMcp(req: Request): Promise<Response> {
         }
         const toolName = String(params?.name ?? "");
         const args = (params?.arguments ?? {}) as Record<string, unknown>;
+        // 🕳️ Nessuna riga ha TRE cause diverse e non possiamo distinguerle da
+        // qui: il token ha già provato che il consenso è vivo (la RPC lo
+        // pretende), quindi restano «nessun corso ancora» e «il device non ha
+        // mai pubblicato». Dirle entrambe è onesto; indovinarne una no.
         const out = rows.length === 0
           ? {
             corsi: [],
-            nota: "Nessun estratto pubblicato: lo studente non ha ancora attivato " +
-              "«Assistente AI collegato» in Fluera, o non ha corsi.",
+            nota: "Nessun estratto pubblicato. Due cause possibili, e da qui " +
+              "non sono distinguibili: lo studente non ha ancora corsi in " +
+              "Fluera, oppure l'app non ha ancora pubblicato da questo " +
+              "dispositivo. Non dedurne che non abbia nulla da studiare.",
+            metodo: MCP_METHOD_NOTE,
           }
           : mcpCallTool(rows, toolName, args, Date.now());
         return reply({
