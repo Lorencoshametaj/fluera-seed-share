@@ -2533,17 +2533,18 @@ async function oauthAuthorize(req: Request, url: URL): Promise<Response> {
 
   const richiesta = { clientId, redirectUri, challenge, state, resource };
 
-  // Passo 2: torniamo da Supabase con un codice di sessione?
-  const sbCode = p.get("fluera_sb_code");
-  if (sbCode) {
-    const ident = await supabaseIdentityFromCode(sbCode);
-    if (!ident) return back("access_denied", "accesso non riuscito");
-    return html(200, renderOauthConsent(client.client_name || clientId, ident, richiesta));
-  }
+  // (Il ritorno da Supabase NON passa di qui: ha la sua rotta, /oauth/callback,
+  // che è l'unico posto dove lo stato firmato viene riaperto e il modulo del
+  // consenso riceve il suo valore. Un secondo ramo qui rendeva la pagina col
+  // segnaposto letterale al posto dello stato.)
 
   // Passo 1: nessuna identità → si va ad accedere a Fluera.
   const ritorno = new URL(`${OAUTH_ISSUER}/oauth/callback`);
-  ritorno.searchParams.set("fluera_state", oauthPackState(richiesta));
+  // 🔏 FIRMATO, non solo impacchettato: il callback verifica l'HMAC, e uno
+  // stato non firmato faceva morire OGNI collegamento con «sessione scaduta».
+  // (Trovato prima che ci passasse un utente: i pezzi erano provati, il
+  // percorso no — la stessa lezione della rotta /mcp cancellata.)
+  ritorno.searchParams.set("fluera_state", await oauthSignState(richiesta));
   const provider = p.get("provider") === "apple" ? "apple" : "google";
   const sbAuth = new URL(`${SUPABASE_URL}/auth/v1/authorize`);
   sbAuth.searchParams.set("provider", provider);
@@ -2560,17 +2561,16 @@ type OauthRichiesta = {
   resource: string;
 };
 
-// Lo stato viaggia FIRMATO: senza firma, chi torna dal provider potrebbe
-// riscrivere client_id o redirect_uri e farsi consegnare il codice altrove.
-function oauthPackState(r: OauthRichiesta): string {
-  return b64url(enc.encode(JSON.stringify(r)));
-}
-async function oauthSignState(r: OauthRichiesta): Promise<string> {
-  const payload = oauthPackState(r);
+// Lo stato viaggia FIRMATO — UNA sola funzione per produrlo, così non può
+// più esistere una via che impacchetta senza firmare: senza firma, chi torna
+// dal provider potrebbe riscrivere client_id o redirect_uri e farsi
+// consegnare il codice altrove.
+export async function oauthSignState(r: OauthRichiesta): Promise<string> {
+  const payload = b64url(enc.encode(JSON.stringify(r)));
   const sig = await crypto.subtle.sign("HMAC", await hmacKey(), enc.encode(payload));
   return `${payload}.${b64url(sig)}`;
 }
-async function oauthOpenState(signed: string): Promise<OauthRichiesta | null> {
+export async function oauthOpenState(signed: string): Promise<OauthRichiesta | null> {
   const i = signed.lastIndexOf(".");
   if (i < 0) return null;
   const payload = signed.slice(0, i);
