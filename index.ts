@@ -76,8 +76,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
     // GUARDA e basta, quindi rivendicarlo faceva solo rimbalzare l'utente), qui
     // l'app è l'unico posto dove l'invito ha senso: rivendicarlo evita che chi
     // ce l'ha già passi dalla pagina di consegna.
+    // /r/* = rientro su una tela PROPRIA (deep link «Atlas risponde» §5):
+    // emesso da notifiche ricche, win card e dal server MCP. L'unico posto
+    // dove il link ha senso è l'app installata — la pagina qui sotto è solo
+    // la consegna per chi non ce l'ha.
     return json({
-      applinks: { apps: [], details: [{ appID: `${APPLE_TEAM_ID}.${BUNDLE_ID}`, paths: ["/s/*", "/i/*", "/u/*", "/collab/*", "/p", "/p/*"] }] },
+      applinks: { apps: [], details: [{ appID: `${APPLE_TEAM_ID}.${BUNDLE_ID}`, paths: ["/s/*", "/i/*", "/u/*", "/collab/*", "/p", "/p/*", "/r/*"] }] },
     });
   }
   if (path.endsWith("/.well-known/assetlinks.json")) {
@@ -127,6 +131,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
         // da indicizzare — il server non conosce nemmeno il token — e un
         // crawler qui spenderebbe budget su una pagina identica ogni volta.
         "Disallow: /p",
+        // `/r/` è il rientro su una tela PERSONALE: stessa porta chiusa di
+        // `/c/` — si apre a chi ha il link, mai ai motori.
+        "Disallow: /r/",
+        // `/mcp` è un endpoint API autenticato: per un crawler è solo un 401.
+        "Disallow: /mcp",
         "Disallow: /get",
         "Disallow: /u/",
         "Disallow: /report",
@@ -297,6 +306,55 @@ Deno.serve(async (req: Request): Promise<Response> => {
       200,
       renderCollabPage(colm[1], store, platform, invite.toString()),
     );
+  }
+
+  // ── /r/{canvasId} → RIENTRO su una tela propria («Atlas risponde», §5) ─────
+  // Chi ha l'app non passa mai di qui (App/Universal Links la aprono
+  // direttamente); questa pagina è la consegna per chi tocca il proprio link
+  // su un device SENZA l'app: bottone custom-scheme per i browser in-app che
+  // non onorano gli App Links + lo store giusto. Il `concept` è ri-serializzato
+  // (mai la query grezza dentro un href) e cappato: è un'etichetta.
+  const rem = path.match(/\/r\/([A-Za-z0-9_-]{4,64})\/?$/);
+  if (rem) {
+    const platform = classify(req.headers.get("user-agent") ?? "");
+    const androidLive = (Deno.env.get("ANDROID_STORE_LIVE") ?? "") === "true";
+    const store = platform === "android" && androidLive
+      ? `https://play.google.com/store/apps/details?id=${BUNDLE_ID}`
+      : platform === "ios" && APPLE_APP_ID
+      ? `https://apps.apple.com/app/id${APPLE_APP_ID}`
+      : `${SITE}/beta`;
+    const q = new URLSearchParams();
+    const rawConcept = reqUrl.searchParams.get("concept");
+    if (rawConcept && rawConcept.length <= 120 && !/[\x00-\x1f<>"']/.test(rawConcept)) {
+      q.set("concept", rawConcept);
+    }
+    const appHref = `fluera://r/${rem[1]}${q.size ? `?${q.toString()}` : ""}`;
+    return html(
+      200,
+      `<!doctype html><html lang="it"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Riapri il quaderno — Fluera</title>
+<style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#F6F7F9;color:#1B2030}main{text-align:center;padding:2rem;max-width:26rem}a.btn{display:inline-block;margin-top:1rem;padding:.7rem 1.4rem;border-radius:10px;background:#2F4DC0;color:#fff;text-decoration:none;font-weight:600}p{color:#5C6475}</style>
+</head><body><main>
+<h1>Il tuo ripasso ti aspetta</h1>
+<p>Questo link riapre un tuo quaderno dentro Fluera. Se l'app è installata, aprilo da lì:</p>
+<a class="btn" href="${appHref}">Apri in Fluera</a>
+<p style="margin-top:1.5rem"><a href="${store}">Non hai l'app? Prendila qui</a></p>
+</main></body></html>`,
+    );
+  }
+
+  // ── /mcp → il connettore MCP («Atlas risponde» L1, 2026-08-22) ─────────────
+  // Server MCP (Streamable HTTP, risposte application/json, niente SSE) che
+  // serve l'ESTRATTO di studio: lettore SOTTILE di `study_digest` (migration
+  // 162) — niente matematica FSRS qui, solo confronti di date. Auth: token
+  // personale `fmcp_…` coniato in-app (`create_mcp_token`, migration 164),
+  // risolto con la RPC `mcp_resolve_token` via service_role. SOLO tool di
+  // lettura: un «segnami come saputo» detto in chat non deve poter comprare
+  // carte — il gemello server del cancello ExamUnlockGate.
+  if (/\/mcp\/?$/.test(path)) {
+    return await handleMcp(req);
   }
 
   // ── /get → «portami l'app», senza attribuzione ─────────────────────────────
@@ -1503,4 +1561,470 @@ function json(obj: unknown): Response {
     status: 200,
     headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=300" },
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🤝📡 MCP — il connettore dell'estratto di studio («Atlas risponde» L1)
+//
+// Contratto ereditato dallo spike L0 (tools/mcp-spike, kill-test superato il
+// 2026-08-22) e dall'oracolo Dart `study_digest_smoke`:
+//   • SCHEMA CHIUSO: le righe di `study_digest` passano da una proiezione ad
+//     allowlist — un campo fuori contratto scritto da chiunque NON esce mai
+//     (l'anti-dump del cancello canarino);
+//   • CONTEGGI, MAI PERCENTUALI + riga epistemica + computed_at su ogni
+//     risposta (freschezza onesta: se il device non pubblica da giorni, lo
+//     si dice, non si finge);
+//   • lista globale interleaved annotata per corso, mai silo per materia;
+//   • SOLO lettura: nessun tool di scrittura esiste, per costruzione.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MCP_EPISTEMIC =
+  "Conteggi, mai percentuali: secondo il modello, e se lo studente continua così.";
+const MCP_METHOD_NOTE =
+  "Il ripasso che conta si fa a libro chiuso dentro Fluera: questa lettura non registra nulla. " +
+  "Fluera alterna le materie di proposito (interleaving): non trasformare la lista in una maratona mono-materia. " +
+  "Chiudi SEMPRE un piano o un consiglio con il link `apri_in_fluera` del corso più urgente.";
+
+// Etichette-stadio leggibili (dal kill-test L0: i nomi SrsStage nudi
+// uscivano in inglese nel piano dell'assistente).
+const MCP_STAGE_LABEL: Record<string, string> = {
+  fragile: "🌱 fragile",
+  growing: "🌿 in crescita",
+  solid: "🌳 solido",
+  mastered: "⭐ padroneggiato",
+  integrated: "👻 integrato",
+};
+const mcpStageLabel = (s: string) => MCP_STAGE_LABEL[s] ?? s;
+
+type McpDue = { title: string; next_review_ms: number; stage: string };
+type McpErr = { title: string; next_review_ms: number };
+type McpTopic = { topic: string; accuracy_band: string; trend: string };
+type McpPayload = {
+  name: string;
+  exam_date_ms: number | null;
+  outcome: string | null;
+  readiness: { ready: number; at_risk: number; never_studied: number };
+  feasibility: string;
+  due: McpDue[];
+  due_total: number;
+  errors_due: McpErr[];
+  errors_due_total: number;
+  weak_topics: McpTopic[];
+};
+type McpRow = {
+  block_id: string;
+  canvas_id: string;
+  computed_at_ms: number;
+  payload: McpPayload;
+};
+
+function mcpPick<T>(src: Record<string, unknown>, keys: string[]): T {
+  const out: Record<string, unknown> = {};
+  for (const k of keys) if (k in src) out[k] = src[k];
+  return out as T;
+}
+
+// La proiezione a schema chiuso: gemella di `projectRow` dello spike e del
+// contratto Dart (`digestPayloadKeys` in study_digest_builder.dart).
+function mcpProjectRow(raw: Record<string, unknown>): McpRow {
+  const row = mcpPick<McpRow>(raw, ["block_id", "canvas_id", "computed_at_ms", "payload"]);
+  const rawPayload = (raw.payload_json ?? raw.payload ?? {}) as Record<string, unknown>;
+  const p = mcpPick<McpPayload>(rawPayload, [
+    "name", "exam_date_ms", "outcome", "readiness", "feasibility",
+    "due", "due_total", "errors_due", "errors_due_total", "weak_topics",
+  ]);
+  p.readiness = mcpPick(((p.readiness ?? {}) as unknown) as Record<string, unknown>,
+    ["ready", "at_risk", "never_studied"]) as McpPayload["readiness"];
+  p.due = ((p.due ?? []) as Record<string, unknown>[]).map((d) =>
+    mcpPick<McpDue>(d, ["title", "next_review_ms", "stage"]));
+  p.errors_due = ((p.errors_due ?? []) as Record<string, unknown>[]).map((e) =>
+    mcpPick<McpErr>(e, ["title", "next_review_ms"]));
+  p.weak_topics = ((p.weak_topics ?? []) as Record<string, unknown>[]).map((w) =>
+    mcpPick<McpTopic>(w, ["topic", "accuracy_band", "trend"]));
+  p.due_total = typeof p.due_total === "number" ? p.due_total : p.due.length;
+  p.errors_due_total =
+    typeof p.errors_due_total === "number" ? p.errors_due_total : p.errors_due.length;
+  row.payload = p;
+  return row;
+}
+
+// ── Auth: token personale → user_id, con una piccola cache positiva ─────────
+// Cache SOLO dei successi (TTL 5 min): una revoca deve mordere entro il TTL,
+// e un token sbagliato non deve potersi «scaldare» in cache.
+const MCP_TOKEN_TTL_MS = 5 * 60 * 1000;
+const _mcpTokenCache = new Map<string, { userId: string; at: number }>();
+
+async function mcpResolveToken(token: string): Promise<string | null> {
+  if (!/^fmcp_[a-f0-9]{48}$/.test(token)) return null;
+  const hit = _mcpTokenCache.get(token);
+  const now = Date.now();
+  if (hit && now - hit.at < MCP_TOKEN_TTL_MS) return hit.userId;
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/mcp_resolve_token`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ p_token: token }),
+  });
+  if (!resp.ok) return null;
+  const rows = (await resp.json()) as Array<{ user_id?: string }>;
+  const userId = rows?.[0]?.user_id ?? null;
+  if (userId) {
+    _mcpTokenCache.set(token, { userId, at: now });
+    if (_mcpTokenCache.size > 5000) {
+      for (const [k, v] of _mcpTokenCache) {
+        if (now - v.at >= MCP_TOKEN_TTL_MS) _mcpTokenCache.delete(k);
+      }
+    }
+  }
+  return userId;
+}
+
+// Rate limit per-token, stesso pattern floor-per-isolate dei limiter sopra.
+const MCP_RL_MAX = 240;
+const MCP_RL_WINDOW_MS = 10 * 60 * 1000;
+const _mcpHits = new Map<string, number[]>();
+function mcpRateLimited(key: string): boolean {
+  const now = Date.now();
+  const recent = (_mcpHits.get(key) ?? []).filter((t) => now - t < MCP_RL_WINDOW_MS);
+  recent.push(now);
+  _mcpHits.set(key, recent);
+  if (_mcpHits.size > 5000) {
+    for (const [k, v] of _mcpHits) {
+      if (v.every((t) => now - t >= MCP_RL_WINDOW_MS)) _mcpHits.delete(k);
+    }
+  }
+  return recent.length > MCP_RL_MAX;
+}
+
+async function mcpLoadDigest(userId: string): Promise<McpRow[] | null> {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
+  const url = `${SUPABASE_URL}/rest/v1/study_digest` +
+    `?user_id=eq.${encodeURIComponent(userId)}` +
+    `&select=block_id,canvas_id,computed_at_ms,payload_json&order=block_id`;
+  const resp = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      Accept: "application/json",
+    },
+  });
+  if (!resp.ok) return null;
+  const rows = (await resp.json()) as Record<string, unknown>[];
+  return rows.map(mcpProjectRow);
+}
+
+// ── I 5 tool (sola lettura) — porting fedele dello spike ────────────────────
+
+const mcpIso = (ms: number | null | undefined) =>
+  ms == null ? null : new Date(ms).toISOString().slice(0, 10);
+const mcpDaysLeft = (examMs: number | null, now: number) =>
+  examMs == null ? null : Math.ceil((examMs - now) / 86_400_000);
+const mcpOpenInApp = (canvasId: string) => `https://share.fluera.dev/r/${canvasId}`;
+
+function mcpWrap(rows: McpRow[], body: Record<string, unknown>): Record<string, unknown> {
+  const oldest = rows.length ? Math.min(...rows.map((r) => r.computed_at_ms)) : 0;
+  return {
+    ...body,
+    computed_at: oldest ? new Date(oldest).toISOString() : null,
+    nota: MCP_EPISTEMIC,
+    metodo: MCP_METHOD_NOTE,
+  };
+}
+
+function mcpCourseSummary(r: McpRow, now: number): Record<string, unknown> {
+  const p = r.payload;
+  if (p.outcome === "passed") {
+    return {
+      corso: p.name,
+      stato: "superato 🎉",
+      esame: mcpIso(p.exam_date_ms),
+      nota_corso: "Fuori dalla pianificazione: l'esame è passato.",
+    };
+  }
+  return {
+    corso: p.name,
+    esame: mcpIso(p.exam_date_ms),
+    giorni_rimanenti: mcpDaysLeft(p.exam_date_ms, now),
+    prontezza: {
+      sopra_soglia: p.readiness.ready,
+      a_rischio: p.readiness.at_risk,
+      mai_studiati: p.readiness.never_studied,
+    },
+    nota_prontezza: "«mai studiati» = mai visti: non è la stessa cosa di «a rischio».",
+    fattibilita: p.feasibility,
+    in_scadenza_ora: p.due.filter((d) => d.next_review_ms <= now).length,
+    errori_da_ricontrollare: p.errors_due.filter((e) => e.next_review_ms <= now).length,
+    apri_in_fluera: mcpOpenInApp(r.canvas_id),
+  };
+}
+
+function mcpFindCourse(rows: McpRow[], q: string): McpRow | undefined {
+  const n = q.trim().toLowerCase();
+  return rows.find((r) => r.payload.name.toLowerCase() === n) ??
+    rows.find((r) => r.payload.name.toLowerCase().includes(n));
+}
+
+class McpRpcError extends Error {
+  constructor(public code: number, message: string) {
+    super(message);
+  }
+}
+
+function mcpCallTool(
+  rows: McpRow[],
+  name: string,
+  args: Record<string, unknown>,
+  now: number,
+): Record<string, unknown> {
+  const active = rows.filter((r) => r.payload.outcome !== "passed");
+  switch (name) {
+    case "list_courses":
+      return mcpWrap(rows, { corsi: rows.map((r) => mcpCourseSummary(r, now)) });
+
+    case "get_readiness": {
+      const r = mcpFindCourse(rows, String(args.course ?? ""));
+      if (!r) return mcpWrap(rows, { errore: `Corso non trovato: "${args.course}". Usa list_courses.` });
+      return mcpWrap([r], mcpCourseSummary(r, now));
+    }
+
+    case "get_due_now": {
+      const scope = args.course
+        ? [mcpFindCourse(active, String(args.course))].filter(Boolean) as McpRow[]
+        : active;
+      const due = scope.flatMap((r) =>
+        r.payload.due.filter((d) => d.next_review_ms <= now).map((d) => ({
+          concetto: d.title,
+          corso: r.payload.name,
+          stadio: mcpStageLabel(d.stage),
+          in_ritardo_da_giorni: Math.max(0, Math.floor((now - d.next_review_ms) / 86_400_000)),
+          apri_in_fluera: mcpOpenInApp(r.canvas_id),
+        }))
+      ).sort((a, b) => b.in_ritardo_da_giorni - a.in_ritardo_da_giorni);
+      const errors = scope.flatMap((r) =>
+        r.payload.errors_due.filter((e) => e.next_review_ms <= now).map((e) => ({
+          errore: e.title,
+          corso: r.payload.name,
+        }))
+      );
+      const CAP = 20;
+      return mcpWrap(scope.length ? scope : rows, {
+        in_scadenza_ora: due.slice(0, CAP),
+        totale_in_scadenza: due.length,
+        ...(due.length > CAP ? { nota_cap: `Mostrati ${CAP} di ${due.length}.` } : {}),
+        errori_da_ricontrollare: errors,
+      });
+    }
+
+    case "get_review_forecast": {
+      const days = Math.min(Number(args.days ?? 7), 14);
+      const buckets: Record<string, number> = { in_ritardo: 0 };
+      for (let i = 0; i < days; i++) buckets[mcpIso(now + i * 86_400_000)!] = 0;
+      for (const r of active) {
+        for (const d of [...r.payload.due, ...r.payload.errors_due]) {
+          if (d.next_review_ms <= now) buckets.in_ritardo++;
+          else {
+            const key = mcpIso(d.next_review_ms)!;
+            if (key in buckets) buckets[key]++;
+          }
+        }
+      }
+      return mcpWrap(active.length ? active : rows, { previsione_ritorni: buckets });
+    }
+
+    case "get_weak_topics": {
+      const scope = args.course
+        ? [mcpFindCourse(active, String(args.course))].filter(Boolean) as McpRow[]
+        : active;
+      const topics = scope.flatMap((r) =>
+        r.payload.weak_topics.map((w) => ({
+          topic: w.topic,
+          corso: r.payload.name,
+          accuratezza: w.accuracy_band,
+          tendenza: w.trend,
+        }))
+      );
+      return mcpWrap(scope.length ? scope : rows, {
+        topic_deboli: topics,
+        nota_fonte: "Solo topic con evidenza sufficiente dagli esami recenti in Fluera.",
+      });
+    }
+
+    default:
+      throw new McpRpcError(-32602, `Tool sconosciuto: ${name}`);
+  }
+}
+
+const MCP_TOOL_DEFS = [
+  {
+    name: "list_courses",
+    description:
+      "Elenca i corsi dello studente su Fluera: data d'esame, giorni rimanenti, prontezza a conteggi (sopra soglia / a rischio / mai studiati), fattibilità, esito. Un corso «superato» è fuori dalla pianificazione.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "get_readiness",
+    description:
+      "La prontezza di UN corso proiettata alla sua data d'esame, a conteggi (mai percentuali), con la fattibilità al ritmo attuale.",
+    inputSchema: {
+      type: "object",
+      properties: { course: { type: "string", description: "Nome del corso" } },
+      required: ["course"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_due_now",
+    description:
+      "I concetti in scadenza ADESSO e gli errori da ricontrollare, lista globale annotata per corso (mai in silo: Fluera alterna le materie di proposito). Opzionale: filtra per corso. Chiudi ogni piano col link apri_in_fluera.",
+    inputSchema: {
+      type: "object",
+      properties: { course: { type: "string" } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_review_forecast",
+    description:
+      "Conteggi di ritorni dovuti per giorno, prossimi N giorni (default 7, max 14), più il bucket «in ritardo».",
+    inputSchema: {
+      type: "object",
+      properties: { days: { type: "number" } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_weak_topics",
+    description:
+      "I topic deboli dagli esami recenti in Fluera: accuratezza (fascia), tendenza. Solo topic con evidenza sufficiente.",
+    inputSchema: {
+      type: "object",
+      properties: { course: { type: "string" } },
+      additionalProperties: false,
+    },
+  },
+];
+
+const MCP_CORS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "POST, GET, DELETE, OPTIONS",
+  "access-control-allow-headers":
+    "content-type, authorization, mcp-session-id, mcp-protocol-version",
+};
+
+async function handleMcp(req: Request): Promise<Response> {
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: MCP_CORS });
+  if (req.method === "DELETE") return new Response(null, { status: 200, headers: MCP_CORS });
+  if (req.method !== "POST") return new Response(null, { status: 405, headers: MCP_CORS });
+
+  const authHeader = req.headers.get("authorization") ?? "";
+  const token = authHeader.toLowerCase().startsWith("bearer ")
+    ? authHeader.slice(7).trim()
+    : "";
+  // Il limiter PRIMA della validazione (convenzione del file: uno spammer non
+  // deve schivarlo con un 401 economico). Chiave = token se plausibile,
+  // altrimenti l'IP.
+  const rlKey = token.length > 10 ? token : `ip:${clientIp(req)}`;
+  if (mcpRateLimited(rlKey)) {
+    return new Response(JSON.stringify({ error: "rate_limited" }), {
+      status: 429,
+      headers: { ...MCP_CORS, "content-type": "application/json" },
+    });
+  }
+  const userId = token ? await mcpResolveToken(token) : null;
+  if (!userId) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), {
+      status: 401,
+      headers: {
+        ...MCP_CORS,
+        "www-authenticate": 'Bearer resource="fluera-study"',
+        "content-type": "application/json",
+      },
+    });
+  }
+
+  let msg: Record<string, unknown>;
+  try {
+    msg = await req.json() as Record<string, unknown>;
+  } catch {
+    return new Response(
+      JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "JSON malformato" } }),
+      { status: 400, headers: { ...MCP_CORS, "content-type": "application/json" } },
+    );
+  }
+
+  const { id, method, params } = msg as {
+    id?: unknown;
+    method?: string;
+    params?: Record<string, unknown>;
+  };
+  const reply = (payload: Record<string, unknown>, status = 200) =>
+    new Response(JSON.stringify(payload), {
+      status,
+      headers: { ...MCP_CORS, "content-type": "application/json", "mcp-session-id": "fluera" },
+    });
+  if (id === undefined) return new Response(null, { status: 202, headers: MCP_CORS }); // notifiche
+
+  try {
+    switch (method) {
+      case "initialize":
+        return reply({
+          jsonrpc: "2.0",
+          id,
+          result: {
+            protocolVersion: (params?.protocolVersion as string) ?? "2025-06-18",
+            capabilities: { tools: { listChanged: false } },
+            serverInfo: { name: "fluera-study", version: "0.1.0" },
+            instructions:
+              "Dati di misura dello studio su Fluera (sola lettura). " +
+              MCP_EPISTEMIC + " " + MCP_METHOD_NOTE,
+          },
+        });
+      case "ping":
+        return reply({ jsonrpc: "2.0", id, result: {} });
+      case "tools/list":
+        return reply({ jsonrpc: "2.0", id, result: { tools: MCP_TOOL_DEFS } });
+      case "tools/call": {
+        const rows = await mcpLoadDigest(userId);
+        if (rows === null) {
+          return reply({
+            jsonrpc: "2.0",
+            id,
+            error: { code: -32603, message: "digest non raggiungibile: riprova" },
+          });
+        }
+        const toolName = String(params?.name ?? "");
+        const args = (params?.arguments ?? {}) as Record<string, unknown>;
+        const out = rows.length === 0
+          ? {
+            corsi: [],
+            nota: "Nessun estratto pubblicato: lo studente non ha ancora attivato " +
+              "«Assistente AI collegato» in Fluera, o non ha corsi.",
+          }
+          : mcpCallTool(rows, toolName, args, Date.now());
+        return reply({
+          jsonrpc: "2.0",
+          id,
+          result: { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] },
+        });
+      }
+      default:
+        return reply({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: `Metodo non supportato: ${method}` },
+        });
+    }
+  } catch (e) {
+    const code = e instanceof McpRpcError ? e.code : -32603;
+    return reply({
+      jsonrpc: "2.0",
+      id,
+      error: { code, message: String((e as Error).message ?? e) },
+    });
+  }
 }
