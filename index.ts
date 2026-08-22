@@ -2544,12 +2544,21 @@ async function oauthAuthorize(req: Request, url: URL): Promise<Response> {
   // stato non firmato faceva morire OGNI collegamento con «sessione scaduta».
   // (Trovato prima che ci passasse un utente: i pezzi erano provati, il
   // percorso no — la stessa lezione della rotta /mcp cancellata.)
-  ritorno.searchParams.set("fluera_state", await oauthSignState(richiesta));
+  const statoFirmato = await oauthSignState(richiesta);
+  ritorno.searchParams.set("fluera_state", statoFirmato);
   const provider = p.get("provider") === "apple" ? "apple" : "google";
   const sbAuth = new URL(`${SUPABASE_URL}/auth/v1/authorize`);
   sbAuth.searchParams.set("provider", provider);
   sbAuth.searchParams.set("redirect_to", ritorno.toString());
-  sbAuth.searchParams.set("flow_type", "pkce");
+  // ⚠️ `flow_type=pkce` NON è un parametro REST: è un'opzione della libreria
+  // JS, che poi manda QUESTI due. Mandandolo, Supabase lo ignorava e usava il
+  // flusso implicito — token nel FRAMMENTO dell'URL, che al server non arriva
+  // mai: il callback non vedeva nessun codice e ogni collegamento moriva in
+  // «Autorizzazione non riuscita» (misurato dal vivo il 2026-08-22).
+  sbAuth.searchParams.set(
+    "code_challenge", b64url(await sha256(await pkceVerifierFor(statoFirmato))),
+  );
+  sbAuth.searchParams.set("code_challenge_method", "s256");
   return html(200, renderOauthSignIn(client.client_name || clientId, sbAuth.toString()));
 }
 
@@ -2565,6 +2574,17 @@ type OauthRichiesta = {
 // più esistere una via che impacchetta senza firmare: senza firma, chi torna
 // dal provider potrebbe riscrivere client_id o redirect_uri e farsi
 // consegnare il codice altrove.
+/// 🔑 Il verifier PKCE per il login su Supabase, DERIVATO dallo stato firmato
+/// con lo stesso segreto: non serve conservarlo e non viaggia mai nell'URL —
+/// chi non ha il segreto non può calcolarlo. (Infilarlo nello stato avrebbe
+/// fatto viaggiare verifier e codice insieme: PKCE sarebbe stato decorativo.)
+export async function pkceVerifierFor(statePayload: string): Promise<string> {
+  const mac = await crypto.subtle.sign(
+    "HMAC", await hmacKey(), enc.encode(`pkce-supabase:${statePayload}`),
+  );
+  return b64url(mac); // 43 caratteri base64url, la lunghezza che la RFC vuole
+}
+
 export async function oauthSignState(r: OauthRichiesta): Promise<string> {
   const payload = b64url(enc.encode(JSON.stringify(r)));
   const sig = await crypto.subtle.sign("HMAC", await hmacKey(), enc.encode(payload));
@@ -2604,12 +2624,16 @@ async function oauthLoadClient(
 /// sessione NON viene conservato: qui serve solo sapere CHI è.
 async function supabaseIdentityFromCode(
   code: string,
+  statePayload: string,
 ): Promise<{ userId: string; email: string } | null> {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
   const r = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=pkce`, {
     method: "POST",
     headers: { apikey: SUPABASE_ANON_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ auth_code: code }),
+    body: JSON.stringify({
+      auth_code: code,
+      code_verifier: await pkceVerifierFor(statePayload),
+    }),
   });
   if (!r.ok) return null;
   const d = await r.json() as { user?: { id?: string; email?: string } };
@@ -2697,7 +2721,7 @@ async function oauthCallback(url: URL): Promise<Response> {
     if (r.state) u.searchParams.set("state", r.state);
     return Response.redirect(u.toString(), 302);
   }
-  const ident = await supabaseIdentityFromCode(code);
+  const ident = await supabaseIdentityFromCode(code, signed);
   if (!ident) {
     return html(400, statusPage("Accesso non riuscito", "Riprova il collegamento."));
   }
