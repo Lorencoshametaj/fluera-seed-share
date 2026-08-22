@@ -2069,10 +2069,22 @@ export function mcpCallTool(
           nota_zero:
             "Nessun ripasso DOVUTO adesso non vuol dire che non ci sia niente da fare: " +
             [
-              maiVisti > 0 ? `${maiVisti} concetti non sono mai stati visti` : null,
-              aRischio > 0 ? `${aRischio} sono sotto soglia` : null,
+              maiVisti > 0
+                ? maiVisti === 1
+                  ? "1 concetto non è mai stato visto"
+                  : `${maiVisti} concetti non sono mai stati visti`
+                : null,
+              aRischio > 0
+                ? aRischio === 1
+                  ? "1 è sotto soglia"
+                  : `${aRischio} sono sotto soglia`
+                : null,
               typeof esameVicino === "number" && esameVicino <= 30
-                ? `l'esame più vicino è fra ${esameVicino} giorni`
+                ? esameVicino === 0
+                  ? "l'esame più vicino è oggi"
+                  : esameVicino === 1
+                  ? "l'esame più vicino è domani"
+                  : `l'esame più vicino è fra ${esameVicino} giorni`
                 : null,
             ].filter(Boolean).join(", ") +
             ". Non dire allo studente che è a posto: dillo solo se non c'è " +
