@@ -320,6 +320,24 @@ export const servi = async (req: Request): Promise<Response> => {
   // su un device SENZA l'app: bottone custom-scheme per i browser in-app che
   // non onorano gli App Links + lo store giusto. Il `concept` è ri-serializzato
   // (mai la query grezza dentro un href) e cappato: è un'etichetta.
+  // ── OAuth 2.1 — i metadati e il flusso («Atlas risponde» L2) ──────────────
+  // I due .well-known stanno in cima alle rotte OAuth di proposito: sono ciò
+  // che un client legge PRIMA di qualunque altra cosa, e la spec MCP li rende
+  // obbligatori (RFC 9728 per la risorsa, RFC 8414 per l'AS).
+  if (path.endsWith("/.well-known/oauth-protected-resource") ||
+      path.endsWith("/.well-known/oauth-protected-resource/mcp")) {
+    return protectedResourceMetadata();
+  }
+  if (path.endsWith("/.well-known/oauth-authorization-server")) {
+    return authorizationServerMetadata();
+  }
+  if (/\/oauth\/register\/?$/.test(path)) return await oauthRegister(req);
+  if (/\/oauth\/authorize\/?$/.test(path)) return await oauthAuthorize(req, reqUrl);
+  if (/\/oauth\/callback\/?$/.test(path)) return await oauthCallback(reqUrl);
+  if (/\/oauth\/approve\/?$/.test(path)) return await oauthApprove(req);
+  if (/\/oauth\/token\/?$/.test(path)) return await oauthToken(req);
+  if (/\/oauth\/revoke\/?$/.test(path)) return await oauthRevoke(req);
+
   // ── /mcp → il connettore MCP («Atlas risponde» L1) ────────────────────────
   // Server MCP (Streamable HTTP, application/json) che serve l'ESTRATTO di
   // studio: lettore SOTTILE di `study_digest` — niente matematica FSRS qui,
@@ -1753,6 +1771,26 @@ async function mcpResolveToken(token: string): Promise<string | null> {
   return userId;
 }
 
+// Consenso per i token OAuth: il JWT non passa dalla RPC che lo verifica, ma
+// il permesso deve restare vivo. Cache POSITIVA breve, come per i token: una
+// revoca morde entro il TTL, e un rifiuto non si scalda mai in cache.
+const _mcpOauthConsent = new Map<string, number>();
+async function mcpOauthConsentOk(userId: string): Promise<boolean> {
+  const now = Date.now();
+  const hit = _mcpOauthConsent.get(userId);
+  if (hit && now - hit < MCP_TOKEN_TTL_MS) return true;
+  const ok = await oauthUserHasDigestConsent(userId);
+  if (ok) {
+    _mcpOauthConsent.set(userId, now);
+    if (_mcpOauthConsent.size > 5000) {
+      for (const [k, v] of _mcpOauthConsent) {
+        if (now - v >= MCP_TOKEN_TTL_MS) _mcpOauthConsent.delete(k);
+      }
+    }
+  }
+  return ok;
+}
+
 // Rate limit per-token, stesso pattern floor-per-isolate dei limiter sopra.
 const MCP_RL_MAX = 240;
 const MCP_RL_WINDOW_MS = 10 * 60 * 1000;
@@ -2054,13 +2092,31 @@ async function handleMcp(req: Request): Promise<Response> {
       headers: { ...MCP_CORS, "content-type": "application/json" },
     });
   }
-  const userId = token ? await mcpResolveToken(token) : null;
+  // Due credenziali, una porta: la chiave personale `fmcp_…` (L1, terminale) e
+  // il token OAuth (L2, connettori web). Si prova prima quella di forma nota,
+  // così un JWT non paga mai un round-trip alla RPC.
+  let userId: string | null = null;
+  if (token.startsWith("fmcp_")) {
+    userId = await mcpResolveToken(token);
+  } else if (token.length > 0) {
+    const claims = await jwtVerify(token);
+    if (claims) {
+      const sub = String(claims.sub);
+      // Il consenso vale anche qui: il JWT prova CHI sei, non che il permesso
+      // sia ancora vivo. Stessa regola della chiave personale, stessa cache.
+      if (await mcpOauthConsentOk(sub)) userId = sub;
+    }
+  }
   if (!userId) {
+    // 🔎 La spec MCP pretende che il 401 dica DOVE trovare i metadati della
+    // risorsa: è così che un client scopre l'authorization server senza che
+    // nessuno glielo configuri a mano.
     return new Response(JSON.stringify({ error: "unauthorized" }), {
       status: 401,
       headers: {
         ...MCP_CORS,
-        "www-authenticate": 'Bearer resource="fluera-study"',
+        "www-authenticate":
+          `Bearer resource_metadata="${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="${OAUTH_SCOPE}"`,
         "content-type": "application/json",
       },
     });
@@ -2167,4 +2223,713 @@ async function handleMcp(req: Request): Promise<Response> {
       error: { code, message: String((e as Error).message ?? e) },
     });
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🔐 OAUTH 2.1 — l'authorization server del connettore («Atlas risponde» L2)
+//
+// PERCHÉ ESISTE: i connettori web (claude.ai, ChatGPT) non hanno un campo per
+// una chiave personale — parlano OAuth. Finché c'era solo `fmcp_…`, la
+// promessa «collega il tuo assistente» valeva per i soli client da terminale.
+//
+// COSA IMPONE LA SPEC MCP, e dove sta qui:
+//   • RFC 9728 Protected Resource Metadata  → /.well-known/oauth-protected-resource
+//   • RFC 8414 Authorization Server Metadata→ /.well-known/oauth-authorization-server
+//   • WWW-Authenticate col `resource_metadata` sul 401
+//   • PKCE S256 obbligatorio (OAuth 2.1) — `plain` RIFIUTATO
+//   • RFC 8707 `resource` + audience VALIDATA lato risorsa
+//   • RFC 9207 `iss` nella risposta di autorizzazione
+//   • RFC 7591 Dynamic Client Registration (deprecata dalla spec ma è ciò che
+//     i connettori usano oggi; tenuta con tetto e validazione delle redirect)
+//
+// SCELTA DI IDENTITÀ: l'utente NON si autentica qui con una password. Il
+// consenso rimbalza su Supabase Auth col flusso PKCE del provider (Google /
+// Apple), che è come si accede a Fluera — chi entra con Google non ha una
+// password da digitare, e noi non dobbiamo custodirne una.
+//
+// IL TOKEN: JWT HS256 con `aud` = URI canonico del nostro MCP. Verificato in
+// locale a ogni richiesta (nessun round-trip). Ciò che va revocato — codici e
+// refresh — vive nel database; l'access token dura poco e non si revoca.
+// ═══════════════════════════════════════════════════════════════════════════
+
+export const MCP_RESOURCE = "https://share.fluera.dev/mcp"; // URI canonico (RFC 8707)
+export const OAUTH_ISSUER = "https://share.fluera.dev";
+const OAUTH_SCOPE = "study:read";
+const OAUTH_CODE_TTL_MS = 10 * 60 * 1000;
+const OAUTH_ACCESS_TTL_S = 60 * 60; // 1 ora: corta di proposito, c'è il refresh
+
+const enc = new TextEncoder();
+
+const b64url = (b: ArrayBuffer | Uint8Array): string => {
+  const u = b instanceof Uint8Array ? b : new Uint8Array(b);
+  let s = "";
+  for (const x of u) s += String.fromCharCode(x);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+const b64urlDecode = (s: string): Uint8Array<ArrayBuffer> => {
+  const p = s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4);
+  const raw = atob(p);
+  const out = new Uint8Array(new ArrayBuffer(raw.length));
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+};
+async function sha256(s: string): Promise<Uint8Array<ArrayBuffer>> {
+  const d = await crypto.subtle.digest("SHA-256", enc.encode(s));
+  return new Uint8Array(d);
+}
+const hexOf = (u: Uint8Array) =>
+  [...u].map((b) => b.toString(16).padStart(2, "0")).join("");
+// PostgREST vuole i bytea in esadecimale con prefisso `\x`.
+const pgHex = (u: Uint8Array) => `\\x${hexOf(u)}`;
+
+async function hmacKey(): Promise<CryptoKey> {
+  const secret = Deno.env.get("MCP_JWT_SECRET") ?? "";
+  if (secret.length < 32) {
+    // Fail-closed: senza segreto NON si firma nulla. Un segreto assente che
+    // diventasse la stringa vuota renderebbe falsificabile ogni token.
+    throw new Error("MCP_JWT_SECRET assente o troppo corto (min 32 caratteri)");
+  }
+  return await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"],
+  );
+}
+
+export async function jwtSign(claims: Record<string, unknown>): Promise<string> {
+  const head = b64url(enc.encode(JSON.stringify({ alg: "HS256", typ: "JWT" })));
+  const body = b64url(enc.encode(JSON.stringify(claims)));
+  const sig = await crypto.subtle.sign("HMAC", await hmacKey(), enc.encode(`${head}.${body}`));
+  return `${head}.${body}.${b64url(sig)}`;
+}
+
+/// Verifica firma, scadenza, emittente e — la parte che la spec chiama per
+/// nome — l'AUDIENCE: un token emesso per un altro server non vale qui.
+export async function jwtVerify(token: string): Promise<Record<string, unknown> | null> {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [head, body, sig] = parts;
+  let ok = false;
+  try {
+    ok = await crypto.subtle.verify(
+      "HMAC",
+      await hmacKey(),
+      b64urlDecode(sig),
+      enc.encode(`${head}.${body}`),
+    );
+  } catch {
+    return null; // segreto mancante = nessun token è valido
+  }
+  if (!ok) return null;
+  let claims: Record<string, unknown>;
+  try {
+    claims = JSON.parse(new TextDecoder().decode(b64urlDecode(body)));
+  } catch {
+    return null;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (typeof claims.exp !== "number" || claims.exp <= now) return null;
+  if (claims.iss !== OAUTH_ISSUER) return null;
+  const aud = claims.aud;
+  const audOk = Array.isArray(aud) ? aud.includes(MCP_RESOURCE) : aud === MCP_RESOURCE;
+  if (!audOk) return null; // RFC 8707: emesso per NOI, o non vale
+  if (typeof claims.sub !== "string" || claims.sub.length === 0) return null;
+  return claims;
+}
+
+// ── Accesso al database con service_role (stessa forma del resto del file) ──
+async function pgFetch(path: string, init: RequestInit = {}): Promise<Response | null> {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
+  return await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...init,
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(init.headers ?? {}),
+    },
+  });
+}
+
+const oauthJson = (obj: unknown, status = 200, extra: Record<string, string> = {}) =>
+  new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": status === 200 ? "public, max-age=300" : "no-store",
+      ...MCP_CORS,
+      ...extra,
+    },
+  });
+const oauthError = (error: string, desc: string, status = 400) =>
+  oauthJson({ error, error_description: desc }, status);
+
+// ── I metadati (RFC 9728 e RFC 8414) ────────────────────────────────────────
+
+export function protectedResourceMetadata(): Response {
+  return oauthJson({
+    resource: MCP_RESOURCE,
+    authorization_servers: [OAUTH_ISSUER],
+    scopes_supported: [OAUTH_SCOPE],
+    bearer_methods_supported: ["header"],
+    resource_documentation: `${SITE}/connect`,
+  });
+}
+
+export function authorizationServerMetadata(): Response {
+  return oauthJson({
+    issuer: OAUTH_ISSUER,
+    authorization_endpoint: `${OAUTH_ISSUER}/oauth/authorize`,
+    token_endpoint: `${OAUTH_ISSUER}/oauth/token`,
+    registration_endpoint: `${OAUTH_ISSUER}/oauth/register`,
+    revocation_endpoint: `${OAUTH_ISSUER}/oauth/revoke`,
+    scopes_supported: [OAUTH_SCOPE],
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    // 🔒 SOLO S256: OAuth 2.1 vieta `plain`, e dichiararlo qui significa che
+    // nessun client può nemmeno provarci.
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"], // client pubblici + PKCE
+    authorization_response_iss_parameter_supported: true, // RFC 9207
+  });
+}
+
+// ── /oauth/register — Dynamic Client Registration (RFC 7591) ────────────────
+// La spec la segna deprecata a favore dei Client ID Metadata Documents, ma i
+// connettori in campo oggi registrano dinamicamente: senza questo, claude.ai
+// non arriva nemmeno alla schermata di consenso.
+async function oauthRegister(req: Request): Promise<Response> {
+  if (req.method !== "POST") return oauthError("invalid_request", "usa POST", 405);
+  if (oauthRateLimited(`reg:${clientIp(req)}`, 20)) {
+    return oauthError("temporarily_unavailable", "troppe registrazioni", 429);
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = await req.json() as Record<string, unknown>;
+  } catch {
+    return oauthError("invalid_client_metadata", "JSON malformato");
+  }
+  const uris = Array.isArray(body.redirect_uris) ? body.redirect_uris as unknown[] : [];
+  const redirects: string[] = [];
+  for (const u of uris) {
+    if (typeof u !== "string" || u.length > 512) continue;
+    let parsed: URL;
+    try {
+      parsed = new URL(u);
+    } catch {
+      return oauthError("invalid_redirect_uri", `redirect_uri non è una URL: ${u}`);
+    }
+    // 🔒 Solo https, o localhost in chiaro per i client da scrivania (OAuth
+    // 2.1 §8.4.2). Un `http://` verso l'esterno rimanderebbe un codice di
+    // autorizzazione su un canale in chiaro; niente frammenti, niente
+    // credenziali nell'URL.
+    const localhost = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && localhost)) {
+      return oauthError("invalid_redirect_uri", `solo https (o http su localhost): ${u}`);
+    }
+    if (parsed.hash) return oauthError("invalid_redirect_uri", "niente frammento");
+    redirects.push(parsed.toString());
+  }
+  if (redirects.length === 0) {
+    return oauthError("invalid_redirect_uri", "serve almeno una redirect_uri valida");
+  }
+
+  const clientId = `fmcpc_${hexOf(crypto.getRandomValues(new Uint8Array(16)))}`;
+  const name = typeof body.client_name === "string" ? body.client_name.slice(0, 120) : "";
+  const resp = await pgFetch("oauth_clients", {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ client_id: clientId, client_name: name, redirect_uris: redirects }),
+  });
+  if (!resp || !resp.ok) {
+    return oauthError("server_error", "registrazione non riuscita", 503);
+  }
+  return oauthJson({
+    client_id: clientId,
+    client_name: name,
+    redirect_uris: redirects,
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+    client_id_issued_at: Math.floor(Date.now() / 1000),
+  }, 201, { "cache-control": "no-store" });
+}
+
+// Limitatore condiviso dagli endpoint OAuth (stesso pattern-casa per-isolate).
+const _oauthHits = new Map<string, number[]>();
+function oauthRateLimited(key: string, max: number): boolean {
+  const now = Date.now();
+  const win = 10 * 60 * 1000;
+  const recent = (_oauthHits.get(key) ?? []).filter((t) => now - t < win);
+  recent.push(now);
+  _oauthHits.set(key, recent);
+  if (_oauthHits.size > 5000) {
+    for (const [k, v] of _oauthHits) {
+      if (v.every((t) => now - t >= win)) _oauthHits.delete(k);
+    }
+  }
+  return recent.length > max;
+}
+
+// ── /oauth/authorize — il consenso, con l'identità presa da Supabase ────────
+// Due passaggi: (1) senza sessione, si rimbalza su Supabase (Google/Apple) col
+// flusso PKCE, portandosi dietro i parametri OAuth nello `state`; (2) tornati
+// col codice di Supabase, lo si scambia per l'identità e si mostra la
+// schermata di consenso, che è l'unico punto in cui l'utente decide.
+async function oauthAuthorize(req: Request, url: URL): Promise<Response> {
+  const p = url.searchParams;
+  const clientId = p.get("client_id") ?? "";
+  const redirectUri = p.get("redirect_uri") ?? "";
+  const challenge = p.get("code_challenge") ?? "";
+  const method = p.get("code_challenge_method") ?? "";
+  const state = p.get("state") ?? "";
+  const resource = p.get("resource") ?? MCP_RESOURCE;
+
+  // 🔑 Gli errori PRIMA di aver validato client+redirect NON si rimandano al
+  // redirect_uri (sarebbe un open redirect): si mostrano qui.
+  if (p.get("response_type") !== "code") {
+    return html(400, statusPage("Richiesta non valida", "response_type deve essere «code»."));
+  }
+  if (!clientId || !redirectUri) {
+    return html(400, statusPage("Richiesta non valida", "Mancano client_id o redirect_uri."));
+  }
+  const client = await oauthLoadClient(clientId);
+  if (!client) {
+    return html(400, statusPage("Applicazione sconosciuta", "Questo client non è registrato."));
+  }
+  if (!client.redirect_uris.includes(redirectUri)) {
+    // Confronto ESATTO, mai per prefisso: un match parziale è la via classica
+    // per farsi consegnare i codici altrove.
+    return html(400, statusPage("Indirizzo di ritorno non valido", "Non corrisponde a quelli registrati."));
+  }
+  // Da qui in poi l'errore può tornare al client, che è registrato.
+  const back = (err: string, desc: string) => {
+    const u = new URL(redirectUri);
+    u.searchParams.set("error", err);
+    u.searchParams.set("error_description", desc);
+    u.searchParams.set("iss", OAUTH_ISSUER); // RFC 9207 anche sugli errori
+    if (state) u.searchParams.set("state", state);
+    return Response.redirect(u.toString(), 302);
+  };
+  if (method !== "S256") return back("invalid_request", "serve PKCE con S256");
+  if (!/^[A-Za-z0-9._~-]{43,128}$/.test(challenge)) {
+    return back("invalid_request", "code_challenge malformato");
+  }
+  if (resource !== MCP_RESOURCE) {
+    // RFC 8707: un token per un'altra risorsa non lo emettiamo.
+    return back("invalid_target", `resource deve essere ${MCP_RESOURCE}`);
+  }
+
+  const richiesta = { clientId, redirectUri, challenge, state, resource };
+
+  // Passo 2: torniamo da Supabase con un codice di sessione?
+  const sbCode = p.get("fluera_sb_code");
+  if (sbCode) {
+    const ident = await supabaseIdentityFromCode(sbCode);
+    if (!ident) return back("access_denied", "accesso non riuscito");
+    return html(200, renderOauthConsent(client.client_name || clientId, ident, richiesta));
+  }
+
+  // Passo 1: nessuna identità → si va ad accedere a Fluera.
+  const ritorno = new URL(`${OAUTH_ISSUER}/oauth/callback`);
+  ritorno.searchParams.set("fluera_state", oauthPackState(richiesta));
+  const provider = p.get("provider") === "apple" ? "apple" : "google";
+  const sbAuth = new URL(`${SUPABASE_URL}/auth/v1/authorize`);
+  sbAuth.searchParams.set("provider", provider);
+  sbAuth.searchParams.set("redirect_to", ritorno.toString());
+  sbAuth.searchParams.set("flow_type", "pkce");
+  return html(200, renderOauthSignIn(client.client_name || clientId, sbAuth.toString()));
+}
+
+type OauthRichiesta = {
+  clientId: string;
+  redirectUri: string;
+  challenge: string;
+  state: string;
+  resource: string;
+};
+
+// Lo stato viaggia FIRMATO: senza firma, chi torna dal provider potrebbe
+// riscrivere client_id o redirect_uri e farsi consegnare il codice altrove.
+function oauthPackState(r: OauthRichiesta): string {
+  return b64url(enc.encode(JSON.stringify(r)));
+}
+async function oauthSignState(r: OauthRichiesta): Promise<string> {
+  const payload = oauthPackState(r);
+  const sig = await crypto.subtle.sign("HMAC", await hmacKey(), enc.encode(payload));
+  return `${payload}.${b64url(sig)}`;
+}
+async function oauthOpenState(signed: string): Promise<OauthRichiesta | null> {
+  const i = signed.lastIndexOf(".");
+  if (i < 0) return null;
+  const payload = signed.slice(0, i);
+  try {
+    const ok = await crypto.subtle.verify(
+      "HMAC",
+      await hmacKey(),
+      b64urlDecode(signed.slice(i + 1)),
+      enc.encode(payload),
+    );
+    if (!ok) return null;
+    return JSON.parse(new TextDecoder().decode(b64urlDecode(payload))) as OauthRichiesta;
+  } catch {
+    return null;
+  }
+}
+
+async function oauthLoadClient(
+  clientId: string,
+): Promise<{ client_id: string; client_name: string; redirect_uris: string[] } | null> {
+  if (!/^fmcpc_[a-f0-9]{32}$/.test(clientId)) return null;
+  const r = await pgFetch(
+    `oauth_clients?client_id=eq.${encodeURIComponent(clientId)}&select=client_id,client_name,redirect_uris&limit=1`,
+  );
+  if (!r || !r.ok) return null;
+  const rows = await r.json() as Array<{ client_id: string; client_name: string; redirect_uris: string[] }>;
+  return rows[0] ?? null;
+}
+
+/// Scambia il codice di Supabase per l'identità dell'utente. Il token di
+/// sessione NON viene conservato: qui serve solo sapere CHI è.
+async function supabaseIdentityFromCode(
+  code: string,
+): Promise<{ userId: string; email: string } | null> {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
+  const r = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=pkce`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_ANON_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ auth_code: code }),
+  });
+  if (!r.ok) return null;
+  const d = await r.json() as { user?: { id?: string; email?: string } };
+  const id = d.user?.id;
+  if (!id) return null;
+  return { userId: id, email: d.user?.email ?? "" };
+}
+
+// ── Le due pagine del flusso ────────────────────────────────────────────────
+// Stile sobrio e coerente con la pagina /r; nessuno script di terze parti.
+
+const oauthShell = (titolo: string, corpo: string) =>
+  `<!doctype html><html lang="it"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>${esc(titolo)} — Fluera</title>
+<style>
+body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#F6F7F9;color:#1B2030}
+main{max-width:26rem;padding:2rem;text-align:left}
+h1{font-size:1.4rem;line-height:1.25;margin:0 0 .5rem}
+p{color:#5C6475;line-height:1.6}
+ul{color:#5C6475;line-height:1.6;padding-left:1.1rem}
+li{margin-bottom:.35rem}
+.btn{display:inline-block;margin-top:1rem;padding:.7rem 1.4rem;border-radius:10px;background:#2F4DC0;color:#fff;text-decoration:none;font-weight:600;border:0;font-size:1rem;cursor:pointer}
+.ghost{background:none;color:#5C6475;font-weight:500;padding:.7rem 1rem}
+.who{font-size:.85rem;color:#5C6475;margin-top:1.5rem;padding-top:1rem;border-top:1px solid #DDE1E9}
+@media(prefers-color-scheme:dark){body{background:#101319;color:#E8EAF1}p,ul,.who{color:#9AA3B5}.who{border-color:#2A3040}}
+</style></head><body><main>${corpo}</main></body></html>`;
+
+function renderOauthSignIn(clientName: string, signInUrl: string): string {
+  return oauthShell(
+    "Collega il tuo assistente",
+    `<h1>${esc(clientName)} vuole collegarsi a Fluera</h1>
+<p>Per continuare, accedi con l'account che usi su Fluera. Non serve una
+password: si entra con Google o Apple, come nell'app.</p>
+<p><a class="btn" href="${esc(signInUrl)}">Accedi a Fluera</a></p>
+<p class="who">Fluera non riceve la tua password: l'accesso avviene sul
+provider che hai scelto.</p>`,
+  );
+}
+
+function renderOauthConsent(
+  clientName: string,
+  ident: { userId: string; email: string },
+  r: OauthRichiesta,
+): string {
+  // Lo stato firmato viaggia nel form: il POST di approvazione non si fida di
+  // nulla che il browser possa aver riscritto.
+  return oauthShell(
+    "Autorizzare?",
+    `<h1>${esc(clientName)} potrà leggere il tuo stato di studio</h1>
+<p>Cosa vedrà:</p>
+<ul>
+  <li>i tuoi corsi, con date d'esame ed esiti;</li>
+  <li>quanti concetti sono sopra soglia, a rischio o mai studiati;</li>
+  <li>i titoli dei concetti da ripassare e quando scadono;</li>
+  <li>i topic su cui vai peggio.</li>
+</ul>
+<p><strong>Cosa non vedrà mai:</strong> i tuoi appunti, la tua calligrafia, il
+testo riconosciuto, le immagini. E non può scrivere nulla: il ripasso che
+conta si fa dentro Fluera, a libro chiuso.</p>
+<form method="POST" action="/oauth/approve">
+  <input type="hidden" name="req" value="__STATO__">
+  <input type="hidden" name="uid" value="${esc(ident.userId)}">
+  <button class="btn" type="submit" name="ok" value="1">Autorizza</button>
+  <button class="btn ghost" type="submit" name="ok" value="0">Annulla</button>
+</form>
+<p class="who">Accesso come ${esc(ident.email)} · Puoi revocare quando vuoi da
+Impostazioni → Funzioni cognitive → Collega il tuo assistente.</p>`,
+  );
+}
+
+// ── /oauth/callback — si torna da Supabase, si mostra il consenso ───────────
+async function oauthCallback(url: URL): Promise<Response> {
+  const signed = url.searchParams.get("fluera_state") ?? "";
+  const r = await oauthOpenState(signed);
+  if (!r) {
+    return html(400, statusPage("Sessione scaduta", "Riprova il collegamento dall'inizio."));
+  }
+  const code = url.searchParams.get("code") ?? "";
+  if (!code) {
+    const u = new URL(r.redirectUri);
+    u.searchParams.set("error", "access_denied");
+    u.searchParams.set("iss", OAUTH_ISSUER);
+    if (r.state) u.searchParams.set("state", r.state);
+    return Response.redirect(u.toString(), 302);
+  }
+  const ident = await supabaseIdentityFromCode(code);
+  if (!ident) {
+    return html(400, statusPage("Accesso non riuscito", "Riprova il collegamento."));
+  }
+  const client = await oauthLoadClient(r.clientId);
+  const pagina = renderOauthConsent(client?.client_name || r.clientId, ident, r)
+    .replace("__STATO__", esc(await oauthSignState(r)));
+  return html(200, pagina);
+}
+
+// ── /oauth/approve — l'utente ha deciso: si conia il codice ────────────────
+async function oauthApprove(req: Request): Promise<Response> {
+  if (req.method !== "POST") return oauthError("invalid_request", "usa POST", 405);
+  const form = await req.formData();
+  const r = await oauthOpenState(String(form.get("req") ?? ""));
+  if (!r) return html(400, statusPage("Sessione scaduta", "Riprova dall'inizio."));
+  const uid = String(form.get("uid") ?? "");
+  if (!/^[0-9a-f-]{36}$/.test(uid)) {
+    return html(400, statusPage("Richiesta non valida", "Identità mancante."));
+  }
+  const u = new URL(r.redirectUri);
+  if (r.state) u.searchParams.set("state", r.state);
+  u.searchParams.set("iss", OAUTH_ISSUER); // RFC 9207
+
+  if (String(form.get("ok")) !== "1") {
+    u.searchParams.set("error", "access_denied");
+    return Response.redirect(u.toString(), 302);
+  }
+
+  // 🛡️ Il consenso `studyDigest` è la condizione, non un dettaglio: senza,
+  // autorizzare un assistente a leggere un estratto che non esiste (e che il
+  // server rifiuterebbe comunque) sarebbe una porta che non porta da nessuna
+  // parte. Meglio dirlo qui.
+  if (!await oauthUserHasDigestConsent(uid)) {
+    return html(200, oauthShell(
+      "Manca un passaggio",
+      `<h1>Prima attiva «Assistente AI collegato»</h1>
+<p>Il collegamento legge il tuo estratto di studio, e quell'estratto viene
+pubblicato solo con il tuo consenso.</p>
+<p>Apri Fluera → Impostazioni → Privacy → <strong>Assistente AI
+collegato</strong>, poi riprova da qui.</p>`,
+    ));
+  }
+
+  const code = `fmcpa_${hexOf(crypto.getRandomValues(new Uint8Array(32)))}`;
+  const ins = await pgFetch("oauth_codes", {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      code_sha256: pgHex(await sha256(code)),
+      client_id: r.clientId,
+      user_id: uid,
+      redirect_uri: r.redirectUri,
+      code_challenge: r.challenge,
+      resource: r.resource,
+      scope: OAUTH_SCOPE,
+      expires_at: new Date(Date.now() + OAUTH_CODE_TTL_MS).toISOString(),
+    }),
+  });
+  if (!ins || !ins.ok) {
+    return html(503, statusPage("Riprova", "Non è stato possibile completare ora."));
+  }
+  u.searchParams.set("code", code);
+  return Response.redirect(u.toString(), 302);
+}
+
+async function oauthUserHasDigestConsent(uid: string): Promise<boolean> {
+  const r = await pgFetch(
+    `user_consent_state?user_id=eq.${encodeURIComponent(uid)}&category=eq.studyDigest&granted=is.true&select=user_id&limit=1`,
+  );
+  if (!r || !r.ok) return false; // fail-closed
+  return ((await r.json()) as unknown[]).length > 0;
+}
+
+// ── /oauth/token — codice → token, e refresh con rotazione ─────────────────
+async function oauthToken(req: Request): Promise<Response> {
+  if (req.method !== "POST") return oauthError("invalid_request", "usa POST", 405);
+  if (oauthRateLimited(`tok:${clientIp(req)}`, 120)) {
+    return oauthError("temporarily_unavailable", "troppe richieste", 429);
+  }
+  const form = await req.formData().catch(() => null);
+  if (!form) return oauthError("invalid_request", "serve application/x-www-form-urlencoded");
+  const grant = String(form.get("grant_type") ?? "");
+  if (grant === "authorization_code") return await oauthGrantCode(form);
+  if (grant === "refresh_token") return await oauthGrantRefresh(form);
+  return oauthError("unsupported_grant_type", `grant_type non supportato: ${grant}`);
+}
+
+async function oauthIssue(
+  userId: string,
+  clientId: string,
+  resource: string,
+  scope: string,
+): Promise<Response> {
+  const now = Math.floor(Date.now() / 1000);
+  const access = await jwtSign({
+    iss: OAUTH_ISSUER,
+    sub: userId,
+    aud: resource,
+    client_id: clientId,
+    scope,
+    iat: now,
+    exp: now + OAUTH_ACCESS_TTL_S,
+    jti: hexOf(crypto.getRandomValues(new Uint8Array(12))),
+  });
+  const refresh = `fmcpr_${hexOf(crypto.getRandomValues(new Uint8Array(32)))}`;
+  const ins = await pgFetch("oauth_refresh_tokens", {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      token_sha256: pgHex(await sha256(refresh)),
+      client_id: clientId,
+      user_id: userId,
+      resource,
+      scope,
+    }),
+  });
+  if (!ins || !ins.ok) return oauthError("server_error", "emissione non riuscita", 503);
+  return oauthJson({
+    access_token: access,
+    token_type: "Bearer",
+    expires_in: OAUTH_ACCESS_TTL_S,
+    refresh_token: refresh,
+    scope,
+  }, 200, { "cache-control": "no-store" });
+}
+
+async function oauthGrantCode(form: FormData): Promise<Response> {
+  const code = String(form.get("code") ?? "");
+  const verifier = String(form.get("code_verifier") ?? "");
+  const redirectUri = String(form.get("redirect_uri") ?? "");
+  const clientId = String(form.get("client_id") ?? "");
+  if (!code || !verifier || !redirectUri || !clientId) {
+    return oauthError("invalid_request", "mancano parametri obbligatori");
+  }
+  const key = pgHex(await sha256(code));
+  const r = await pgFetch(
+    `oauth_codes?code_sha256=eq.${encodeURIComponent(key)}&select=*&limit=1`,
+  );
+  if (!r || !r.ok) return oauthError("server_error", "riprova", 503);
+  const rows = await r.json() as Array<Record<string, string>>;
+  const row = rows[0];
+  if (!row) return oauthError("invalid_grant", "codice sconosciuto");
+
+  // 🔁 RIUSO = FURTO. Un codice già consumato che ricompare significa che
+  // qualcuno l'ha intercettato: OAuth 2.1 §4.1.3 vuole che si neghi, e che si
+  // ritirino i token già emessi da quel codice. Qui si ritira la sessione.
+  if (row.consumed_at) {
+    await pgFetch(
+      `oauth_refresh_tokens?user_id=eq.${encodeURIComponent(row.user_id)}&client_id=eq.${encodeURIComponent(row.client_id)}&revoked_at=is.null`,
+      { method: "PATCH", headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ revoked_at: new Date().toISOString() }) },
+    );
+    return oauthError("invalid_grant", "codice già usato");
+  }
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    return oauthError("invalid_grant", "codice scaduto");
+  }
+  if (row.client_id !== clientId) return oauthError("invalid_grant", "client non corrispondente");
+  if (row.redirect_uri !== redirectUri) {
+    return oauthError("invalid_grant", "redirect_uri non corrispondente");
+  }
+  // PKCE S256: SHA-256 del verifier, in base64url, deve dare la challenge.
+  if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) {
+    return oauthError("invalid_grant", "code_verifier malformato");
+  }
+  if (b64url(await sha256(verifier)) !== row.code_challenge) {
+    return oauthError("invalid_grant", "code_verifier non corrisponde");
+  }
+
+  // Consumo ATOMICO: il PATCH filtra su `consumed_at is null`, quindi due
+  // richieste in corsa non possono riuscire entrambe.
+  const consume = await pgFetch(
+    `oauth_codes?code_sha256=eq.${encodeURIComponent(key)}&consumed_at=is.null`,
+    { method: "PATCH", headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ consumed_at: new Date().toISOString() }) },
+  );
+  if (!consume || !consume.ok) return oauthError("server_error", "riprova", 503);
+  if (((await consume.json()) as unknown[]).length !== 1) {
+    return oauthError("invalid_grant", "codice già usato");
+  }
+  if (!await oauthUserHasDigestConsent(row.user_id)) {
+    return oauthError("access_denied", "il consenso allo studio è stato ritirato", 403);
+  }
+  return await oauthIssue(row.user_id, row.client_id, row.resource, row.scope);
+}
+
+async function oauthGrantRefresh(form: FormData): Promise<Response> {
+  const token = String(form.get("refresh_token") ?? "");
+  if (!/^fmcpr_[a-f0-9]{64}$/.test(token)) {
+    return oauthError("invalid_grant", "refresh_token malformato");
+  }
+  const key = pgHex(await sha256(token));
+  const r = await pgFetch(
+    `oauth_refresh_tokens?token_sha256=eq.${encodeURIComponent(key)}&select=*&limit=1`,
+  );
+  if (!r || !r.ok) return oauthError("server_error", "riprova", 503);
+  const row = (await r.json() as Array<Record<string, string | null>>)[0];
+  if (!row) return oauthError("invalid_grant", "refresh sconosciuto");
+  if (row.revoked_at) return oauthError("invalid_grant", "sessione revocata");
+  if (row.rotated_to) {
+    // Un refresh GIÀ ruotato che ritorna = copia rubata: si chiude tutta la
+    // catena di quell'utente per quel client (OAuth 2.1 §4.3.1).
+    await pgFetch(
+      `oauth_refresh_tokens?user_id=eq.${encodeURIComponent(String(row.user_id))}&client_id=eq.${encodeURIComponent(String(row.client_id))}&revoked_at=is.null`,
+      { method: "PATCH", headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ revoked_at: new Date().toISOString() }) },
+    );
+    return oauthError("invalid_grant", "refresh già usato: sessione chiusa per sicurezza");
+  }
+  if (!await oauthUserHasDigestConsent(String(row.user_id))) {
+    return oauthError("access_denied", "il consenso allo studio è stato ritirato", 403);
+  }
+  const emesso = await oauthIssue(
+    String(row.user_id), String(row.client_id), String(row.resource), String(row.scope),
+  );
+  if (emesso.status === 200) {
+    const body = await emesso.clone().json() as { refresh_token: string };
+    await pgFetch(`oauth_refresh_tokens?token_sha256=eq.${encodeURIComponent(key)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({
+        rotated_to: pgHex(await sha256(body.refresh_token)),
+        last_used_at: new Date().toISOString(),
+      }),
+    });
+  }
+  return emesso;
+}
+
+// ── /oauth/revoke — RFC 7009, sempre 200 (non si rivela cosa esisteva) ─────
+async function oauthRevoke(req: Request): Promise<Response> {
+  if (req.method !== "POST") return oauthError("invalid_request", "usa POST", 405);
+  const form = await req.formData().catch(() => null);
+  const token = String(form?.get("token") ?? "");
+  if (/^fmcpr_[a-f0-9]{64}$/.test(token)) {
+    await pgFetch(
+      `oauth_refresh_tokens?token_sha256=eq.${encodeURIComponent(pgHex(await sha256(token)))}`,
+      { method: "PATCH", headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({ revoked_at: new Date().toISOString() }) },
+    );
+  }
+  return new Response(null, { status: 200, headers: MCP_CORS });
 }
