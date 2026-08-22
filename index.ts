@@ -2032,8 +2032,16 @@ export function mcpCallTool(
       ).sort((a, b) => b.in_ritardo_da_giorni - a.in_ritardo_da_giorni);
       const errors = scope.flatMap((r) =>
         r.payload.errors_due.filter((e) => e.next_review_ms <= now).map((e) => ({
-          errore: e.title,
+          // 🔒 `errore` e' il CONCETTO su cui pende la correzione, non la
+          // correzione: del diario escono solo il nome del cluster e la
+          // data (§2.12, meta' negativa). Il nome del campo lo dice.
+          concetto_da_ricontrollare: e.title,
           corso: r.payload.name,
+          in_ritardo_da_giorni: Math.max(
+            0,
+            Math.floor((now - e.next_review_ms) / 86_400_000),
+          ),
+          apri_in_fluera: mcpOpenInApp(r.canvas_id),
         }))
       );
       // 🆕 I mai studiati: non sono «in scadenza» — non hanno una scadenza —
