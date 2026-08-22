@@ -320,6 +320,21 @@ export const servi = async (req: Request): Promise<Response> => {
   // su un device SENZA l'app: bottone custom-scheme per i browser in-app che
   // non onorano gli App Links + lo store giusto. Il `concept` è ri-serializzato
   // (mai la query grezza dentro un href) e cappato: è un'etichetta.
+  // ── /mcp → il connettore MCP («Atlas risponde» L1) ────────────────────────
+  // Server MCP (Streamable HTTP, application/json) che serve l'ESTRATTO di
+  // studio: lettore SOTTILE di `study_digest` — niente matematica FSRS qui,
+  // solo confronti di date. Auth: token personale `fmcp_…` risolto via RPC
+  // service_role. SOLO tool di lettura, per costruzione.
+  //
+  // ⚠️ STA PRIMA di /r di proposito: quando questa rotta viveva DOPO, una
+  // riscrittura del blocco /r se l'è portata via in silenzio — `deno check`
+  // verde, test unitari verdi (importano le funzioni, non le rotte) e il
+  // dominio che rispondeva 302 invece di 401. Il cancello del contratto MCP
+  // ora include una prova di RAGGIUNGIBILITÀ della rotta.
+  if (/\/mcp\/?$/.test(path)) {
+    return await handleMcp(req);
+  }
+
   const rem = path.match(/\/r\/([A-Za-z0-9_-]{4,64})\/?$/);
   if (rem) {
     const platform = classify(req.headers.get("user-agent") ?? "");
