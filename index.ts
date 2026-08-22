@@ -142,6 +142,10 @@ export const servi = async (req: Request): Promise<Response> => {
         "Disallow: /r/",
         // `/mcp` è un endpoint API autenticato: per un crawler è solo un 401.
         "Disallow: /mcp",
+        // Le rotte OAuth sono un flusso, non pagine: `/connect` invece SÌ —
+        // è la guida pubblica, e vale la pena che si trovi.
+        "Disallow: /oauth/",
+        "Allow: /connect",
         "Disallow: /get",
         "Disallow: /u/",
         "Disallow: /report",
@@ -331,6 +335,10 @@ export const servi = async (req: Request): Promise<Response> => {
   if (path.endsWith("/.well-known/oauth-authorization-server")) {
     return authorizationServerMetadata();
   }
+  // La pagina che spiega il collegamento: citata dai metadati della risorsa
+  // (`resource_documentation`), ed è anche l'unica guida pubblica che uno
+  // studente possa aprire da un telefono senza cercarla nelle impostazioni.
+  if (/\/connect\/?$/.test(path)) return html(200, renderConnectPage(req));
   if (/\/oauth\/register\/?$/.test(path)) return await oauthRegister(req);
   if (/\/oauth\/authorize\/?$/.test(path)) return await oauthAuthorize(req, reqUrl);
   if (/\/oauth\/callback\/?$/.test(path)) return await oauthCallback(reqUrl);
@@ -2375,7 +2383,7 @@ export function protectedResourceMetadata(): Response {
     authorization_servers: [OAUTH_ISSUER],
     scopes_supported: [OAUTH_SCOPE],
     bearer_methods_supported: ["header"],
-    resource_documentation: `${SITE}/connect`,
+    resource_documentation: `${OAUTH_ISSUER}/connect`,
   });
 }
 
@@ -2932,4 +2940,57 @@ async function oauthRevoke(req: Request): Promise<Response> {
     );
   }
   return new Response(null, { status: 200, headers: MCP_CORS });
+}
+
+// ── /connect — come si collega un assistente, in una pagina sola ───────────
+function renderConnectPage(req: Request): string {
+  const it = (req.headers.get("accept-language") ?? "").toLowerCase().startsWith("it");
+  const t = it
+    ? {
+      h: "Collega il tuo assistente a Fluera",
+      p: "Il tuo assistente AI può leggere <strong>cosa devi ripassare e quando</strong>: corsi, date d'esame, concetti in scadenza, argomenti deboli. Mai il contenuto dei tuoi appunti — e non può scrivere nulla.",
+      pre: "Prima di tutto, in Fluera:",
+      s1: "Impostazioni → Privacy → attiva <strong>Assistente AI collegato</strong>",
+      s2: "Impostazioni → Funzioni cognitive → <strong>Collega il tuo assistente</strong>",
+      web: "Dai connettori (claude.ai, ChatGPT)",
+      webp: "Aggiungi un connettore con questo indirizzo, poi accedi con l'account che usi su Fluera e autorizza:",
+      cli: "Da terminale (Claude Code)",
+      clip: "Crea una chiave nell'app e incolla il comando che ti mostra:",
+      rev: "Puoi revocare in ogni momento dall'app. Revocare il consenso chiude tutte le sessioni e cancella l'estratto conservato.",
+    }
+    : {
+      h: "Connect your assistant to Fluera",
+      p: "Your AI assistant can read <strong>what you need to review and when</strong>: courses, exam dates, concepts due, weak topics. Never the content of your notes — and it cannot write anything.",
+      pre: "First, in Fluera:",
+      s1: "Settings → Privacy → turn on <strong>Connected AI assistant</strong>",
+      s2: "Settings → Cognitive features → <strong>Connect your assistant</strong>",
+      web: "From connectors (claude.ai, ChatGPT)",
+      webp: "Add a connector with this address, then sign in with your Fluera account and approve:",
+      cli: "From the terminal (Claude Code)",
+      clip: "Create a key in the app and paste the command it shows you:",
+      rev: "You can revoke at any time from the app. Revoking consent closes every session and deletes the stored digest.",
+    };
+  return `<!doctype html><html lang="${it ? "it" : "en"}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(t.h)} — Fluera</title>
+<style>body{font-family:system-ui,sans-serif;margin:0;background:#F6F7F9;color:#1B2030;line-height:1.6}
+main{max-width:38rem;margin:0 auto;padding:3rem 1.25rem 4rem}
+h1{font-size:1.7rem;line-height:1.2;margin:0 0 .75rem}h2{font-size:1.05rem;margin:2rem 0 .5rem}
+p,li{color:#5C6475}ol{padding-left:1.2rem}li{margin-bottom:.4rem}
+code{background:#EEF0F5;border-radius:5px;padding:.15em .4em;font-size:.9em;word-break:break-all}
+.note{margin-top:2rem;padding-top:1rem;border-top:1px solid #DDE1E9;font-size:.9rem}
+@media(prefers-color-scheme:dark){body{background:#101319;color:#E8EAF1}p,li{color:#9AA3B5}code{background:#1F2532}.note{border-color:#2A3040}}</style>
+</head><body><main>
+<h1>${esc(t.h)}</h1>
+<p>${t.p}</p>
+<h2>${esc(t.pre)}</h2>
+<ol><li>${t.s1}</li><li>${t.s2}</li></ol>
+<h2>${esc(t.web)}</h2>
+<p>${esc(t.webp)}</p>
+<p><code>${MCP_RESOURCE}</code></p>
+<h2>${esc(t.cli)}</h2>
+<p>${esc(t.clip)}</p>
+<p><code>claude mcp add --transport http fluera-study ${MCP_RESOURCE} --header "Authorization: Bearer fmcp_…"</code></p>
+<p class="note">${esc(t.rev)}</p>
+</main></body></html>`;
 }
