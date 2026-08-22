@@ -328,8 +328,7 @@ export const servi = async (req: Request): Promise<Response> => {
   // I due .well-known stanno in cima alle rotte OAuth di proposito: sono ciò
   // che un client legge PRIMA di qualunque altra cosa, e la spec MCP li rende
   // obbligatori (RFC 9728 per la risorsa, RFC 8414 per l'AS).
-  if (path.endsWith("/.well-known/oauth-protected-resource") ||
-      path.endsWith("/.well-known/oauth-protected-resource/mcp")) {
+  if (/\/\.well-known\/oauth-protected-resource(\/mcp\.?)?\/?$/.test(path)) {
     return protectedResourceMetadata();
   }
   if (path.endsWith("/.well-known/oauth-authorization-server")) {
@@ -357,7 +356,13 @@ export const servi = async (req: Request): Promise<Response> => {
   // verde, test unitari verdi (importano le funzioni, non le rotte) e il
   // dominio che rispondeva 302 invece di 401. Il cancello del contratto MCP
   // ora include una prova di RAGGIUNGIBILITÀ della rotta.
-  if (/\/mcp\/?$/.test(path)) {
+  // ⚠️ `\.?` — un punto finale è tollerato di proposito: chi copia l'indirizzo
+  // da una frase si porta dietro il punto della punteggiatura, e senza questa
+  // riga il risultato era il peggiore possibile — l'OAuth riusciva (la
+  // scoperta dei metadati ripiega sulla radice) e POI la connessione moriva
+  // con «l'URL non punta a un server MCP valido». Misurato dal vivo il
+  // 2026-08-22: un punto ha bruciato tre tentativi.
+  if (/\/mcp\.?\/?$/.test(path)) {
     return await handleMcp(req);
   }
 
