@@ -3137,7 +3137,7 @@ function renderConnectPage(req: Request): string {
   const t = it
     ? {
       h: "Collega il tuo assistente a Fluera",
-      p: "Il tuo assistente AI può leggere <strong>cosa devi ripassare e quando</strong>: corsi, date d'esame, concetti in scadenza, argomenti deboli. Mai il contenuto dei tuoi appunti — e non può scrivere nulla.",
+      p: "Il tuo assistente AI può leggere <strong>cosa devi ripassare e quando</strong>: corsi e date d'esame, i concetti in scadenza con quanto reggono e quante volte sono già caduti, quelli che non hai mai aperto, su quali concetti hai una correzione da ricontrollare, e i punti deboli come fasce. <strong>Mai il contenuto dei tuoi appunti</strong>: non la tua calligrafia, non il testo riconosciuto, non la frase che avevi sbagliato — e non può scrivere nulla.",
       pre: "Prima di tutto, in Fluera:",
       s1: "Impostazioni → Privacy → attiva <strong>Assistente AI collegato</strong>",
       s2: "Impostazioni → Funzioni cognitive → <strong>Collega il tuo assistente</strong>",
@@ -3149,7 +3149,7 @@ function renderConnectPage(req: Request): string {
     }
     : {
       h: "Connect your assistant to Fluera",
-      p: "Your AI assistant can read <strong>what you need to review and when</strong>: courses, exam dates, concepts due, weak topics. Never the content of your notes — and it cannot write anything.",
+      p: "Your AI assistant can read <strong>what you need to review and when</strong>: courses and exam dates, the concepts due with how long they hold and how many times they have lapsed, the ones you have never opened, which concepts carry a correction to recheck, and weak points as coarse bands. <strong>Never the content of your notes</strong>: not your handwriting, not the recognised text, not the sentence you got wrong — and it cannot write anything.",
       pre: "First, in Fluera:",
       s1: "Settings → Privacy → turn on <strong>Connected AI assistant</strong>",
       s2: "Settings → Cognitive features → <strong>Connect your assistant</strong>",
