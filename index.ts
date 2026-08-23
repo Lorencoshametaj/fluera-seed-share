@@ -1678,7 +1678,7 @@ type McpDue = {
 };
 type McpErr = { title: string; next_review_ms: number };
 type McpUnseen = { title: string };
-type McpTopic = { topic: string; accuracy_band: string; trend: string };
+type McpTopic = { topic: string; accuracy_band: string };
 type McpPayload = {
   name: string;
   exam_date_ms: number | null;
@@ -1765,7 +1765,7 @@ export function mcpProjectRow(raw: Record<string, unknown>): McpRow {
   p.weak_topics = ((p.weak_topics ?? []) as Record<string, unknown>[])
     .slice(0, MCP_MAX_LIST)
     .map((x) => {
-      const e = mcpPick<McpTopic>(x, ["topic", "accuracy_band", "trend"]);
+      const e = mcpPick<McpTopic>(x, ["topic", "accuracy_band"]);
       e.topic = mcpText(e.topic);
       return e;
     });
@@ -2144,12 +2144,17 @@ export function mcpCallTool(
           topic: w.topic,
           corso: r.payload.name,
           accuratezza: w.accuracy_band,
-          tendenza: w.trend,
         }))
       );
       return mcpWrap(scope.length ? scope : rows, {
         topic_deboli: topics,
-        nota_fonte: "Solo topic con evidenza sufficiente dagli esami recenti in Fluera.",
+        // 🕳️ La stessa disciplina di `nota_zero`: un elenco vuoto qui non
+        // e' una promessa di solidita'. La soglia e' 4 osservazioni
+        // QUALIFICANTI per concetto (kMinEvidence), e sotto quella il
+        // sistema dichiara di non sapere invece di stimare.
+        nota_fonte: topics.length
+          ? "Fasce, mai numeri. Solo concetti con evidenza sufficiente (almeno 4 osservazioni qualificanti)."
+          : "Nessun concetto ha ancora abbastanza evidenza per una fascia: NON significa che sia tutto solido, significa che da qui non lo so. Non dedurne che lo studente non abbia punti deboli.",
       }, now);
     }
 
@@ -2199,7 +2204,7 @@ export const MCP_TOOL_DEFS = [
   {
     name: "get_weak_topics",
     description:
-      "I topic deboli dagli esami recenti in Fluera: accuratezza (fascia), tendenza. Solo topic con evidenza sufficiente.",
+      "I concetti su cui lo studente è più fragile, come FASCIA (bassa/media), dalla storia socratica e dagli atti di ricostruzione. Nessuna tendenza: la competenza qui è una fotografia, non una serie. Escono solo i concetti con evidenza sufficiente — un elenco vuoto significa «non ho abbastanza prove», NON «è tutto solido».",
     inputSchema: {
       type: "object",
       properties: { course: { type: "string" } },
