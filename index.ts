@@ -3145,7 +3145,19 @@ function renderConnectPage(req: Request): string {
       webp: "Aggiungi un connettore con questo indirizzo, poi accedi con l'account che usi su Fluera e autorizza:",
       cli: "Da terminale (Claude Code)",
       clip: "Crea una chiave nell'app e incolla il comando che ti mostra:",
-      rev: "Puoi revocare in ogni momento dall'app. Revocare il consenso chiude tutte le sessioni e cancella l'estratto conservato.",
+      ask: "Cosa puoi chiedergli",
+      askp: "Una volta collegato, parlagli come parleresti a un compagno di corso che ha visto il tuo quaderno:",
+      q: [
+        "Cosa devo ripassare adesso?",
+        "Quali corsi ho e quando sono gli esami?",
+        "Da dove comincio su Corpo Rigido?",
+        "Cosa mi torna nei prossimi sette giorni?",
+        "Su cosa sono più debole?",
+        "Come sarò messo il giorno dell'esame?",
+      ],
+      hon: "Quando non sa, lo dice",
+      honp: "Un elenco vuoto non è mai una promessa. Se non hai ripassi dovuti ma hai concetti mai aperti e un esame vicino, te lo dice invece di rispondere «sei a posto». Se non ha abbastanza prove per chiamare debole un concetto, dice che non lo sa — non che va tutto bene. E i conteggi non diventano mai percentuali: «uno a rischio, due mai visti» è una cosa che puoi verificare, «sei al 62%» no.",
+      rev: "Puoi revocare in ogni momento dall'app. Revocare il consenso chiude tutte le sessioni e cancella l'estratto conservato. Il ripasso che conta si fa comunque qui: a libro chiuso, con la tua calligrafia.",
     }
     : {
       h: "Connect your assistant to Fluera",
@@ -3157,7 +3169,19 @@ function renderConnectPage(req: Request): string {
       webp: "Add a connector with this address, then sign in with your Fluera account and approve:",
       cli: "From the terminal (Claude Code)",
       clip: "Create a key in the app and paste the command it shows you:",
-      rev: "You can revoke at any time from the app. Revoking consent closes every session and deletes the stored digest.",
+      ask: "What you can ask it",
+      askp: "Once connected, talk to it the way you would to a coursemate who has seen your notebook:",
+      q: [
+        "What should I review right now?",
+        "Which courses do I have, and when are the exams?",
+        "Where do I start on Rigid Body?",
+        "What comes back at me over the next seven days?",
+        "What am I weakest on?",
+        "Where will I stand on the day of the exam?",
+      ],
+      hon: "When it does not know, it says so",
+      honp: "An empty list is never a promise. If nothing is due but you have concepts you have never opened and an exam coming, it tells you — instead of answering «you are all set». If there is not enough evidence to call a concept weak, it says it does not know, not that everything is fine. And counts never turn into percentages: «one at risk, two never seen» is something you can check; «you are at 62%» is not.",
+      rev: "You can revoke at any time from the app. Revoking consent closes every session and deletes the stored digest. The review that counts still happens here: closed-book, in your own handwriting.",
     };
   return `<!doctype html><html lang="${it ? "it" : "en"}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3167,8 +3191,8 @@ main{max-width:38rem;margin:0 auto;padding:3rem 1.25rem 4rem}
 h1{font-size:1.7rem;line-height:1.2;margin:0 0 .75rem}h2{font-size:1.05rem;margin:2rem 0 .5rem}
 p,li{color:#5C6475}ol{padding-left:1.2rem}li{margin-bottom:.4rem}
 code{background:#EEF0F5;border-radius:5px;padding:.15em .4em;font-size:.9em;word-break:break-all}
-.note{margin-top:2rem;padding-top:1rem;border-top:1px solid #DDE1E9;font-size:.9rem}
-@media(prefers-color-scheme:dark){body{background:#101319;color:#E8EAF1}p,li{color:#9AA3B5}code{background:#1F2532}.note{border-color:#2A3040}}</style>
+.note{margin-top:2rem;padding-top:1rem;border-top:1px solid #DDE1E9;font-size:.9rem}\nul.ask{list-style:none;padding:0;margin:.5rem 0 0}\nul.ask li{margin:0 0 .5rem;padding:.5rem .8rem;background:#EEF0F5;border-radius:8px;color:#1B2030}
+@media(prefers-color-scheme:dark){body{background:#101319;color:#E8EAF1}p,li{color:#9AA3B5}code{background:#1F2532}.note{border-color:#2A3040}ul.ask li{background:#1A1F29;color:#E8EAF1}}</style>
 </head><body><main>
 <h1>${esc(t.h)}</h1>
 <p>${t.p}</p>
@@ -3180,6 +3204,11 @@ code{background:#EEF0F5;border-radius:5px;padding:.15em .4em;font-size:.9em;word
 <h2>${esc(t.cli)}</h2>
 <p>${esc(t.clip)}</p>
 <p><code>claude mcp add --transport http fluera-study ${MCP_RESOURCE} --header "Authorization: Bearer fmcp_…"</code></p>
+<h2>${esc(t.ask)}</h2>
+<p>${esc(t.askp)}</p>
+<ul class="ask">${t.q.map((d) => `<li>${esc(d)}</li>`).join("")}</ul>
+<h2>${esc(t.hon)}</h2>
+<p>${esc(t.honp)}</p>
 <p class="note">${esc(t.rev)}</p>
 </main></body></html>`;
 }
