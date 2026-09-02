@@ -1692,6 +1692,30 @@ type McpPayload = {
   weak_topics: McpTopic[];
   never_studied: McpUnseen[];
   never_studied_total: number;
+  exam_gate?: McpExamGate;
+};
+type McpBlocked = { title: string; blocker: string };
+type McpExamGate = {
+  ready: number;
+  total: number;
+  blocked: McpBlocked[];
+  blocked_total: number;
+};
+
+/// 🔒 Gemello dell'insieme chiuso lato Dart (`kDigestBlockerValues`). Vive
+/// anche QUI, e non per ridondanza: `payload_json` lo scrive `authenticated`
+/// e la RLS non ne vincola la forma, quindi un motivo inventato arriverebbe
+/// verbatim nel contesto dell'assistente. I due lati devono restare uguali —
+/// il cancello `mcp_contract` lo pretende.
+const MCP_BLOCKERS: Record<string, string> = {
+  confidentErrorPending: "una risposta che sembrava giusta e non lo era, ancora da rivedere",
+  notEnoughEvidence: "ancora poche domande impegnative",
+  needsSecondSession: "una sola sessione di lavoro",
+  needsTimeApart: "le due sessioni sono troppo ravvicinate",
+  needsSpacedSuccess: "manca il ritrovamento dopo una pausa",
+  tooManyRecentErrors: "troppi errori recenti",
+  memoryTooWeak: "il ricordo si è raffreddato",
+  competenceTooLow: "competenza ancora sotto soglia",
 };
 type McpRow = {
   block_id: string;
@@ -1733,7 +1757,7 @@ export function mcpProjectRow(raw: Record<string, unknown>): McpRow {
   const p = mcpPick<McpPayload>(rawPayload, [
     "name", "exam_date_ms", "outcome", "readiness", "feasibility",
     "due", "due_total", "errors_due", "errors_due_total", "weak_topics",
-    "never_studied", "never_studied_total",
+    "never_studied", "never_studied_total", "exam_gate",
   ]);
   p.readiness = mcpPick(((p.readiness ?? {}) as unknown) as Record<string, unknown>,
     ["ready", "at_risk", "never_studied"]) as McpPayload["readiness"];
@@ -1783,6 +1807,35 @@ export function mcpProjectRow(raw: Record<string, unknown>): McpRow {
   p.due_total = typeof p.due_total === "number" ? p.due_total : p.due.length;
   p.errors_due_total =
     typeof p.errors_due_total === "number" ? p.errors_due_total : p.errors_due.length;
+  // 🎓 Il verdetto pre-prova. Ri-proiettato come tutto il resto: il device
+  // filtra gia', ma il payload lo scrive `authenticated` e la RLS non ne
+  // vincola la forma — un motivo inventato o un titolo lungo un chilometro
+  // arriverebbero verbatim nel contesto dell'assistente.
+  const rawGate = p.exam_gate as unknown;
+  if (rawGate && typeof rawGate === "object") {
+    const g = mcpPick<McpExamGate>(rawGate as Record<string, unknown>, [
+      "ready", "total", "blocked", "blocked_total",
+    ]);
+    g.ready = mcpCount(g.ready, 9999);
+    g.total = mcpCount(g.total, 9999);
+    g.blocked = ((g.blocked ?? []) as Record<string, unknown>[])
+      .slice(0, MCP_MAX_LIST)
+      .map((x) => {
+        const e = mcpPick<McpBlocked>(x, ["title", "blocker"]);
+        e.title = mcpText(e.title);
+        return e;
+      })
+      // Un motivo fuori dall'insieme chiuso non e' dichiarato nell'informativa:
+      // la voce cade INTERA, perche' un titolo con un motivo sconosciuto
+      // accanto direbbe «su X c'e' qualcosa» senza dire cosa.
+      .filter((e) => e.title.length > 0 && e.blocker in MCP_BLOCKERS);
+    g.blocked_total = typeof g.blocked_total === "number"
+      ? mcpCount(g.blocked_total, 9999)
+      : g.blocked.length;
+    p.exam_gate = g;
+  } else {
+    delete p.exam_gate;
+  }
   row.payload = p;
   return row;
 }
@@ -1891,7 +1944,14 @@ export const mcpExamDay = (ms: number | null | undefined) =>
   ms == null ? null : new Date(ms + 43_200_000).toISOString().slice(0, 10);
 const mcpDaysLeft = (examMs: number | null, now: number) =>
   examMs == null ? null : Math.ceil((examMs - now) / 86_400_000);
-const mcpOpenInApp = (canvasId: string) => `https://share.fluera.dev/r/${canvasId}`;
+// 🔗 R3 — L'ULTIMO MIGLIO. La rotta /r/ legge e sanifica `?concept=`, il
+// gestore deep-link lo estrae e la tela apre il punto giusto: tutta la
+// catena era costruita e il connettore non l'ha mai usata, quindi ogni
+// consiglio atterrava sulla tela e lasciava allo studente il compito di
+// ritrovare da solo il concetto di cui si stava parlando.
+const mcpOpenInApp = (canvasId: string, concept?: string | null) =>
+  `https://share.fluera.dev/r/${canvasId}` +
+  (concept ? `?concept=${encodeURIComponent(concept)}` : "");
 
 function mcpWrap(
   rows: McpRow[],
@@ -1926,6 +1986,11 @@ function mcpWrap(
 
 function mcpCourseSummary(r: McpRow, now: number): Record<string, unknown> {
   const p = r.payload;
+  // 🕰️ R7: `eta_giorni` è il MINIMO su tutte le righe — con quattro corsi
+  // freschi e uno fermo da un mese, l'intera risposta si dichiara vecchia
+  // di un mese e la freschezza smette di dire qualcosa. L'età del SINGOLO
+  // corso è quella che cambia il consiglio su quel corso.
+  const etaCorso = Math.floor((now - r.computed_at_ms) / 86_400_000);
   if (p.outcome === "passed") {
     return {
       corso: p.name,
@@ -1936,7 +2001,11 @@ function mcpCourseSummary(r: McpRow, now: number): Record<string, unknown> {
   }
   return {
     corso: p.name,
-    esame: mcpIso(p.exam_date_ms),
+    // 🪤 R1: il ramo `passed` usava mcpExamDay e questo mcpIso — la data
+    // d'esame usciva D−1 per ogni fuso a est di Greenwich, cioè per ogni
+    // studente italiano, su ogni corso che conta ancora. `mcpIso` resta
+    // giusto nei bucket del forecast, dove il valore è un istante vero.
+    esame: mcpExamDay(p.exam_date_ms),
     giorni_rimanenti: mcpDaysLeft(p.exam_date_ms, now),
     prontezza: {
       sopra_soglia: p.readiness.ready,
@@ -1944,6 +2013,14 @@ function mcpCourseSummary(r: McpRow, now: number): Record<string, unknown> {
       mai_studiati: p.readiness.never_studied,
     },
     nota_prontezza: "«mai studiati» = mai visti: non è la stessa cosa di «a rischio».",
+    aggiornato_giorni_fa: etaCorso,
+    ...(etaCorso >= 3
+      ? {
+        nota_corso_freschezza: `Di questo corso ho una fotografia di ` +
+          `${etaCorso} giorni fa: non aprirlo da allora non significa non ` +
+          `averlo studiato, significa che da qui non lo vedo.`,
+      }
+      : {}),
     // 🆕 I mai studiati PER NOME: un conteggio non dice da dove cominciare,
     // che è l'unica cosa utile da dire su un concetto mai visto. Assente in
     // modalità «solo conteggi» (il device non manda titoli) e assente quando
@@ -1960,7 +2037,14 @@ function mcpCourseSummary(r: McpRow, now: number): Record<string, unknown> {
           : {}),
       }
       : {}),
-    fattibilita: p.feasibility,
+    // 🪦 R5: `feasibility` è la costante 'unknown' per ogni corso di ogni
+    // utente — il calcolo vero esiste, è provato, e non ha un chiamante.
+    // Finché è costante non esce: un campo che dice sempre la stessa cosa
+    // è rumore che sembra informazione. Il giorno in cui l'app lo cabla,
+    // ricompare da solo senza toccare il server.
+    ...(p.feasibility && p.feasibility !== "unknown"
+      ? { fattibilita: p.feasibility }
+      : {}),
     in_scadenza_ora: p.due.filter((d) => d.next_review_ms <= now).length,
     errori_da_ricontrollare: p.errors_due.filter((e) => e.next_review_ms <= now).length,
     // 📊 I totali che il DEVICE ha calcolato prima di cappare la lista: senza,
@@ -2027,7 +2111,7 @@ export function mcpCallTool(
           // ripreso da un'altra angolazione, non ripassato uguale.
           regge_giorni: d.stability_days,
           ...(d.lapses > 0 ? { gia_caduto_volte: d.lapses } : {}),
-          apri_in_fluera: mcpOpenInApp(r.canvas_id),
+          apri_in_fluera: mcpOpenInApp(r.canvas_id, d.title),
         }))
       ).sort((a, b) => b.in_ritardo_da_giorni - a.in_ritardo_da_giorni);
       const errors = scope.flatMap((r) =>
@@ -2041,7 +2125,7 @@ export function mcpCallTool(
             0,
             Math.floor((now - e.next_review_ms) / 86_400_000),
           ),
-          apri_in_fluera: mcpOpenInApp(r.canvas_id),
+          apri_in_fluera: mcpOpenInApp(r.canvas_id, e.title),
         }))
       );
       // 🆕 I mai studiati: non sono «in scadenza» — non hanno una scadenza —
@@ -2053,7 +2137,7 @@ export function mcpCallTool(
         r.payload.never_studied.map((u) => ({
           concetto: u.title,
           corso: r.payload.name,
-          apri_in_fluera: mcpOpenInApp(r.canvas_id),
+          apri_in_fluera: mcpOpenInApp(r.canvas_id, u.title),
         }))
       );
       const CAP = 20;
@@ -2070,6 +2154,11 @@ export function mcpCallTool(
         .sort((a, b) => a - b)[0];
       const maiVisti = scope.reduce((n, r) => n + r.payload.readiness.never_studied, 0);
       const aRischio = scope.reduce((n, r) => n + r.payload.readiness.at_risk, 0);
+      // 🔗 R4: anche lo stato vuoto deve poter chiudere col link, e il corso
+      // giusto è quello dell'esame più vicino — non il primo dell'elenco.
+      const rientro = scope.find((r) =>
+        mcpDaysLeft(r.payload.exam_date_ms, now) === esameVicino
+      ) ?? scope[0];
       const nienteInScadenza = due.length === 0 && errors.length === 0;
       const notaZero = nienteInScadenza && (maiVisti > 0 || aRischio > 0 ||
           (typeof esameVicino === "number" && esameVicino <= 30))
@@ -2097,6 +2186,7 @@ export function mcpCallTool(
             ].filter(Boolean).join(", ") +
             ". Non dire allo studente che è a posto: dillo solo se non c'è " +
             "nessuna di queste tre cose.",
+          ...(rientro ? { apri_in_fluera: mcpOpenInApp(rientro.canvas_id) } : {}),
         }
         : {};
       return mcpWrap(scope.length ? scope : rows, {
@@ -2115,7 +2205,12 @@ export function mcpCallTool(
     }
 
     case "get_review_forecast": {
-      const days = Math.min(Number(args.days ?? 7), 14);
+      // 🕳️ R2: `Number("sette")` è NaN e `Math.min(NaN, 14)` è NaN — il ciclo
+      // dei bucket non girava, la risposta usciva col solo «in_ritardo» e si
+      // leggeva come «non hai nulla in scadenza». Un'assenza dedotta da un
+      // difetto di parsing: la dottrina violata dal codice, non da una scelta.
+      const daysRaw = Math.trunc(Number(args.days ?? 7));
+      const days = Number.isFinite(daysRaw) && daysRaw > 0 ? Math.min(daysRaw, 14) : 7;
       const buckets: Record<string, number> = { in_ritardo: 0 };
       for (let i = 0; i < days; i++) buckets[mcpIso(now + i * 86_400_000)!] = 0;
       for (const r of active) {
@@ -2144,6 +2239,9 @@ export function mcpCallTool(
           topic: w.topic,
           corso: r.payload.name,
           accuratezza: w.accuracy_band,
+          // 🔗 R4: la riga `metodo` ordina in OGNI risposta di chiudere col
+          // link, e questo percorso non ne aveva nessuno da usare.
+          apri_in_fluera: mcpOpenInApp(r.canvas_id, w.topic),
         }))
       );
       return mcpWrap(scope.length ? scope : rows, {
@@ -2158,6 +2256,63 @@ export function mcpCallTool(
       }, now);
     }
 
+    case "get_exam_gate": {
+      if (args.course && !mcpFindCourse(active, String(args.course))) {
+        return mcpWrap(rows, {
+          errore: `Corso non trovato fra quelli attivi: "${args.course}". Usa list_courses.`,
+        }, now);
+      }
+      const scope = args.course
+        ? [mcpFindCourse(active, String(args.course))].filter(Boolean) as McpRow[]
+        : active;
+      // 🕳️ Un corso SENZA verdetto e uno con «zero pronti» sono due fatti
+      // diversi, e confonderli e' il difetto di sempre: il primo significa
+      // «non l'ho misurato», il secondo «l'ho misurato e non ci sei». Escono
+      // in due liste separate, mai sommati.
+      const conVerdetto = scope.filter((r) => r.payload.exam_gate);
+      const senzaVerdetto = scope
+        .filter((r) => !r.payload.exam_gate)
+        .map((r) => r.payload.name);
+      const corsi = conVerdetto.map((r) => {
+        const g = r.payload.exam_gate!;
+        return {
+          corso: r.payload.name,
+          pronti: g.ready,
+          su: g.total,
+          non_pronti: g.blocked.map((b) => ({
+            concetto: b.title,
+            motivo: MCP_BLOCKERS[b.blocker],
+            apri_in_fluera: mcpOpenInApp(r.canvas_id, b.title),
+          })),
+          non_pronti_totale: g.blocked_total,
+          ...(g.blocked_total > g.blocked.length
+            ? {
+              nota_non_pronti:
+                `Elenco parziale: ${g.blocked.length} nomi su ${g.blocked_total}.`,
+            }
+            : {}),
+          apri_in_fluera: mcpOpenInApp(r.canvas_id),
+        };
+      });
+      return mcpWrap(scope.length ? scope : rows, {
+        controllo_pre_prova: corsi,
+        ...(senzaVerdetto.length
+          ? {
+            senza_verdetto: senzaVerdetto,
+            nota_senza_verdetto:
+              "Su questi corsi il controllo non ha ancora abbastanza storia per " +
+              "esprimersi: NON significa che lo studente non sia pronto, significa " +
+              "che da qui non lo so. Non trattarli come bocciati.",
+          }
+          : {}),
+        nota_controllo:
+          "Non è un voto e non è una previsione d'esame: dice se su un argomento " +
+          "è stato fatto abbastanza lavoro perché una prova a libro chiuso dentro " +
+          "Fluera abbia senso. Il motivo è la PRIMA condizione che manca, non " +
+          "l'unica: quando quella è risolta può comparirne un'altra, ed è normale.",
+      }, now);
+    }
+
     default:
       throw new McpRpcError(-32602, `Tool sconosciuto: ${name}`);
   }
@@ -2166,14 +2321,38 @@ export function mcpCallTool(
 export const MCP_TOOL_DEFS = [
   {
     name: "list_courses",
+    // 🔒 P1: «sola lettura» viveva in un commento e in una frase su
+    // /connect: nessuna macchina la leggeva. E i default dello spec
+    // sono i pessimisti — annotazioni assenti significano distruttivo
+    // e mondo aperto, quindi un client prudente fa confermare ogni
+    // chiamata. ⚠️ Sono hint non fidati: descrivono, non proteggono.
+    annotations: {
+      title: "I tuoi corsi",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
-      "Elenca i corsi dello studente su Fluera: data d'esame, giorni rimanenti, prontezza a conteggi (sopra soglia / a rischio / mai studiati), i NOMI dei concetti mai studiati, fattibilità, esito. Un corso «superato» è fuori dalla pianificazione.",
+      "Elenca i corsi dello studente su Fluera: data d'esame, giorni rimanenti, prontezza a conteggi (sopra soglia / a rischio / mai studiati), i NOMI dei concetti mai studiati, esito. Un corso «superato» è fuori dalla pianificazione.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "get_readiness",
+    // 🔒 P1: «sola lettura» viveva in un commento e in una frase su
+    // /connect: nessuna macchina la leggeva. E i default dello spec
+    // sono i pessimisti — annotazioni assenti significano distruttivo
+    // e mondo aperto, quindi un client prudente fa confermare ogni
+    // chiamata. ⚠️ Sono hint non fidati: descrivono, non proteggono.
+    annotations: {
+      title: "Prontezza di un corso",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
-      "La prontezza di UN corso proiettata alla sua data d'esame, a conteggi (mai percentuali), con la fattibilità al ritmo attuale.",
+      "La prontezza di UN corso proiettata alla sua data d'esame, a conteggi (mai percentuali).",
     inputSchema: {
       type: "object",
       properties: { course: { type: "string", description: "Nome del corso" } },
@@ -2183,6 +2362,18 @@ export const MCP_TOOL_DEFS = [
   },
   {
     name: "get_due_now",
+    // 🔒 P1: «sola lettura» viveva in un commento e in una frase su
+    // /connect: nessuna macchina la leggeva. E i default dello spec
+    // sono i pessimisti — annotazioni assenti significano distruttivo
+    // e mondo aperto, quindi un client prudente fa confermare ogni
+    // chiamata. ⚠️ Sono hint non fidati: descrivono, non proteggono.
+    annotations: {
+      title: "Cosa fare adesso",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       "Cosa fare ADESSO: i concetti in scadenza (con `regge_giorni` = per quanti giorni il modello dice che il ricordo tiene, e `gia_caduto_volte`), gli errori da ricontrollare, e i concetti MAI studiati da cui iniziare. Lista globale annotata per corso (mai in silo: Fluera alterna le materie di proposito). Opzionale: filtra per corso. Zero in scadenza NON significa «a posto»: leggi `nota_zero` se c'è. Chiudi ogni piano col link apri_in_fluera.",
     inputSchema: {
@@ -2193,16 +2384,59 @@ export const MCP_TOOL_DEFS = [
   },
   {
     name: "get_review_forecast",
+    // 🔒 P1: «sola lettura» viveva in un commento e in una frase su
+    // /connect: nessuna macchina la leggeva. E i default dello spec
+    // sono i pessimisti — annotazioni assenti significano distruttivo
+    // e mondo aperto, quindi un client prudente fa confermare ogni
+    // chiamata. ⚠️ Sono hint non fidati: descrivono, non proteggono.
+    annotations: {
+      title: "Previsione dei ritorni",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       "Conteggi di ritorni dovuti per giorno, prossimi N giorni (default 7, max 14), più il bucket «in ritardo».",
     inputSchema: {
       type: "object",
-      properties: { days: { type: "number" } },
+      properties: {
+        days: { type: "integer", minimum: 1, maximum: 14, default: 7 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_exam_gate",
+    annotations: {
+      title: "Controllo pre-prova",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    description:
+      "Cosa manca PRIMA di una prova a libro chiuso, per argomento: quanti hanno superato il controllo e quanti no, e per quelli che no il MOTIVO (la prima condizione mancante, non l'unica). Non è un voto né una previsione d'esame. Un corso in `senza_verdetto` non è bocciato: è non misurato — leggi `nota_senza_verdetto`. Opzionale: filtra per corso.",
+    inputSchema: {
+      type: "object",
+      properties: { course: { type: "string" } },
       additionalProperties: false,
     },
   },
   {
     name: "get_weak_topics",
+    // 🔒 P1: «sola lettura» viveva in un commento e in una frase su
+    // /connect: nessuna macchina la leggeva. E i default dello spec
+    // sono i pessimisti — annotazioni assenti significano distruttivo
+    // e mondo aperto, quindi un client prudente fa confermare ogni
+    // chiamata. ⚠️ Sono hint non fidati: descrivono, non proteggono.
+    annotations: {
+      title: "Argomenti fragili",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     description:
       "I concetti su cui lo studente è più fragile, come FASCIA (bassa/media), dalla storia socratica e dagli atti di ricostruzione. Nessuna tendenza: la competenza qui è una fotografia, non una serie. Escono solo i concetti con evidenza sufficiente — un elenco vuoto significa «non ho abbastanza prove», NON «è tutto solido».",
     inputSchema: {
@@ -2361,6 +2595,13 @@ async function handleMcp(req: Request): Promise<Response> {
         }
         const toolName = String(params?.name ?? "");
         const args = (params?.arguments ?? {}) as Record<string, unknown>;
+        // 🕳️ R6: con zero righe il ramo del digest vuoto rispondeva SUCCESSO
+        // a qualunque nome — `segna_come_saputo` compreso veniva assolto
+        // dall'assenza di dati invece che rifiutato. Il nome si valida prima
+        // di guardare i dati, o l'esistenza di un tool dipende dal digest.
+        if (!MCP_TOOL_DEFS.some((t) => t.name === toolName)) {
+          throw new McpRpcError(-32602, `Tool sconosciuto: ${toolName}`);
+        }
         // 🕳️ Nessuna riga ha TRE cause diverse e non possiamo distinguerle da
         // qui: il token ha già provato che il consenso è vivo (la RPC lo
         // pretende), quindi restano «nessun corso ancora» e «il device non ha
@@ -2378,7 +2619,16 @@ async function handleMcp(req: Request): Promise<Response> {
         return reply({
           jsonrpc: "2.0",
           id,
-          result: { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] },
+          result: {
+            content: [{ type: "text", text: JSON.stringify(out, null, 2) }],
+            // 🚩 R6: un fallimento di DOMINIO (corso inesistente) usciva come
+            // successo. Lo spec vuole che l'errore di esecuzione arrivi al
+            // modello, perché si autocorregga, invece di farlo ragionare
+            // sopra una risposta che crede buona.
+            ...(out && typeof out === "object" && "errore" in out
+              ? { isError: true }
+              : {}),
+          },
         });
       }
       default:
