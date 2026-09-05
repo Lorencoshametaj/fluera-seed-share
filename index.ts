@@ -377,8 +377,13 @@ export const servi = async (req: Request): Promise<Response> => {
       : `${SITE}/beta`;
     const q = new URLSearchParams();
     const rawConcept = reqUrl.searchParams.get("concept");
+    // 🔤 L'apostrofo NON e' un carattere pericoloso qui: esce solo dentro
+    // `esc()` (che lo rende `&#39;`) e dentro `encodeURIComponent`. Metterlo
+    // in lista nera buttava via l'INTERO concetto per ogni titolo con un
+    // apostrofo — «L'apparato di Golgi», «Teoria dell'attaccamento» — e il
+    // link atterrava sulla tela muta senza dire perche'.
     const concept =
-      rawConcept && rawConcept.length <= 120 && !/[\x00-\x1f<>"']/.test(rawConcept)
+      rawConcept && rawConcept.length <= 120 && !/[\x00-\x1f<>"]/.test(rawConcept)
         ? rawConcept
         : null;
     if (concept) q.set("concept", concept);
@@ -393,7 +398,7 @@ export const servi = async (req: Request): Promise<Response> => {
     const t = it
       ? {
         lang: "it",
-        titolo: concept ? `«${esc(concept)}» ti aspetta` : "Il tuo ripasso ti aspetta",
+        titolo: concept ? `«${concept}» ti aspetta` : "Il tuo ripasso ti aspetta",
         corpo: concept
           ? "Questo link riapre i tuoi appunti su questo concetto, dentro Fluera."
           : "Questo link riapre un tuo quaderno dentro Fluera.",
@@ -403,7 +408,7 @@ export const servi = async (req: Request): Promise<Response> => {
       }
       : {
         lang: "en",
-        titolo: concept ? `“${esc(concept)}” is waiting` : "Your review is waiting",
+        titolo: concept ? `“${concept}” is waiting` : "Your review is waiting",
         corpo: concept
           ? "This link reopens your notes on this concept, inside Fluera."
           : "This link reopens one of your notebooks inside Fluera.",
@@ -1623,10 +1628,18 @@ function fmt(n: number): string {
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
+// 🌍 `Vary: Accept-Language` e' obbligatorio: queste pagine si ramificano
+// sull'header (rotta /r/), e `s-maxage=120` le mette in cache di bordo. Senza
+// `Vary`, la lingua servita per due minuti e' quella di CHI HA SCALDATO LA
+// CACHE — uno studente italiano riceveva la pagina inglese a caso.
 function html(status: number, body: string): Response {
   return new Response(body, {
     status,
-    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=0, s-maxage=120" },
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "public, max-age=0, s-maxage=120",
+      "Vary": "Accept-Language",
+    },
   });
 }
 function json(obj: unknown): Response {
@@ -1944,11 +1957,15 @@ export const mcpExamDay = (ms: number | null | undefined) =>
   ms == null ? null : new Date(ms + 43_200_000).toISOString().slice(0, 10);
 const mcpDaysLeft = (examMs: number | null, now: number) =>
   examMs == null ? null : Math.ceil((examMs - now) / 86_400_000);
-// 🔗 R3 — L'ULTIMO MIGLIO. La rotta /r/ legge e sanifica `?concept=`, il
-// gestore deep-link lo estrae e la tela apre il punto giusto: tutta la
-// catena era costruita e il connettore non l'ha mai usata, quindi ogni
+// 🔗 R3 — Il concetto nel link. La rotta /r/ legge e sanifica `?concept=`, e
+// il gestore deep-link lo estrae: il connettore non lo passava, quindi ogni
 // consiglio atterrava sulla tela e lasciava allo studente il compito di
 // ritrovare da solo il concetto di cui si stava parlando.
+// ⚠️ Questo commento diceva anche «e la tela apre il punto giusto». Era
+// FALSO quando l'ho scritto: l'inquadratura non esisteva. Ora c'e'
+// (`FlueraFirstGlimpseControls.focusOnConcept`, chiamata da main.dart dopo
+// il primo snapshot NON VUOTO dei concetti) — ma resta verificabile solo su
+// un dispositivo: nessun cancello puo' provare che la camera si e' mossa.
 const mcpOpenInApp = (canvasId: string, concept?: string | null) =>
   `https://share.fluera.dev/r/${canvasId}` +
   (concept ? `?concept=${encodeURIComponent(concept)}` : "");
