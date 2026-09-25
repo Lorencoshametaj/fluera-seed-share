@@ -63,6 +63,9 @@ export interface SeedRow {
   // senza limiti, quindi il numero si gonfia con un ciclo di curl (S7,
   // 2026-09-24). Resta nel tipo perché get_study_seed lo restituisce.
   install_count: number | null;
+  // ⚠️ Nemmeno questi si mostrano (25/09/2026): contano anche gli account
+  // anonimi. Sul web il voto viene SOLO da get_web_scheda (220), che per un
+  // pack non indicizzabile non restituisce righe.
   rating_sum: number | null;
   rating_count: number | null;
   // Campi che get_study_seed (186) restituisce già: servono al predicato
@@ -102,10 +105,6 @@ const CRAWLER_ADDESTRAMENTO = [
   "Applebot-Extended",
   "meta-externalagent",
 ] as const;
-
-/// Tetto sotto cui il voto medio non si mostra: con 1-4 voti la «media» è il
-/// gesto riconoscibile di una persona, non un'opinione del pubblico.
-const RATING_MIN_VOTI = 5;
 
 // 🔬 2026-08-22 — `servi` estratta e `Deno.serve` dietro `import.meta.main`:
 // finché il gestore era anonimo dentro la chiamata, questo file non poteva
@@ -218,6 +217,11 @@ export const servi = async (req: Request): Promise<Response> => {
         // regola più lunga, quindi l'Allow sotto riapre solo «?pagina=».
         "Disallow: /*/appunti/*?",
         "Allow: /*/appunti/*?pagina=",
+        // …ma non «?pagina=N&ref=…»: risponde 200 (il ref è l'attribuzione e
+        // si conserva), e con un ref qualunque sarebbe uno spazio di URL senza
+        // fine. Più lunga dell'Allow, quindi vince. Il server ricompone la
+        // query nell'ordine ordine, pagina, ref: altre forme sono già 301.
+        "Disallow: /*/appunti/*?pagina=*&ref=",
         "",
         // 🤖 Crawler che raccolgono testo per ADDESTRARE modelli: fuori da
         // tutto (F1, 2026-09-24). Il gruppo «*» sopra resta com'è: Googlebot,
@@ -1100,7 +1104,7 @@ async function rottaAppunti(m: RegExpMatchArray, reqUrl: URL): Promise<Response>
   if (!coda) return nonTrovata();
   const [, slug, corso, barra] = coda;
   // UN indirizzo per pagina: il server ricompone la query nel suo ordine
-  // (elenchi: ordine, pagina, ref; ricerca: q, materia, ref) e toglie il
+  // (elenchi: ordine, pagina, ref; ricerca: q, materia, ordine, ref) e toglie il
   // resto (utm_*, fbclid, ordine=consigliati, pagina=1). Il ref resta: è
   // l'attribuzione di chi ha condiviso il link.
   const par = reqUrl.searchParams;
@@ -1111,13 +1115,15 @@ async function rottaAppunti(m: RegExpMatchArray, reqUrl: URL): Promise<Response>
     const q = par.get("q");
     const mRaw = par.get("materia");
     const materia = mRaw !== null && RE_SLUG_MATERIA.test(mRaw) ? chiaveMateria(lingua, mRaw).chiave : null;
+    const ordineC = ordineDi(par.get("ordine"));
     if (q !== null) giusti.set("q", q);
     if (materia) giusti.set("materia", slugMateria(lingua, materia));
+    if (ordineC !== "consigliati") giusti.set("ordine", ordineC);
     if (ref) giusti.set("ref", ref);
     if (queryDiversa(par, giusti)) {
       return sposta301(`${base}${percorsoElenco(lingua)}cerca${giusti.size ? `?${giusti}` : ""}`);
     }
-    return await paginaCerca(lingua, q, materia);
+    return await paginaCerca(lingua, q, materia, ordineC);
   }
   if (corso && !RE_SLUG_CORSO.test(corso)) return nonTrovata();
   const pRaw = par.get("pagina");
@@ -1296,6 +1302,17 @@ function numeroIt(n: number): string {
   }
 }
 const votoIt = (v: number) => v.toFixed(1).replace(".", ",");
+
+/// La parola più lunga di un testo in em, a peso 600, per eccesso: tarata su
+/// Noto Sans (il sans più largo fra quelli di sistema che il catalogo usa;
+/// «Matematica» misura 6,0 em, stima 6,3). Solo per scegliere un corpo.
+export function larghezzaEm(testo: string): number {
+  const em = (c: string) =>
+    /[ijl.,'’!|]/.test(c) ? 0.32 : /[tfr]/.test(c) ? 0.44 : /[mw]/.test(c) ? 0.96 : /[MW]/.test(c) ? 1.02
+    : /\p{Lu}/u.test(c) ? 0.74 : 0.62;
+  const max = Math.max(0, ...testo.split(/\s+/).map((p) => [...p].reduce((s, c) => s + em(c), 0)));
+  return Math.round(max * 100) / 100;
+}
 const concetti = (n: number) => `${n} concett${n === 1 ? "o" : "i"}`;
 
 /// Cinque stelle come MW: piena se ≥ i, mezza se ≥ i − 0,5, vuota altrimenti.
@@ -1327,14 +1344,24 @@ function nuovo(r: SemeWeb): boolean {
 }
 
 /// Il distintivo di fiducia piccolo: Ufficiale vince su In evidenza.
+const nomeFiducia = (r: { is_official?: boolean | null; is_featured?: boolean | null }) =>
+  r.is_official === true ? "Ufficiale" : r.is_featured === true ? "In evidenza" : null;
+/// Sopra l'anteprima è solo per gli occhi (aria-hidden): il lettore di schermo
+/// lo sente in `dopoIlTitolo`, perché il nome della scheda cominci dal titolo
+/// come nell'app («titolo. autore. voto», MW:1246-1262).
 function fiducia(r: { is_official?: boolean | null; is_featured?: boolean | null }): string {
-  if (r.is_official === true) {
-    return `<span class="fiducia" title="Ufficiale">${ic("verified")}<span class="vh">Ufficiale</span></span>`;
-  }
-  if (r.is_featured === true) {
-    return `<span class="fiducia evid" title="In evidenza">${ic("auto_awesome")}<span class="vh">In evidenza</span></span>`;
-  }
-  return "";
+  const n = nomeFiducia(r);
+  return n
+    ? `<span class="fiducia${r.is_official === true ? "" : " evid"}" title="${n}" aria-hidden="true">${ic(r.is_official === true ? "verified" : "auto_awesome")}</span>`
+    : "";
+}
+/// I distintivi della scheda come testo nascosto, in fondo al nome del link.
+/// ⚠️ a.scheda è position:relative per questo: senza, lo span assoluto
+/// sfuggiva alla striscia che scorre e allargava la pagina (misurato: 989 px
+/// di scorrimento a 412).
+function dopoIlTitolo(voci: Array<string | null | undefined>): string {
+  const v = voci.filter((x): x is string => !!x);
+  return v.length ? `<span class="vh">${esc(v.join(", "))}</span>` : "";
 }
 
 /// L'anteprima «foglio appuntato sulla carta»: cornice a righe da quaderno e
@@ -1353,8 +1380,9 @@ function anteprima(r: SemeWeb, subito: boolean, sopra: string): string {
 function schedaSeme(r: SemeWeb, griglia: boolean, subito = false): string {
   const t = (r.title ?? "").trim() || "Senza titolo";
   const cat = categoriaDi(r.category);
-  const sopra = (fiducia(r) || (nuovo(r) ? `<span class="nuovo">Nuovo</span>` : "")) +
-    (cat ? `<span class="categoria">${ic(cat[1])}${esc(cat[0])}</span>` : "");
+  const eNuovo = nuovo(r);
+  const sopra = (fiducia(r) || (eNuovo ? `<span class="nuovo" aria-hidden="true">Nuovo</span>` : "")) +
+    (cat ? `<span class="categoria" aria-hidden="true">${ic(cat[1])}<span>${esc(cat[0])}</span></span>` : "");
   // Mai author_code sulle pagine indicizzate (dati_web §1): oggi ci arrivano
   // solo pack ufficiali, e l'autore degli studenti lo decide la F3.
   const autore = r.is_official === true ? "Fluera" : null;
@@ -1365,7 +1393,9 @@ function schedaSeme(r: SemeWeb, griglia: boolean, subito = false): string {
     autore ? `<span class="autore">${pallino(autore)}${esc(autore)}</span>` : ""
   }${eff !== null ? `<span class="pillola">${ic("trending")}+${Math.round(eff)}% ritenzione</span>` : ""}${
     voto !== null ? stelle(voto, numero(r.voti)) : ""
-  }<span class="piede-s"><span>${n !== null && n > 0 ? `${ic("hub")}${concetti(n)}` : ""}</span>${ic("chevron", "vai")}</span></span></a></li>`;
+  }<span class="piede-s"><span>${n !== null && n > 0 ? `${ic("hub")}${concetti(n)}` : ""}</span>${ic("chevron", "vai")}</span>${
+    dopoIlTitolo([nomeFiducia(r) ?? (eNuovo ? "Nuovo" : null), cat?.[0]])
+  }</span></a></li>`;
 }
 
 /// La scheda della striscia «In evidenza» (FeaturedTemplateCard, MW:2367-2626).
@@ -1374,7 +1404,7 @@ function schedaEvidenza(r: SemeWeb): string {
   const voto = numero(r.voto_medio);
   return `<li><a class="scheda evid" href="${SHARE}/s/${esc(r.hash)}">${anteprima(r, false, fiducia(r))}<span class="testi"><span class="col"><h3 class="t"${attrLingua(r)}>${esc(t)}</h3>${
     r.is_official === true ? `<span class="autore">${pallino("Fluera", "p24")}Fluera</span>` : ""
-  }${voto !== null ? stelle(voto, numero(r.voti)) : ""}</span><span class="tondo" aria-hidden="true">${ic("arrow")}</span></span></a></li>`;
+  }${voto !== null ? stelle(voto, numero(r.voti)) : ""}${dopoIlTitolo([nomeFiducia(r)])}</span><span class="tondo" aria-hidden="true">${ic("arrow")}</span></span></a></li>`;
 }
 
 /// Il banner (_InkfolioFeaturedHero, MS:2358-2810): il primo In evidenza, con
@@ -1399,7 +1429,9 @@ function bannerEvidenza(r: SemeWeb): string {
 }
 
 /// Intestazione di sezione (MS:1975-2059). «Vedi tutti» verso un ordine è
-/// nofollow: quelle pagine sono duplicati della base.
+/// nofollow: quelle pagine sono duplicati della base. Come nell'app icona e
+/// titolo stanno in una riga e il sottotitolo sotto, dal margine: rientrato
+/// sotto il titolo andava a capo sul telefono.
 function intestazione(
   id: string,
   icona: string,
@@ -1407,7 +1439,7 @@ function intestazione(
   sotto: string | null,
   vedi?: { href: string; nofollow: boolean },
 ): string {
-  return `<div class="sez-testa">${ic(icona)}<div><h2 id="${id}">${esc(titolo)}</h2>${sotto ? `<p>${esc(sotto)}</p>` : ""}</div>${
+  return `<div class="sez-testa"><div><div class="riga">${ic(icona)}<h2 id="${id}">${esc(titolo)}</h2></div>${sotto ? `<p>${esc(sotto)}</p>` : ""}</div>${
     vedi ? `<a class="vedi" href="${esc(vedi.href)}"${vedi.nofollow ? ` rel="nofollow"` : ""}>Vedi tutti${ic("chevron")}</a>` : ""
   }</div>`;
 }
@@ -1423,11 +1455,12 @@ const materieDi = (hubs: HubWeb[]) =>
 /// I chip delle MATERIE al posto dei chip categoria dell'app: sul web oggi
 /// ogni pack è «study», e la materia è il percorso. Link normali verso pagine
 /// indicizzabili; nella ricerca portano la ricerca con la materia.
-function chipMaterie(lingua: string, hubs: HubWeb[], attuale: string | null, q: string | null): string {
+function chipMaterie(lingua: string, hubs: HubWeb[], attuale: string | null, q: string | null, ordine: Ordine = "consigliati"): string {
   const href = (k: string | null) => {
     if (q === null) return urlElenco(lingua, k);
     const p = new URLSearchParams({ q });
     if (k) p.set("materia", slugMateria(lingua, k));
+    if (ordine !== "consigliati") p.set("ordine", ordine);
     return `${urlElenco(lingua)}cerca?${p}`;
   };
   const voce = (k: string | null, nome: string) =>
@@ -1461,10 +1494,16 @@ function faccettaCorso(lingua: string, hubs: HubWeb[], materia: string | null, c
   }</summary><ul class="menu" role="list">${menu}</ul></details>`;
 }
 
-/// «Ordina»: quattro link, e solo la griglia si riordina.
-function menuOrdina(base: string, ordine: Ordine): string {
+/// «Ordina»: quattro link, e solo la griglia si riordina. Nella ricerca `resto`
+/// porta q e materia, come nell'app dove l'ordine vale anche cercando.
+function menuOrdina(base: string, ordine: Ordine, resto?: URLSearchParams): string {
+  const href = (o: Ordine) => {
+    const q = new URLSearchParams(resto);
+    if (o !== "consigliati") q.set("ordine", o);
+    return `${base}${q.size ? `?${q}` : ""}`;
+  };
   const voci = ORDINI.map(([o, nome, nota]) =>
-    `<li><a href="${esc(o === "consigliati" ? base : `${base}?ordine=${o}`)}#tutti"${o === ordine ? ` aria-current="true"` : ""}${
+    `<li><a href="${esc(href(o))}#tutti"${o === ordine ? ` aria-current="true"` : ""}${
       o === "consigliati" ? "" : ` rel="nofollow"`
     }>${nome}${nota ? `<small>${nota}</small>` : ""}</a></li>`
   ).join("");
@@ -1511,12 +1550,12 @@ function navPagine(base: string, pagina: number, pagine: number, ordine: Ordine)
 }
 
 /// La ricerca in cima (ARB:3500). Con una materia, si cerca dentro la materia.
-function formCerca(lingua: string, q = "", materia: string | null = null): string {
+function formCerca(lingua: string, q = "", materia: string | null = null, ordine: Ordine = "consigliati"): string {
   return `<form class="cerca" action="${urlElenco(lingua)}cerca" method="get" role="search">${ic("search", "lente")}<input type="search" name="q" value="${
     esc(q)
   }" minlength="2" maxlength="80" placeholder="Cerca template di studio…" aria-label="Cerca template di studio" enterkeyhint="search" />${
     materia ? `<input type="hidden" name="materia" value="${esc(slugMateria(lingua, materia))}" />` : ""
-  }<button type="submit" aria-label="Cerca">${ic("arrow")}</button></form>`;
+  }${ordine !== "consigliati" ? `<input type="hidden" name="ordine" value="${ordine}" />` : ""}<button type="submit" aria-label="Cerca">${ic("arrow")}</button></form>`;
 }
 
 /// La fascia d'apertura (§ + titolo + stanghetta gialla + sottotitolo).
@@ -1538,10 +1577,12 @@ function statoVuoto(
   }</div>`;
 }
 
-/// «Tutti i template»: la griglia (le prime 5 immagini senza lazy) e le pagine.
-function sezioneTutti(semi: SemeWeb[], nav: string, titolo = "Tutti i template"): string {
+/// «Tutti i template»: la griglia e le pagine. Le prime 5 immagini senza lazy
+/// solo dove la griglia sta in cima (`inCima`): nell'indice con le vetrine sta
+/// sotto quattro strisce, e scaricarle subito rubava banda al banner.
+function sezioneTutti(semi: SemeWeb[], nav: string, titolo = "Tutti i template", inCima = true): string {
   return `<section class="sez" id="tutti" aria-labelledby="t-tutti">${intestazione("t-tutti", "grid", titolo, null)}<ul class="griglia">${
-    semi.map((r, i) => schedaSeme(r, true, i < 5)).join("")
+    semi.map((r, i) => schedaSeme(r, true, inCima && i < 5)).join("")
   }</ul>${nav}</section>`;
 }
 
@@ -1562,7 +1603,19 @@ function mappaCorsi(lingua: string, hubs: HubWeb[]): string {
 /// clic fuori. Solo comodità: senza script la pagina funziona uguale.
 /// Porta anche in vista il chip o la scheda che prende il focus: Chromium non
 /// fa scorrere una fila se l'elemento è visibile anche solo in parte.
-const AIUTO_MENU = `<script>(function(){var D=document,d=D.querySelectorAll("details.menu-a"),o=D.addEventListener.bind(D);function c(e){for(var i=0;i<d.length;i++)if(!e||!d[i].contains(e.target))d[i].removeAttribute("open")}o("click",c);o("keydown",function(e){e.key==="Escape"&&c()});o("focusin",function(e){var t=e.target;t.closest(".chips a,.striscia a")&&t.scrollIntoView({block:"nearest",inline:"nearest"})})})();</script>`;
+/// Le schede delle strisce, se non stanno intere con l'anello (5 px), vanno a
+/// «start»: con «nearest» lo scroll-snap (mandatory, start) le riportava
+/// indietro e a 320 px una scheda su due restava tagliata di 11 px a destra.
+/// Se stanno già intere non si muove niente (su desktop la fila sta ferma).
+/// Il focus da TASTIERA dentro una striscia o una fila di chip: porta la
+/// scheda intera in vista. Solo con :focus-visible — Chromium dà il focus al
+/// link già al mousedown/touchstart: far scorrere lì spostava la striscia
+/// sotto il dito, il rilascio cadeva su un'altra scheda e il clic non apriva
+/// niente (misurato a 320 px, 25/09/2026). Serve anche sulla /s/, che ha la
+/// striscia «Ti potrebbero interessare».
+const FOCUS_STRISCIA = `document.addEventListener("focusin",function(e){var t=e.target,s=t.closest(".striscia"),a,b;if(!t.matches(":focus-visible"))return;if(s&&t.tagName==="A"){a=t.getBoundingClientRect();b=s.getBoundingClientRect();t.scrollIntoView({block:"nearest",inline:a.left-5<b.left||a.right+5>b.right?"start":"nearest"})}else t.closest(".chips a")&&t.scrollIntoView({block:"nearest",inline:"nearest"})});`;
+const AIUTO_MENU = `<script>(function(){var D=document,d=D.querySelectorAll("details.menu-a"),o=D.addEventListener.bind(D);function c(e){for(var i=0;i<d.length;i++)if(!e||!d[i].contains(e.target))d[i].removeAttribute("open")}o("click",c);o("keydown",function(e){e.key==="Escape"&&c()});${FOCUS_STRISCIA}})();</script>`;
+const AIUTO_STRISCIA = `<script>${FOCUS_STRISCIA}</script>`;
 
 function jsonLdElenco(
   briciole: Array<{ nome: string; url: string }>,
@@ -1746,7 +1799,7 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
       )
     }
     ${vetrine.map((x) => sezioneVetrina(self, x)).join("\n    ")}
-    ${sezioneTutti(semi, navPagine(self, pagina, pagine, ordine))}
+    ${sezioneTutti(semi, navPagine(self, pagina, pagine, ordine), undefined, vetrine.length === 0)}
     ${mappaCorsi(lingua, hubs)}`,
   });
 }
@@ -1838,14 +1891,15 @@ async function paginaElenco(
 /// Minuscolo e senza accenti: «Perché» si trova scrivendo «perche».
 const perCercare = (s: string) => s.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
 
-/// Tutti i semi indicizzabili di una lingua, fino a CERCA_MAX.
-async function semiDellaLingua(lingua: string): Promise<EsitoRpc<SemeWeb>> {
-  const primo = await rpcWeb<SemeWeb>("list_web_seeds", { p_lingua: lingua, p_limit: 100, p_offset: 0 });
+/// Tutti i semi indicizzabili di una lingua, fino a CERCA_MAX, nell'ordine
+/// chiesto: lo fa il database, e il filtro della ricerca lo conserva.
+async function semiDellaLingua(lingua: string, ordine: Ordine): Promise<EsitoRpc<SemeWeb>> {
+  const primo = await rpcWeb<SemeWeb>("list_web_seeds", { p_lingua: lingua, p_limit: 100, p_offset: 0, ...conOrdine(ordine) });
   if (!primo.ok) return primo;
   const totale = Math.min(Number(primo.rows[0]?.totale ?? 0) || 0, CERCA_MAX);
   const altri = [];
   for (let off = 100; off < totale; off += 100) {
-    altri.push(rpcWeb<SemeWeb>("list_web_seeds", { p_lingua: lingua, p_limit: 100, p_offset: off }));
+    altri.push(rpcWeb<SemeWeb>("list_web_seeds", { p_lingua: lingua, p_limit: 100, p_offset: off, ...conOrdine(ordine) }));
   }
   const rows = [...primo.rows];
   for (const e of await Promise.all(altri)) {
@@ -1859,7 +1913,7 @@ async function semiDellaLingua(lingua: string): Promise<EsitoRpc<SemeWeb>> {
 /// ogni parola cercata sarebbe una pagina sottile. Cerca SOLO fra i semi
 /// indicizzabili (list_web_seeds), nel titolo, nella descrizione, nel corso e
 /// nel nome della materia.
-async function paginaCerca(lingua: string, qRaw: string | null, materia: string | null): Promise<Response> {
+async function paginaCerca(lingua: string, qRaw: string | null, materia: string | null, ordine: Ordine): Promise<Response> {
   // Gli elenchi servono ai chip delle materie, e dicono se la lingua (o la
   // materia chiesta) ha un catalogo.
   const h = await rpcWeb<HubWeb>("list_web_hubs", { p_lingua: lingua });
@@ -1874,7 +1928,7 @@ async function paginaCerca(lingua: string, qRaw: string | null, materia: string 
   if (n > 0 && (n < 2 || n > 80)) {
     esito = statoVuoto("search", "Cerca template di studio", "Scrivi da due a ottanta caratteri.", null);
   } else if (n > 0) {
-    const e = await semiDellaLingua(lingua);
+    const e = await semiDellaLingua(lingua, ordine);
     if (!e.ok) return rispostaGuasto(`ricerca (${lingua}): ${e.motivo}`);
     const parole = perCercare(q).split(/\s+/).filter(Boolean);
     const trovati = e.rows.filter((r) => {
@@ -1903,8 +1957,10 @@ async function paginaCerca(lingua: string, qRaw: string | null, materia: string 
     self: null,
     siIndicizza: false, // la ricerca: mai su Google
     corpo: `<nav class="briciole" aria-label="Percorso"><a href="${urlElenco(lingua)}">Appunti</a><span class="sep" aria-hidden="true">›</span><span aria-current="page">Cerca</span></nav>
-    ${formCerca(lingua, q, materia)}
-    <div class="filtri">${chipMaterie(lingua, hubs, materia, q)}</div>
+    ${formCerca(lingua, q, materia, ordine)}
+    <div class="filtri">${chipMaterie(lingua, hubs, materia, q, ordine)}${
+      menuOrdina(`${urlElenco(lingua)}cerca`, ordine, new URLSearchParams([["q", q], ...(materia ? [["materia", slugMateria(lingua, materia)]] : [])]))
+    }</div>
     ${fascia(n ? `Risultati per «${esc(q)}»` : "Cerca template di studio", sotto)}
     ${esito}`,
   });
@@ -2454,7 +2510,10 @@ async function ogImageResponse(hash: string): Promise<Response> {
         : row.thumb_path
         ? publicUrl(row.thumb_path)
         : OG_FALLBACK;
-      const png = await buildOgPng(row, baseUrl);
+      // Il voto di una indicizzabile viene dalla lettura del web, come la
+      // pagina: una sola regola (218), mai una soglia ricopiata qui.
+      const scheda = indicizzabile(row) ? await fetchScheda(row.hash) : null;
+      const png = await buildOgPng(row, baseUrl, scheda);
       return new Response(png, {
         status: 200,
         headers: {
@@ -2485,11 +2544,12 @@ async function ogImageResponse(hash: string): Promise<Response> {
 // irrilevante. Finché il modulo era importato dinamicamente il tipo era `any` e
 // niente di tutto questo si vedeva — l'import statico l'ha fatto emergere.
 /// I numeri stampati nell'og.png, fuori da resvg perché il cancello li possa
-/// leggere senza WASM. Niente install_count (gonfiabile, S7) e il voto solo
-/// sopra il tetto.
-export function ogNumeri(row: SeedRow): { stats: string; showStar: boolean } {
+/// leggere senza WASM. Niente install_count (gonfiabile, S7). Il voto come la
+/// /s/: solo sulle indicizzabili e solo da get_web_scheda (0 righe = niente
+/// voto); sulle noindex nessun voto.
+export function ogNumeri(row: SeedRow, scheda: SchedaWeb | null = null): { stats: string; showStar: boolean } {
   const concepts = Math.max(0, row.concept_count ?? 0);
-  const rating = votoMostrabile(row);
+  const rating = indicizzabile(row) ? Math.max(0, numero(scheda?.voto_medio) ?? 0) : 0;
   const parts: string[] = [];
   if (rating > 0) parts.push(rating.toFixed(1));
   if (concepts > 0) parts.push(`${concepts} concett${concepts === 1 ? "o" : "i"}`);
@@ -2499,6 +2559,7 @@ export function ogNumeri(row: SeedRow): { stats: string; showStar: boolean } {
 async function buildOgPng(
   row: SeedRow,
   baseUrl: string,
+  scheda: SchedaWeb | null,
 ): Promise<Uint8Array<ArrayBuffer>> {
   const { Resvg, font } = await loadResvg();
   const imgBytes = new Uint8Array(await (await fetch(baseUrl)).arrayBuffer());
@@ -2508,7 +2569,7 @@ async function buildOgPng(
     (row.title ?? "Template di studio").trim() || "Template di studio",
     30,
   );
-  const { stats, showStar } = ogNumeri(row);
+  const { stats, showStar } = ogNumeri(row, scheda);
   const statsX = showStar ? 110 : 64;
   // hand-coded 5-point star (resvg renders only fontBuffers glyphs → no emoji).
   const star =
@@ -2565,12 +2626,6 @@ function truncate(s: string, n: number): string {
 }
 
 // ── Rendering ───────────────────────────────────────────────────────────────
-
-/// Il voto medio, o 0 se non si deve mostrare (sotto RATING_MIN_VOTI).
-function votoMostrabile(row: SeedRow): number {
-  const n = Math.max(0, row.rating_count ?? 0);
-  return n >= RATING_MIN_VOTI ? (row.rating_sum ?? 0) / n : 0;
-}
 
 /// JSON dentro un <script> inline: `JSON.stringify` da solo non basta, perché
 /// una stringa con «</script>» chiuderebbe il tag. Si scappano «<», «>», «&»
@@ -2813,10 +2868,11 @@ function renderPage(
   // S7: install_count MAI (si gonfia con chiamate anonime, 047). Sulle
   // indicizzabili voto ed efficacia arrivano da get_web_scheda, già sotto le
   // soglie della 218: 0 righe o un guasto = nessun numero, mai un ripiego su
-  // get_study_seed. Sulle noindex resta RATING_MIN_VOTI di share.
-  const votoUgc = votoMostrabile(row) > 0 ? votoMostrabile(row) : null;
-  const voto = siIndicizza ? numero(scheda?.voto_medio) : votoUgc;
-  const voti = siIndicizza ? numero(scheda?.voti) : votoUgc !== null ? Math.max(0, row.rating_count ?? 0) : null;
+  // get_study_seed. Sulle noindex nessun voto (25/09/2026): la regola «da 5
+  // voti di account veri» vive solo nel database (220), e get_study_seed
+  // conta anche gli anonimi.
+  const voto = siIndicizza ? numero(scheda?.voto_medio) : null;
+  const voti = siIndicizza ? numero(scheda?.voti) : null;
   const nConcetti = numero(scheda?.concept_count) ?? (concepts > 0 ? concepts : null);
   const eff = numero(scheda?.efficacia_pct);
   const effN = numero(scheda?.efficacia_studenti);
@@ -2857,17 +2913,24 @@ function renderPage(
     : scheda?.is_featured === true
     ? `<span class="distintivo evid">${ic("auto_awesome")}In evidenza</span>`
     : "";
+  // --em: la parola più lunga della materia in em, perché il CSS scelga il
+  // corpo che la tiene su una riga («Matemat / ica» a 320 px).
+  const stileMateria = disciplina ? ` style="--em:${larghezzaEm(disciplina)}"` : "";
   const materiaV = disciplina
     ? vicini.hubMateria
-      ? `<a class="v materia" href="${esc(vicini.hubMateria)}">${esc(disciplina)}</a>`
-      : `<span class="v materia">${esc(disciplina)}</span>`
+      ? `<a class="v materia" href="${esc(vicini.hubMateria)}"${stileMateria}>${esc(disciplina)}</a>`
+      : `<span class="v materia"${stileMateria}>${esc(disciplina)}</span>`
     : `<span class="v">—</span>`;
   // Il riquadro a tre caselle (TD:1139-1197) senza installazioni: il loro
-  // posto va ai concetti veri (nell'app «1» fisso) e alla materia.
+  // posto va ai concetti veri (nell'app «1» fisso) e alla materia. Il numero
+  // dei voti non è nell'etichetta, come nell'app: resta per il lettore di
+  // schermo e al passaggio del mouse. «Compare da 5 voti» solo dove può
+  // comparire: su una noindex sarebbe una promessa falsa.
+  const nVoti = voti !== null ? `${voti} vot${voti === 1 ? "o" : "i"}` : null;
   const riquadro = `<div class="riquadro">
-          <div class="cella">${ic("star")}<span class="v"${voto === null ? ` title="Il voto compare da 5 voti"` : ""}>${
+          <div class="cella"${nVoti ? ` title="${nVoti}"` : ""}>${ic("star")}<span class="v"${voto === null && siIndicizza ? ` title="Il voto compare da 5 voti"` : ""}>${
     voto !== null ? votoIt(voto) : "—"
-  }</span><span class="e">Valutazione${voti !== null ? ` (${esc(numeroIt(voti))})` : ""}</span></div>
+  }</span><span class="e">Valutazione</span>${nVoti ? `<span class="vh">, ${nVoti}</span>` : ""}</div>
           <div class="cella">${ic("hub")}<span class="v">${nConcetti !== null ? esc(numeroIt(nConcetti)) : "—"}</span><span class="e">Concetti</span></div>
           <div class="cella">${ic(iconaMateria(materiaDi(row.discipline)))}${materiaV}<span class="e">Materia</span></div>
         </div>`;
@@ -2951,7 +3014,7 @@ function renderPage(
 </head>
 <body>
   ${spriteIcone(dentro)}${dentro}
-  ${l.script}
+  ${l.script}${siIndicizza && vicini.correlati.length ? `\n  ${AIUTO_STRISCIA}` : ""}
 </body>
 </html>`;
 }
@@ -2981,8 +3044,8 @@ const STILE_WEB =
   // Serif, che ha quelle di Times New Roman).
   `@font-face{font-family:"Instrument Fallback";src:local("Times New Roman"),local("Liberation Serif");size-adjust:83.8%;ascent-override:118.1%;descent-override:37%;line-gap-override:0%}` +
   `@font-face{font-family:"Caveat Fluera";src:url(${FONT_SITO}/Caveat-Regular.woff2) format("woff2");font-weight:400;font-display:swap}
-    :root{color-scheme:light dark;--carta:#FAF8F2;--carta-alta:#FFFFFF;--foglio:#FFFDF8;--lavata:#F7F3EB;--rialzo:#F1EBDD;--inchiostro:#23211B;--inchiostro-2:#6E6656;--accento:#2563EB;--accento-t:#2563EB;--accento-h:#1D4ED8;--accento-velo:#DCE6FB;--su-accento-velo:#16357A;--taupe:#EFE9DB;--filo:#E5DECE;--filo-2:#EFE8D9;--evidenziatore:#FFE55C;--stella-vuota:rgb(110 102 86/.45);--pal-sunset:#F0E1D7;--pal-sunset-t:#6E4A36;--pal-amber:#EEE6CF;--pal-amber-t:#5E4E2C;--pal-rose:#F0DFE2;--pal-rose-t:#6C3E48;--pal-grape:#E4DEEC;--pal-grape-t:#4C3F64;--serif:"Instrument Serif","Instrument Fallback",Georgia,"Times New Roman",serif;--mano:"Caveat Fluera",cursive;--sans:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;--bg:var(--carta);--sup:var(--foglio);--fg:var(--inchiostro);--forte:var(--inchiostro);--muted:var(--inchiostro-2);--dim:var(--inchiostro-2);--riga:var(--filo-2);--riga2:var(--filo);--acc:var(--accento-t);--btn:var(--accento);--btn-t:#FFFFFF;--btn-h:var(--accento-h);--img:var(--rialzo)}
-    @media(prefers-color-scheme:dark){:root{--carta:#221E16;--carta-alta:#322C22;--foglio:#2A251C;--lavata:#302B21;--rialzo:#3A3327;--inchiostro:#F2ECE0;--inchiostro-2:#A79E8A;--accento-t:#A8C7FA;--accento-h:#3B74F0;--accento-velo:#1E3054;--su-accento-velo:#C7D9FF;--taupe:#322D22;--filo:#3D3629;--filo-2:#322D23;--stella-vuota:rgb(167 158 138/.4);--pal-sunset:#43342B;--pal-sunset-t:#E6C7B4;--pal-amber:#3F3825;--pal-amber-t:#E2CFA0;--pal-rose:#422E33;--pal-rose-t:#E6C0C8;--pal-grape:#362F44;--pal-grape-t:#CCC0E0}}
+    :root{color-scheme:light dark;--carta:#FAF8F2;--carta-alta:#FFFFFF;--foglio:#FFFDF8;--lavata:#F7F3EB;--rialzo:#F1EBDD;--inchiostro:#23211B;--inchiostro-2:#6E6656;--accento:#2563EB;--accento-t:#2563EB;--accento-h:#1D4ED8;--accento-velo:#DCE6FB;--su-accento-velo:#16357A;--taupe:#EFE9DB;--filo:#E5DECE;--filo-2:#EFE8D9;--evidenziatore:#FFE55C;--stella-vuota:rgb(110 102 86/.8);--pal-sunset:#F0E1D7;--pal-sunset-t:#6E4A36;--pal-amber:#EEE6CF;--pal-amber-t:#5E4E2C;--pal-rose:#F0DFE2;--pal-rose-t:#6C3E48;--pal-grape:#E4DEEC;--pal-grape-t:#4C3F64;--serif:"Instrument Serif","Instrument Fallback",Georgia,"Times New Roman",serif;--mano:"Caveat Fluera",cursive;--sans:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;--bg:var(--carta);--sup:var(--foglio);--fg:var(--inchiostro);--forte:var(--inchiostro);--muted:var(--inchiostro-2);--dim:var(--inchiostro-2);--riga:var(--filo-2);--riga2:var(--filo);--acc:var(--accento-t);--btn:var(--accento);--btn-t:#FFFFFF;--btn-h:var(--accento-h);--img:var(--rialzo)}
+    @media(prefers-color-scheme:dark){:root{--carta:#221E16;--carta-alta:#322C22;--foglio:#2A251C;--lavata:#302B21;--rialzo:#3A3327;--inchiostro:#F2ECE0;--inchiostro-2:#A79E8A;--accento-t:#A8C7FA;--accento-h:#3B74F0;--accento-velo:#1E3054;--su-accento-velo:#C7D9FF;--taupe:#322D22;--filo:#3D3629;--filo-2:#322D23;--stella-vuota:rgb(167 158 138/.7);--pal-sunset:#43342B;--pal-sunset-t:#E6C7B4;--pal-amber:#3F3825;--pal-amber-t:#E2CFA0;--pal-rose:#422E33;--pal-rose-t:#E6C0C8;--pal-grape:#362F44;--pal-grape-t:#CCC0E0}}
     *{box-sizing:border-box}
     html{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;-webkit-text-size-adjust:100%}
     body{margin:0;background:var(--carta);color:var(--inchiostro);font:16px/1.5 var(--sans);overflow-wrap:break-word}
@@ -3036,7 +3099,17 @@ const STILE_WEB =
 /// lista è max-content perché il padding destro di un contenitore più stretto
 /// dei figli non entra nello scorrimento: a fine corsa l'ultimo chip restava
 /// nella sfumatura e l'ultima scheda attaccata al bordo. Da 1024 px le colonne
-/// delle strisce sono in % della lista, che quindi torna auto.
+/// delle strisce compatte sono un sesto del contenitore (cqi); le schede In
+/// evidenza restano 260 come nell'app (a un terzo della colonna il foglio
+/// diventava più alto del banner).
+/// La cornice ha l'altezza della scheda dell'app (_PaperFramedThumb: Center +
+/// AspectRatio in un Expanded): il foglio sta dentro, centrato, e ai lati
+/// resta la carta; almeno 76 px, perché a 320 px (schede da 138) il foglio
+/// scendeva a 40 px e distintivo e categoria si coprivano. Le stelle vuote sono a ≥ 3:1 sul fondo (WCAG 1.4.11): a
+/// .45 erano 1,9:1 e in scuro quasi sparivano.
+/// Il bordo della ricerca è il confine di un campo di testo: ≥ 3:1 contro la
+/// pagina e contro il campo (WCAG 1.4.11). Con --filo-2 era 1,1:1; resta un
+/// filo da 1 px, al 75% di --inchiostro-2 sulla carta (3,2:1 chiaro, 3,8:1 scuro).
 const STILE_CATALOGO = `
     main.cat{padding-top:2px}
     nav.briciole{margin:14px 0 0;font:12px/1.5 var(--sans);color:var(--inchiostro-2)}
@@ -3044,7 +3117,7 @@ const STILE_CATALOGO = `
     nav.briciole a:hover{color:var(--inchiostro);text-decoration:underline}
     nav.briciole .sep{margin:0 6px}
     nav.briciole [aria-current]{color:var(--inchiostro)}
-    form.cerca{position:relative;display:flex;align-items:center;height:52px;margin:14px 0 0;border:1px solid var(--filo-2);border-radius:14px;background:var(--foglio)}
+    form.cerca{position:relative;display:flex;align-items:center;height:52px;margin:14px 0 0;border:1px solid color-mix(in srgb,var(--inchiostro-2) 75%,var(--carta));border-radius:14px;background:var(--foglio)}
     form.cerca:focus-within{border-color:var(--accento-t);box-shadow:0 0 0 .5px var(--accento-t)}
     form.cerca .lente{position:absolute;left:16px;width:22px;height:22px;color:var(--inchiostro-2);pointer-events:none}
     form.cerca input{flex:1;min-width:0;height:100%;padding:0 4px 0 50px;border:0;background:none;color:var(--inchiostro);font:16px/1 var(--sans);outline:none}
@@ -3086,12 +3159,13 @@ const STILE_CATALOGO = `
     .fascia>div{min-width:0}
     .stanghetta{display:block;width:46px;height:6px;margin:10px 0 12px;border-radius:999px;background:var(--evidenziatore)}
     .fascia p{margin:0;color:var(--inchiostro-2);font:16px/1.45 var(--sans)}
-    .sez-testa{display:flex;align-items:flex-start;gap:8px;margin:22px 0 10px}
-    .sez-testa>.ic{width:19px;height:19px;margin-top:5px;color:var(--inchiostro-2)}
+    .sez-testa{display:flex;align-items:flex-end;gap:8px;margin:22px 0 10px}
     .sez-testa>div{flex:1;min-width:0}
-    .sez-testa h2{font-size:21px;line-height:1.2}
+    .sez-testa .riga{display:flex;align-items:center;gap:8px}
+    .sez-testa .riga>.ic{width:19px;height:19px;margin-top:1.5px;color:var(--inchiostro-2)}
+    .sez-testa h2{min-width:0;font-size:21px;line-height:1.2}
     .sez-testa p{margin:2px 0 0;color:var(--inchiostro-2);font:12px/1.35 var(--sans)}
-    .vedi{display:inline-flex;align-items:center;gap:2px;min-height:48px;margin:-10px -8px -10px 0;padding:0 8px;color:var(--accento-t);font:600 14px/1 var(--sans);white-space:nowrap;text-decoration:none}
+    .vedi{display:inline-flex;align-items:center;gap:2px;min-height:48px;margin:-10px -8px 0 0;padding:0 8px;color:var(--accento-t);font:600 14px/1 var(--sans);white-space:nowrap;text-decoration:none}
     .vedi .ic{width:18px;height:18px}
     .vedi:hover{text-decoration:underline}
     .striscia{margin:-4px -16px 0;padding:6px 16px 10px;overflow-x:auto;scroll-snap-type:x mandatory;overscroll-behavior-x:contain;scroll-padding-inline:16px;scrollbar-width:thin}
@@ -3101,11 +3175,12 @@ const STILE_CATALOGO = `
     .striscia.evid ul{grid-auto-columns:260px;gap:14px}
     ul.griglia{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:0;padding:0;list-style:none}
     ul.griglia>li{display:flex;min-width:0}
-    a.scheda{display:flex;flex-direction:column;width:100%;min-width:0;border:1px solid var(--filo);border-radius:16px;background:var(--carta);color:var(--inchiostro);text-decoration:none;transition:border-color 120ms ease-out,transform 120ms ease-out}
+    a.scheda{position:relative;display:flex;flex-direction:column;width:100%;min-width:0;border:1px solid var(--filo);border-radius:16px;background:var(--carta);color:var(--inchiostro);text-decoration:none;transition:border-color 120ms ease-out,transform 120ms ease-out}
     a.scheda:hover{border-color:color-mix(in srgb,var(--inchiostro-2) 45%,transparent)}
     a.scheda:hover .t,.eroe-a:hover h3{text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:3px}
-    .cornice{display:block;margin:10px 10px 0;padding:8px;border:1px solid var(--filo-2);border-radius:12px;background:repeating-linear-gradient(to bottom,transparent 0 10.5px,color-mix(in srgb,var(--filo-2) 60%,transparent) 10.5px 11px) var(--rialzo)}
-    .foglio{position:relative;display:block;aspect-ratio:4/3;overflow:hidden;border-radius:8px;background:var(--foglio)}
+    .cornice{display:flex;justify-content:center;aspect-ratio:2/1;min-height:76px;margin:10px 10px 0;padding:8px;border:1px solid var(--filo-2);border-radius:12px;background:repeating-linear-gradient(to bottom,transparent 0 10.5px,color-mix(in srgb,var(--filo-2) 60%,transparent) 10.5px 11px) var(--rialzo)}
+    .foglio{position:relative;display:block;height:100%;max-width:100%;aspect-ratio:4/3;overflow:hidden;border-radius:8px;background:var(--foglio)}
+    .striscia a.scheda:not(.evid) .cornice{aspect-ratio:17/10}
     .foglio img,.e-foglio img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center}
     .rigatura{position:absolute;inset:0;display:grid;place-items:center;background:repeating-linear-gradient(to bottom,transparent 0 10px,var(--filo) 10px 11px) var(--foglio)}
     .rigatura .cat{width:30px;height:30px;color:color-mix(in srgb,var(--inchiostro-2) 28%,transparent)}
@@ -3115,6 +3190,7 @@ const STILE_CATALOGO = `
     .nuovo{position:absolute;top:8px;left:8px;padding:3px 7px;border:1px solid var(--filo-2);border-radius:8px;background:var(--taupe);color:var(--inchiostro);font:600 11px/1.2 var(--sans)}
     .categoria{position:absolute;bottom:8px;left:8px;display:inline-flex;align-items:center;gap:4px;max-width:calc(100% - 16px);padding:3px 8px;border-radius:8px;background:rgb(0 0 0/.62);color:#FFFFFF;font:600 11px/1.3 var(--sans);white-space:nowrap}
     .categoria .ic{width:12px;height:12px}
+    .categoria>span{min-width:0;overflow:hidden;text-overflow:ellipsis}
     .testi{display:flex;flex-direction:column;flex:1;gap:5px;min-width:0;padding:9px 12px 11px}
     .testi .t{overflow:hidden;font-size:15.5px;line-height:1.15;white-space:nowrap;text-overflow:ellipsis}
     .autore{display:flex;align-items:center;gap:6px;min-width:0;color:var(--inchiostro-2);font:12px/1.3 var(--sans)}
@@ -3135,7 +3211,7 @@ const STILE_CATALOGO = `
     .piede-s .ic{width:13px;height:13px}
     .piede-s .vai{width:20px;height:20px;color:var(--accento-t)}
     a.scheda.evid{border-radius:18px}
-    a.scheda.evid .cornice{margin:12px 12px 0;padding:10px;border-radius:13px}
+    a.scheda.evid .cornice{aspect-ratio:19/10;margin:12px 12px 0;padding:10px;border-radius:13px}
     a.scheda.evid .foglio{aspect-ratio:3/2;border-radius:9px}
     a.scheda.evid .testi{flex-direction:row;align-items:flex-end;gap:10px;padding:10px 12px 12px 14px}
     a.scheda.evid .col{display:flex;flex:1;flex-direction:column;gap:7px;min-width:0}
@@ -3156,7 +3232,7 @@ const STILE_CATALOGO = `
     .e-voto{display:flex;align-items:center;justify-content:space-between;gap:12px}
     .eroe .stelle{color:var(--e-stelle)}
     .eroe .stelle .ic{width:16px;height:16px}
-    .eroe .stelle .vuota{color:color-mix(in srgb,var(--e-testo) 30%,transparent)}
+    .eroe .stelle .vuota{color:color-mix(in srgb,var(--e-testo) 50%,transparent)}
     .eroe .stelle .n{color:color-mix(in srgb,var(--e-testo) 72%,transparent);font-size:13px}
     .e-conc{display:inline-flex;align-items:center;gap:6px;color:color-mix(in srgb,var(--e-testo) 72%,transparent);font:600 14px/1 var(--sans)}
     .e-conc .ic{width:15px;height:15px}
@@ -3181,16 +3257,22 @@ const STILE_CATALOGO = `
     @media(prefers-color-scheme:dark){.eroe{--e-fondo:#FAF8F2;--e-testo:#23211B;--e-cornice:#F1EBDD;--e-foglio:#FFFDF8;--e-filo:#EFE8D9;--e-occhiello:#2563EB;--e-stelle:#2563EB;--e-pal:#DCE6FB;--e-pal-t:#16357A}}
     @media(min-width:640px){.striscia{margin:-4px -24px 0;padding-inline:24px;scroll-padding-inline:24px}ul.griglia{grid-template-columns:repeat(3,minmax(0,1fr))}}
     @media(min-width:800px){ul.griglia{grid-template-columns:repeat(4,minmax(0,1fr))}}
-    @media(min-width:1024px){nav.chips{grid-column:1;grid-row:1}details.ordina{grid-row:1}details.faccetta{grid-row:2}.fascia h1{font-size:36px}.sez-testa{margin-top:36px}.vedi{min-height:32px;margin-block:0}ul.griglia{grid-template-columns:repeat(5,minmax(0,1fr));gap:16px}.striscia{container-type:inline-size}.striscia ul{grid-auto-columns:calc((100cqi - 5*12px)/6);gap:12px}.striscia.evid ul{grid-auto-columns:calc((100cqi - 2*14px)/3);gap:14px}.eroe h3{font-size:30px}.e-foglio{height:260px}}
+    @media(min-width:1024px){nav.chips{grid-column:1;grid-row:1}details.ordina{grid-row:1}details.faccetta{grid-row:2}.fascia h1{font-size:36px}.sez-testa{margin-top:36px}.vedi{min-height:32px;margin-block:0}ul.griglia{grid-template-columns:repeat(5,minmax(0,1fr));gap:16px}.striscia{container-type:inline-size}.striscia ul{grid-auto-columns:calc((100cqi - 5*12px)/6);gap:12px}.eroe h3{font-size:30px}.e-foglio{height:260px}}
     @media(prefers-reduced-motion:no-preference){a.scheda:active,.eroe-a:active,a.chip:active{transform:scale(.98)}}`;
 
 /// La pagina del pack (TemplateDetailScreen): una colonna di 820 come l'app,
 /// due colonne da 1024. Sotto i 1024 la barra dei bottoni resta in basso.
+/// Su una colonna il foglio è 5:4 come la grande anteprima dell'app (a 4:3 il
+/// ritaglio della miniatura 3:4 tagliava la riga di scrittura in fondo).
+/// Etichette del riquadro come labelSmall dell'app (11, spaziatura .5), a 600:
+/// il w500 dell'app, senza un peso 500 nel font di sistema, esce normale.
+/// Sotto i 360 px i due bottoni della barra prendono la larghezza del loro
+/// testo (e 8 px di margine): a metà esatta «Entra nella beta» andava a capo.
 const STILE_PACK = `
     .pack{display:flex;flex-direction:column;max-width:820px;margin:0 auto}
     .pack-info{display:contents}
     .pack-img{margin:12px 0 18px;padding:12px;border:1px solid var(--filo-2);border-radius:16px;background:var(--rialzo)}
-    .foglio-g{position:relative;display:block;aspect-ratio:4/3;overflow:hidden;border-radius:10px;background:var(--foglio)}
+    .foglio-g{position:relative;display:block;aspect-ratio:5/4;overflow:hidden;border-radius:10px;background:var(--foglio)}
     .foglio-g img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center}
     .iniziale{position:absolute;inset:0;display:grid;place-items:center;background:linear-gradient(135deg,var(--accento-velo),var(--rialzo));color:color-mix(in srgb,var(--su-accento-velo) 60%,transparent);font:600 44px/1 var(--serif)}
     .titolo-riga{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:6px 12px}
@@ -3203,13 +3285,14 @@ const STILE_PACK = `
     .di{display:flex;align-items:center;gap:6px;margin:8px 0 0;color:var(--inchiostro-2);font:12px/1.3 var(--sans)}
     .di .ic{width:16px;height:16px}
     .riquadro{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin-top:16px;padding:14px 4px;border:1px solid var(--filo-2);border-radius:12px;background:var(--foglio)}
-    .cella{display:flex;flex-direction:column;align-items:center;gap:4px;min-width:0;padding:0 6px;text-align:center}
+    .cella{position:relative;display:flex;flex-direction:column;align-items:center;gap:4px;min-width:0;padding:0 6px;text-align:center;container-type:inline-size}
     .cella+.cella{border-left:1px solid var(--filo-2)}
     .cella .ic{width:16px;height:16px;color:var(--inchiostro-2)}
     .cella .v{max-width:100%;color:var(--inchiostro);font:600 17px/1.3 var(--sans);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+    .cella .v.materia{font-size:clamp(10px,calc(100cqi / var(--em,6)),17px)}
     .cella a.v{color:var(--accento-t);text-decoration:none}
     .cella a.v:hover{text-decoration:underline}
-    .cella .e{color:var(--inchiostro-2);font:11px/1.3 var(--sans)}
+    .cella .e{color:var(--inchiostro-2);font:600 11px/1.45 var(--sans);letter-spacing:.5px}
     .eff{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin-top:12px;color:var(--inchiostro-2);font:12px/1.3 var(--sans)}
     .pack .blocco h2{margin:26px 0 10px;font-size:19px;line-height:1.2}
     .tag-l{display:flex;flex-wrap:wrap;gap:8px;margin:0;padding:0;list-style:none}
@@ -3223,6 +3306,7 @@ const STILE_PACK = `
     .nota p{margin:0}
     .azioni{position:sticky;bottom:0;z-index:10;order:3;display:flex;gap:10px;margin:24px -16px 0;padding:10px 16px 12px;border-top:1px solid var(--filo-2);background:var(--carta)}
     .azioni .btn{flex:1 1 0;min-height:52px;padding:0 12px}
+    @media(max-width:359px){.azioni{gap:8px}.azioni .btn{flex-basis:auto;padding:0 8px}}
     .segnala-riga{order:1;margin:18px 0 0}
     .segnala{display:inline-flex;align-items:center;gap:4px;color:var(--inchiostro-2);font:12px/1.3 var(--sans);text-decoration:none}
     .segnala .ic{width:16px;height:16px}
