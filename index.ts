@@ -17,6 +17,9 @@
 //       shipped QR pointed at a 404 until this route existed.
 //   • GET /.well-known/apple-app-site-association → iOS Universal Links claim
 //   • GET /.well-known/assetlinks.json            → Android App Links claim
+//   • GET /{lingua}/appunti/[{materia}/[{corso}/]] → gli elenchi pubblici per
+//       materia e corso, e /{lingua}/appunti/cerca (F2, 2026-09-24). Chi sta
+//       in un elenco lo decide SOLO il database (213): qui non si ricopia.
 //
 // Because the deep-link verification files live on the SAME domain that the
 // share link uses, tapping share.fluera.dev/s/{hash} opens the app (when
@@ -46,7 +49,7 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "
 const OG_FALLBACK = `${SITE}/og/default.png`;
 const HASH_RE = /[A-Za-z0-9]{8,64}/;
 
-interface SeedRow {
+export interface SeedRow {
   hash: string;
   author_code: string | null;
   title: string | null;
@@ -56,10 +59,53 @@ interface SeedRow {
   thumb_path: string | null;
   og_path: string | null;
   is_official: boolean | null;
+  // ⚠️ Si legge ma NON si mostra mai: `record_seed_install` (047) è anonimo e
+  // senza limiti, quindi il numero si gonfia con un ciclo di curl (S7,
+  // 2026-09-24). Resta nel tipo perché get_study_seed lo restituisce.
   install_count: number | null;
   rating_sum: number | null;
   rating_count: number | null;
+  // Campi che get_study_seed (186) restituisce già: servono al predicato
+  // `indicizzabile` e alla pagina senza contenuto per i non-general.
+  moderation_status: string | null;
+  content_maturity: string | null;
+  locale: string | null;
+  ai_generated: boolean | null;
+  // Per isAccessibleForFree del JSON-LD: oggi è 0 per costruzione (CHECK
+  // della 047), ma il markup non deve continuare a dire «gratis» il giorno
+  // in cui quel CHECK cade.
+  price_cents?: number | null;
+  superseded_by?: string | null;
+  // La regola di Google calcolata dal database (seed_web_indicizzabile, 213).
+  // Assente su un database prima della 213.
+  web_indicizzabile?: boolean | null;
 }
+
+/// 🔎 Su Google solo ciò di cui rispondiamo noi. La regola vive in SQL
+/// (seed_web_indicizzabile, 213) e arriva come `web_indicizzabile`: qui si
+/// LEGGE e basta. Fino al 2026-09-24 ne esisteva una copia in TypeScript che
+/// non guardava superseded_by: con la testa di una catena revocata, pagina e
+/// sitemap dicevano due cose diverse. Campo assente = non indicizzabile.
+export function indicizzabile(row: SeedRow): boolean {
+  return row.web_indicizzabile === true;
+}
+
+/// I token robots.txt dei crawler di ADDESTRAMENTO, come li scrivono i loro
+/// gestori (Google, Apple, Meta e Common Crawl verificati sulle pagine
+/// ufficiali il 2026-09-24). Niente bot di ricerca né di anteprima link qui:
+/// quelli (Googlebot, facebookexternalhit…) devono poter leggere /s/.
+const CRAWLER_ADDESTRAMENTO = [
+  "GPTBot",
+  "ClaudeBot",
+  "CCBot",
+  "Google-Extended",
+  "Applebot-Extended",
+  "meta-externalagent",
+] as const;
+
+/// Tetto sotto cui il voto medio non si mostra: con 1-4 voti la «media» è il
+/// gesto riconoscibile di una persona, non un'opinione del pubblico.
+const RATING_MIN_VOTI = 5;
 
 // 🔬 2026-08-22 — `servi` estratta e `Deno.serve` dietro `import.meta.main`:
 // finché il gestore era anonimo dentro la chiamata, questo file non poteva
@@ -100,6 +146,17 @@ export const servi = async (req: Request): Promise<Response> => {
       target: { namespace: "android_app", package_name: BUNDLE_ID, sha256_cert_fingerprints: fingerprints },
     }]);
   }
+  // 🪪 L'impronta del build in esecuzione: lo sha256 di QUESTO file. La legge
+  // mirror_in_sync.sh (B) — prima (B) guardava solo i path dell'AASA, quindi
+  // un build con l'AASA giusto ma senza il noindex risultava «promosso».
+  // no-store: un'impronta vecchia in cache farebbe sembrare non promosso un
+  // build appena promosso.
+  if (/\/\.well-known\/fluera-build\/?$/.test(path)) {
+    return new Response(JSON.stringify(await improntaBuild()), {
+      status: 200,
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
+  }
 
   // ── /robots.txt + /sitemap.xml → rendere TROVABILI le pagine template ──────
   // Ogni `/s/{hash}` è già una pagina server-rendered con og:* e canonical, ma
@@ -136,7 +193,11 @@ export const servi = async (req: Request): Promise<Response> => {
         // `/p` e' una scheda privata condivisa con una persona. Non c'e' nulla
         // da indicizzare — il server non conosce nemmeno il token — e un
         // crawler qui spenderebbe budget su una pagina identica ogni volta.
-        "Disallow: /p",
+        // Tre regole strette, non il prefisso «/p»: quello chiudeva anche
+        // gli elenchi /pt/appunti/ e /pl/appunti/ che la sitemap dà a Google.
+        "Disallow: /p$",
+        "Disallow: /p?",
+        "Disallow: /p/",
         // `/r/` è il rientro su una tela PERSONALE: stessa porta chiusa di
         // `/c/` — si apre a chi ha il link, mai ai motori.
         "Disallow: /r/",
@@ -149,7 +210,22 @@ export const servi = async (req: Request): Promise<Response> => {
         "Disallow: /get",
         "Disallow: /u/",
         "Disallow: /report",
+        // La ricerca negli elenchi: una pagina per ogni parola che qualcuno
+        // scrive, cioè infinite pagine sottili. Gli elenchi sì, la ricerca no.
+        "Disallow: /*/appunti/cerca",
+        // Ordini e varianti degli elenchi sono duplicati della pagina base
+        // (canonical alla base): chiusi, tranne la paginazione pura. Vince la
+        // regola più lunga, quindi l'Allow sotto riapre solo «?pagina=».
+        "Disallow: /*/appunti/*?",
+        "Allow: /*/appunti/*?pagina=",
         "",
+        // 🤖 Crawler che raccolgono testo per ADDESTRARE modelli: fuori da
+        // tutto (F1, 2026-09-24). Il gruppo «*» sopra resta com'è: Googlebot,
+        // Bingbot e i bot di RICERCA continuano a leggere /s/. Google-Extended
+        // non tocca l'inclusione né il posizionamento su Google Search (lo
+        // dice la documentazione di Google). È il default restrittivo: la
+        // posizione definitiva andrà nei Termini, e la decide Lorenco.
+        ...CRAWLER_ADDESTRAMENTO.flatMap((bot) => [`User-agent: ${bot}`, "Disallow: /", ""]),
         "Sitemap: https://share.fluera.dev/sitemap.xml",
         "",
       ].join("\n"),
@@ -163,6 +239,13 @@ export const servi = async (req: Request): Promise<Response> => {
     );
   }
   if (/\/sitemap\.xml$/.test(path)) return await sitemapResponse();
+
+  // ── /{lingua}/appunti/… → gli elenchi per materia e corso (F2) ─────────────
+  // QUI, prima delle rotte a suffisso (/get, /connect, /report, /mcp…): un
+  // corso chiamato «Get» ha slug «get», e /it/appunti/matematica/get/ finirebbe nel
+  // redirect verso lo store.
+  const appunti = path.match(RE_ROTTA_APPUNTI);
+  if (appunti) return await rottaAppunti(appunti, reqUrl);
 
   // ── /c/{hash} → la Ghost Map pubblica ──────────────────────────────────────
   // L'app produce questi link da una UI viva (ShareGhostMapSheet) da mesi, e
@@ -537,38 +620,100 @@ export const servi = async (req: Request): Promise<Response> => {
   const hash = m[1];
 
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-    return html(500, statusPage("Errore", "Server non configurato."));
+    return html(500, paginaStato("Errore", "Server non configurato."));
   }
-  const row = await fetchTemplate(hash);
-  if (!row) return html(410, statusPage("Non più disponibile", "Questo template è stato rimosso o non è più pubblico."));
+  const esito = await fetchTemplate(hash);
+  // ⚠️ Guasto ≠ assente. Fino al 2026-09-24 un 5xx o una rete muta
+  // rispondevano 410 «rimosso», che per Google è DEFINITIVO: un guasto di un
+  // minuto poteva deindicizzare il catalogo. Il 503 dice «riprova».
+  if (esito.tipo === "guasto") return rispostaGuasto(`get_study_seed per ${hash}: ${esito.motivo}`);
+  if (esito.tipo === "assente") return html(410, paginaStato("Non più disponibile", "Questo template è stato rimosso o non è più pubblico."));
+  const row = esito.row;
 
-  // L'ultimo ramo era `OG_FALLBACK`, cioè il banner marketing generico: chi
-  // apriva il link vedeva un'immagine di repertorio identica per ogni template.
-  // Il render dal vivo di `/s/{hash}/og.png` — quello che il crawler riceve già
-  // oggi per `og:image` — almeno ci stampa sopra il titolo e i numeri veri.
-  // ⚠️ Non è la vera riparazione: i pack curati pubblicati senza `--thumb` non
-  // hanno miniatura in storage, e il posto dove sistemarlo è la pubblicazione,
-  // non questa pagina. Il percorso dell'app ne carica una (`_study_seed.dart`),
-  // quindi i seed degli utenti non passano mai di qui.
-  const ogImageUrl = row.og_path
-    ? publicUrl(row.og_path)
-    : row.thumb_path
-      ? publicUrl(row.thumb_path)
-      : `https://share.fluera.dev/s/${hash}/og.png`;
-  const platform = classify(req.headers.get("user-agent") ?? "");
   // C1: attribution is an OPTIONAL "?ref={referralCode}" query param. Read it
   // here and forward it into every store/app-open URL so an install attributes
   // back to the sharer. Sanitize (alnum + a few safe chars) to keep referrer
   // payloads clean and avoid open-redirect/HTML-injection surprises.
   const ref = sanitizeRef(reqUrl.searchParams.get("ref"));
-  return html(200, renderPage(row, hash, ogImageUrl, platform, ref));
+
+  // 🔗 UN indirizzo per contenuto: get_study_seed segue la catena delle
+  // versioni (186), quindi un link vecchio risolve alla testa. Senza il 301
+  // la stessa pagina viveva sotto N hash. Location RELATIVA per non perdere
+  // il prefisso di `functions serve` in locale; `/s/{hash}` resta a DUE
+  // segmenti (il gestore dei link dell'app accetta solo quella forma). La
+  // scadenza non è estetica: un 301 senza Cache-Control resta nel browser per
+  // sempre, e la testa della catena può cambiare.
+  // ⚠️ Il prefisso si tiene SOLO se è quello di `functions serve` (segmenti
+  // semplici che finiscono in /seed-share). Il 2026-09-24 il prefisso grezzo
+  // faceva di `//evil.example/s/{hash vecchio}` (o `/\evil.example/…`) un 301
+  // protocol-relative verso un host qualsiasi, in cache pubblica per 5 minuti.
+  if (hash !== row.hash) {
+    const prefisso = path.slice(0, m.index ?? 0);
+    const base = /^(?:\/[A-Za-z0-9_-]+)*\/seed-share$/.test(prefisso) ? prefisso : "";
+    return new Response(null, {
+      status: 301,
+      headers: {
+        Location: `${base}/s/${row.hash}${ref ? `?ref=${encodeURIComponent(ref)}` : ""}`,
+        "Cache-Control": "public, max-age=300",
+      },
+    });
+  }
+
+  // 🔞 Non-general: la pagina esiste (un link deve risolvere, 070) ma non
+  // dice niente del contenuto — né nel corpo né nell'anteprima di una chat.
+  if (row.content_maturity !== "general") {
+    return paginaSeme(renderPaginaRiservata(row, ref), false);
+  }
+
+  // 📱 Niente user-agent qui: la pagina è la STESSA per ogni telefono (S6).
+  // Link interni e scheda (voto, efficacia, argomenti) solo dove Google
+  // entra: su una noindex get_web_scheda darebbe comunque 0 righe.
+  // Senza miniatura la pagina mostra l'iniziale del titolo come l'app
+  // (TD:1945-1965), non più la card og: i pack curati pubblicati senza
+  // `--thumb` si sistemano alla pubblicazione, non qui.
+  const [vicini, scheda] = indicizzabile(row)
+    ? await Promise.all([fetchVicini(row), fetchScheda(row.hash)])
+    : [NESSUN_VICINO, null];
+  return paginaSeme(renderPage(row, ref, vicini, scheda), indicizzabile(row));
 };
 
 if (import.meta.main) Deno.serve(servi);
 
+/// La risposta di una pagina /s/ o di un elenco: `html()` più il noindex anche
+/// come header, così vale pure per chi non legge l'HTML. Si passa da qui e da
+/// nessun altro posto, perché il predicato non si perda in un ramo nuovo.
+function paginaSeme(body: string, siIndicizza: boolean): Response {
+  const r = html(200, body);
+  if (!siIndicizza) r.headers.set("X-Robots-Tag", "noindex");
+  return r;
+}
+
+/// Un guasto del database: 503 che dice «riprova», mai 404/410 (per Google
+/// sono una rimozione) e mai in cache.
+function rispostaGuasto(motivo: string): Response {
+  console.error(`guasto: ${motivo}`);
+  // «Riprova» = href vuoto, cioè lo stesso indirizzo.
+  const r = html(503, paginaStato("Catalogo non raggiungibile", "Non riusciamo a caricare il catalogo in questo momento. Riprova tra poco.", {
+    icona: "cloud_off",
+    azione: { testo: "Riprova", href: "" },
+  }));
+  r.headers.set("Retry-After", "120");
+  r.headers.set("Cache-Control", "no-store");
+  r.headers.set("X-Robots-Tag", "noindex");
+  return r;
+}
+
 // ── Supabase ────────────────────────────────────────────────────────────────
 
-async function fetchTemplate(hash: string): Promise<SeedRow | null> {
+type EsitoSeme =
+  | { tipo: "trovato"; row: SeedRow }
+  | { tipo: "assente" }
+  | { tipo: "guasto"; motivo: string };
+
+/// «Assente» SOLO quando il database ha risposto bene con zero righe. Ogni
+/// altra cosa — rete, 5xx, JSON che non è un elenco — è un guasto, e il
+/// chiamante non deve poterlo scambiare per una rimozione.
+async function fetchTemplate(hash: string): Promise<EsitoSeme> {
   try {
     const resp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_study_seed`, {
       method: "POST",
@@ -580,12 +725,1216 @@ async function fetchTemplate(hash: string): Promise<SeedRow | null> {
       },
       body: JSON.stringify({ p_hash: hash }),
     });
-    if (!resp.ok) return null;
-    const rows = (await resp.json()) as SeedRow[];
-    return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
-  } catch {
+    if (!resp.ok) return { tipo: "guasto", motivo: `HTTP ${resp.status}` };
+    const rows = (await resp.json()) as unknown;
+    if (!Array.isArray(rows)) return { tipo: "guasto", motivo: "risposta non è un elenco" };
+    if (rows.length === 0) return { tipo: "assente" };
+    const row = rows[0] as SeedRow;
+    if (!row || typeof row.hash !== "string") {
+      return { tipo: "guasto", motivo: "riga senza hash" };
+    }
+    return { tipo: "trovato", row };
+  } catch (e) {
+    return { tipo: "guasto", motivo: String(e) };
+  }
+}
+
+// ── Gli elenchi del web (F2, 2026-09-24) ────────────────────────────────────
+// Le tre letture della 213 restituiscono SOLO semi indicizzabili (list_web_seeds)
+// e SOLO elenchi sopra soglia (list_web_hubs: almeno 3 semi, e tutti ufficiali
+// oppure almeno 2 account — un elenco di un solo autore sarebbe il profilo di
+// una persona). Qui la soglia non si ricalcola: un elenco esiste se e solo se
+// list_web_hubs lo restituisce.
+const HASH_INTERO_RE = new RegExp(`^${HASH_RE.source}$`);
+const SHARE = "https://share.fluera.dev";
+const CORRELATI_MAX = 6;
+/// 60 = multiplo di 2, 3, 4, 5 e 6: con ogni numero di colonne l'ultima riga
+/// della griglia resta piena.
+const SEMI_PER_PAGINA = 60;
+/// Il tetto di p_offset della 213: oltre, l'RPC ripeterebbe l'ultima pagina.
+const OFFSET_MAX = 10000;
+/// Quanti semi di una lingua la ricerca legge al massimo (5 chiamate da 100).
+const CERCA_MAX = 500;
+const RE_SLUG_MATERIA = /^[a-z]{2,20}$/;
+const RE_SLUG_CORSO = /^(?=.{1,60}$)[a-z0-9]+(?:-[a-z0-9]+)*$/;
+/// /{lingua}/appunti + il resto. Il prefisso di `functions serve` (in locale)
+/// passa solo a segmenti semplici, come per il 301 di /s/.
+const RE_ROTTA_APPUNTI = /^((?:\/[A-Za-z0-9_-]+)*\/seed-share)?\/([a-z]{2,3})\/appunti(\/.*)?$/;
+
+type SemeWeb = {
+  hash: string;
+  title: string | null;
+  description: string | null;
+  discipline: string | null;
+  materia_slug: string | null;
+  course: string | null;
+  corso_slug: string | null;
+  locale: string | null;
+  thumb_path: string | null;
+  og_path: string | null;
+  updated_at: string | null;
+  totale: number | string | null;
+  // I campi della scheda (218): assenti su un database prima della 218, e
+  // già passati dalle soglie del server (sotto soglia arrivano NULL).
+  category?: string | null;
+  tags?: string[] | null;
+  concept_count?: number | null;
+  is_official?: boolean | null;
+  is_featured?: boolean | null;
+  ai_generated?: boolean | null;
+  voto_medio?: number | string | null;
+  voti?: number | null;
+  efficacia_pct?: number | null;
+  efficacia_studenti?: number | null;
+  created_at?: string | null;
+};
+/// Una riga di list_web_vetrine (218): la scheda più la vetrina e il posto.
+type VetrinaWeb = SemeWeb & { vetrina: string; posto: number };
+/// Una riga di get_web_scheda (218): 0 righe se il pack non è indicizzabile.
+type SchedaWeb = Pick<
+  SemeWeb,
+  | "hash" | "category" | "tags" | "concept_count" | "is_official" | "is_featured" | "ai_generated"
+  | "voto_medio" | "voti" | "efficacia_pct" | "efficacia_studenti" | "created_at" | "updated_at"
+>;
+type HubWeb = {
+  materia_slug: string;
+  materia: string | null;
+  corso_slug: string | null;
+  corso: string | null;
+  n: number | string | null;
+  lastmod: string | null;
+};
+
+/// Le materie di seed_web_materia_slug (213) con l'etichetta italiana e
+/// l'introduzione della pagina materia. Solo parole: quali elenchi esistono
+/// lo dice il database. Chiavi ed etichette sono tenute uguali alla 213 da
+/// seo_contract (test 18).
+export const MATERIE: Record<string, { it: string; intro: string }> = {
+  math: {
+    it: "Matematica",
+    intro:
+      "La matematica si capisce con la penna in mano. Leggere un ragionamento già scritto dà l'impressione di averlo capito; rifarlo da soli, un passaggio alla volta, dice se è vero. Gli appunti di questa pagina servono a questo. Si aprono in Fluera su un canvas senza bordi, e accanto a ogni passaggio c'è spazio per riscriverlo con la tua calligrafia, per disegnare un grafico storto ma tuo, per segnare il punto in cui ti sei bloccato. Non sono schede da imparare a memoria: sono un punto di partenza da riempire. Quando torni a ripassare, prova prima a ricostruire il ragionamento a libro chiuso, poi confrontalo con quello che avevi scritto.",
+  },
+  physics: {
+    it: "Fisica",
+    intro:
+      "In fisica le formule arrivano alla fine. Prima c'è una situazione da immaginare: un oggetto che cade, una corda che vibra, l'acqua che scorre in un tubo. Chi studia bene la disegna, ci mette le frecce, si chiede che cosa succederebbe cambiando una cosa sola. Gli appunti di questa pagina si aprono in Fluera su un canvas dove puoi fare proprio questo: schizzare la scena a mano accanto alla spiegazione, scrivere con parole tue perché il risultato ha senso, lasciare a margine una domanda per la volta dopo. Quando ripassi, prova a rifare il disegno senza guardare. Quello che riesci a ridisegnare da solo è quello che hai capito.",
+  },
+  chemistry: {
+    it: "Chimica",
+    intro:
+      "La chimica è piena di cose che non si vedono: atomi, legami, sostanze che si separano e si ricompongono. Per questo aiuta così tanto disegnarle. Uno schema fatto a mano, anche impreciso, ti costringe a decidere dove va ogni pezzo e perché. Gli appunti di questa pagina si aprono in Fluera su un canvas libero: puoi ricopiare una reazione con la tua scrittura, colorare quello che cambia fra prima e dopo, aggiungere un esempio che ti viene in mente. Un nome si dimentica in fretta; il disegno che ci hai fatto sopra resta più a lungo. Al ripasso, prova a ridisegnare lo schema senza guardarlo, poi confronta.",
+  },
+  biology: {
+    it: "Biologia",
+    intro:
+      "La biologia chiede di ricordare i nomi delle parti, ma soprattutto di capire come lavorano insieme. Una cellula, un organo, il ciclo di vita di una pianta diventano chiari quando li disegni e colleghi i pezzi con le frecce, non quando rileggi un elenco. Gli appunti di questa pagina si aprono in Fluera su un canvas dove c'è spazio per farlo: puoi rifare uno schema a mano, scrivere accanto a ogni parte a che cosa serve con parole tue, aggiungere collegamenti che nel testo non c'erano. Quando torni a studiare, copri le etichette e prova a rimetterle da solo. Quello che non ricordi ti dice dove tornare.",
+  },
+  medicine: {
+    it: "Medicina",
+    intro:
+      "Studiare medicina vuol dire ricordare molto e, soprattutto, collegare: un sintomo a ciò che lo provoca, una causa a una cura. Rileggere e sottolineare dà la sensazione di sapere, ma il collegamento si costruisce solo quando lo scrivi tu. Gli appunti di questa pagina si aprono in Fluera su un canvas libero, dove puoi fare mappe a mano, disegnare un organo e annotarlo, spiegare un passaggio con le tue parole come se dovessi raccontarlo a un compagno. Sono materiale per studiare, non indicazioni sulla salute di nessuno. Al ripasso, prova a ricostruire il percorso a libro chiuso e guarda dove si interrompe: è lì che vale la pena tornare.",
+  },
+  law: {
+    it: "Diritto",
+    intro:
+      "Nel diritto le parole contano una per una, e proprio per questo imparare a memoria non basta. Serve capire perché una regola esiste, a quali casi si applica e dove si ferma. Scriverlo a mano, con parole tue, è il modo più onesto per scoprire se l'hai capito davvero. Gli appunti di questa pagina si aprono in Fluera su un canvas dove puoi riassumere una regola accanto al testo, disegnare lo schema di chi fa che cosa, annotare un esempio concreto che ti aiuta a ricordarla. Sono materiale di studio, non consulenza. Al ripasso, prova a spiegare la regola a libro chiuso, poi confronta con quello che avevi scritto.",
+  },
+  economics: {
+    it: "Economia",
+    intro:
+      "L'economia parla di scelte: che cosa fanno le persone, le imprese e gli stati quando le risorse non bastano per tutto. Molte idee si capiscono meglio con un disegno: curve che si incontrano, una freccia che mostra chi paga e chi riceve. Gli appunti di questa pagina si aprono in Fluera su un canvas libero, dove puoi ridisegnare un grafico a mano, scrivere accanto che cosa succede se cambia una cosa sola, aggiungere un esempio preso dalla vita di tutti i giorni. Quando ripassi, prova a rifare il ragionamento senza guardare: se sai spiegarlo con parole semplici, l'hai fatto tuo.",
+  },
+  philosophy: {
+    it: "Filosofia",
+    intro:
+      "In filosofia non si studia un elenco di risposte, ma il modo in cui qualcuno ha provato a ragionare su una domanda. Per seguirlo bisogna rallentare: riscrivere un argomento con parole tue, chiederti se sei d'accordo, cercare il punto in cui potrebbe non reggere. Gli appunti di questa pagina si aprono in Fluera su un canvas dove puoi farlo a mano, accanto al testo: mettere in fila i passaggi di un ragionamento, collegare pensatori diversi con una freccia, scrivere a margine un'obiezione tua. Quando ripassi, prova a raccontare l'idea a libro chiuso, come se la spiegassi a qualcuno che non l'ha mai sentita.",
+  },
+  history: {
+    it: "Storia",
+    intro:
+      "La storia si ricorda meglio quando diventa un racconto e non una lista di date. Chi ha deciso che cosa, perché, e che cosa è cambiato dopo: sono queste le domande che tengono insieme i fatti. Gli appunti di questa pagina si aprono in Fluera su un canvas libero, dove puoi tracciare a mano una linea del tempo, collegare una causa alle sue conseguenze con una freccia, disegnare una cartina approssimativa per capire dove succedono le cose. Scrivere il racconto con le tue parole è già un modo di studiarlo. Al ripasso, prova a rimettere in ordine gli eventi senza guardare, poi controlla.",
+  },
+  language: {
+    it: "Lingue",
+    intro:
+      "Una lingua si impara usandola, e scrivere a mano è un modo di usarla. Ricopiare una frase, cambiarla, sbagliare e correggerti lascia una traccia che la sola lettura non lascia. Gli appunti di questa pagina si aprono in Fluera su un canvas libero, dove puoi scrivere parole ed esempi con la tua calligrafia, annotare accanto una frase tua che le usa, disegnare un piccolo schema quando una regola ti confonde. Per le lingue con un altro alfabeto, tracciare i caratteri con la penna aiuta a riconoscerli. Al ripasso, copri la traduzione e prova a ricordare prima di guardare.",
+  },
+  cs: {
+    it: "Informatica",
+    intro:
+      "In informatica capire un'idea viene prima di scrivere il codice. Come si muovono i dati, in che ordine avvengono i passaggi, che cosa succede quando qualcosa va storto: spesso lo vedi davvero solo quando lo disegni. Gli appunti di questa pagina si aprono in Fluera su un canvas libero, dove puoi schizzare a mano uno schema a blocchi, seguire con le frecce il percorso di un'informazione, scrivere accanto a un esempio che cosa fa ogni pezzo, con parole tue. Quando ripassi, prova a rifare lo schema senza guardare e a spiegarlo ad alta voce. Il punto in cui ti fermi è quello da ristudiare.",
+  },
+};
+const ALIAS_MATERIA: Record<string, string> = {
+  mathematics: "math",
+  computer_science: "cs",
+  languages: "language",
+};
+
+/// Copie di seed_web_materia_slug e seed_web_lingua (213), usate SOLO per
+/// scegliere quali righe chiedere dalla pagina /s/. Se divergono dal database
+/// si perde un link, mai se ne inventa uno: il link a un elenco esce solo se
+/// list_web_seeds mette il seme in quella materia.
+export function materiaDi(discipline: string | null): string | null {
+  const k = (discipline ?? "").trim().toLowerCase();
+  if (Object.hasOwn(MATERIE, k)) return k;
+  return Object.hasOwn(ALIAS_MATERIA, k) ? ALIAS_MATERIA[k] : null;
+}
+function linguaDi(locale: string | null): string | null {
+  const m = (locale ?? "").trim().toLowerCase().match(/^([a-z]{2,3})(?:[-_]|$)/);
+  return m ? m[1] : null;
+}
+
+/// La materia di un seme col nome della pagina (italiano): «Matematica», non
+/// «math». Una disciplina fuori elenco resta com'è.
+export function nomeDisciplina(discipline: string | null): string | null {
+  const t = (discipline ?? "").trim();
+  if (!t) return null;
+  const k = materiaDi(t);
+  return k ? MATERIE[k].it : t;
+}
+
+/// Lo slug della materia negli INDIRIZZI, per lingua: su Google in italiano
+/// la parola cercata dentro l'indirizzo conta. Il database resta sulle chiavi
+/// canoniche della 213 (neutre e stabili); qui solo la traduzione verso gli
+/// indirizzi. Una lingua senza voce usa la chiave.
+const SLUG_MATERIA: Record<string, Record<string, string>> = {
+  it: {
+    math: "matematica",
+    physics: "fisica",
+    chemistry: "chimica",
+    biology: "biologia",
+    medicine: "medicina",
+    law: "diritto",
+    economics: "economia",
+    philosophy: "filosofia",
+    history: "storia",
+    language: "lingue",
+    cs: "informatica",
+  },
+};
+
+export function slugMateria(lingua: string, chiave: string): string {
+  const m = Object.hasOwn(SLUG_MATERIA, lingua) ? SLUG_MATERIA[lingua] : null;
+  return m && Object.hasOwn(m, chiave) ? m[chiave] : chiave;
+}
+
+/// Dallo slug di un indirizzo alla chiave della 213. `sposta`: l'indirizzo usa
+/// la chiave dove la lingua ha lo slug localizzato, e va rediretto. Uno slug
+/// sconosciuto passa com'è: il database risponde che l'elenco non c'è.
+export function chiaveMateria(lingua: string, slug: string): { chiave: string; sposta: boolean } {
+  const m = Object.hasOwn(SLUG_MATERIA, lingua) ? SLUG_MATERIA[lingua] : {};
+  const k = Object.keys(m).find((c) => m[c] === slug);
+  return k ? { chiave: k, sposta: false } : { chiave: slug, sposta: slugMateria(lingua, slug) !== slug };
+}
+
+/// L'UNICO punto che compone l'indirizzo di un elenco: pagine, JSON-LD, link
+/// della /s/, redirect e sitemap passano tutti da qui, con la CHIAVE.
+function percorsoElenco(lingua: string, materia?: string | null, corso?: string | null): string {
+  const s = materia ? slugMateria(lingua, materia) : null;
+  return `/${lingua}/appunti/${s ? `${s}/` : ""}${s && corso ? `${corso}/` : ""}`;
+}
+
+export function urlElenco(lingua: string, materia?: string | null, corso?: string | null): string {
+  return `${SHARE}${percorsoElenco(lingua, materia, corso)}`;
+}
+
+type EsitoRpc<T> = { ok: true; rows: T[] } | { ok: false; motivo: string };
+
+/// Una lettura del web con la chiave pubblica. Rete, 5xx, tempo scaduto o
+/// una risposta che non è un elenco sono un GUASTO: il chiamante sceglie fra
+/// 503 (pagina) e «niente link» (best-effort), mai «non esiste».
+async function rpcWeb<T>(nome: string, corpo: Record<string, unknown>, ms = 4000): Promise<EsitoRpc<T>> {
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${nome}`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(corpo),
+      signal: AbortSignal.timeout(ms),
+    });
+    if (!resp.ok) return { ok: false, motivo: `${nome}: HTTP ${resp.status}` };
+    const rows = (await resp.json()) as unknown;
+    if (!Array.isArray(rows)) return { ok: false, motivo: `${nome}: risposta non è un elenco` };
+    return { ok: true, rows: rows as T[] };
+  } catch (e) {
+    return { ok: false, motivo: `${nome}: ${e}` };
+  }
+}
+
+const semiValidi = (rows: SemeWeb[]) =>
+  rows.filter((r) => r && typeof r.hash === "string" && HASH_INTERO_RE.test(r.hash));
+const hubValidi = (rows: HubWeb[]) =>
+  rows.filter((h) =>
+    h && typeof h.materia_slug === "string" && RE_SLUG_MATERIA.test(h.materia_slug) &&
+    (h.corso_slug === null || (typeof h.corso_slug === "string" && RE_SLUG_CORSO.test(h.corso_slug)))
+  );
+const titoloSeme = (t: string | null) => (t ?? "").trim() || "Template di studio";
+
+// ── Link interni di una /s/: «Ti potrebbero interessare», briciole, elenchi ──
+type Vicini = {
+  correlati: SemeWeb[];
+  tutti: { href: string; nome: string } | null;
+  /// Solo verso elenchi che esistono E contengono il seme; vuote sulle noindex.
+  briciole: Array<{ nome: string; url: string }>;
+  /// «Tutto il catalogo →»: l'indice della lingua, se ha elenchi.
+  catalogo: string;
+  /// Il corso del seme come lo scrive list_web_seeds (titolo e JSON-LD).
+  corso: string | null;
+  /// L'elenco della materia, se contiene il seme (la casella «Materia»).
+  hubMateria: string | null;
+};
+const NESSUN_VICINO: Vicini = { correlati: [], tutti: null, briciole: [], catalogo: urlElenco("it"), corso: null, hubMateria: null };
+
+/// Altri semi della stessa materia e lingua (list_web_seeds: indicizzabili per
+/// costruzione, mai il seme stesso), prima quelli dello stesso corso, e, se il
+/// seme sta in un elenco sopra soglia, il link all'elenco: quello del corso se
+/// c'è, se no quello della materia. Fino al 2026-09-24 i link venivano da
+/// browse_study_seeds filtrato con la copia TypeScript della regola.
+/// Best-effort: un guasto toglie i link, mai la pagina; per questo il tetto di
+/// tempo.
+async function fetchVicini(row: SeedRow): Promise<Vicini> {
+  const materia = materiaDi(row.discipline);
+  const appunti = { nome: "Appunti", url: urlElenco("it") };
+  if (!materia) return { ...NESSUN_VICINO, briciole: [appunti] };
+  const lingua = linguaDi(row.locale);
+  const [s, h] = await Promise.all([
+    rpcWeb<SemeWeb>("list_web_seeds", { p_lingua: lingua, p_materia_slug: materia, p_corso_slug: null, p_limit: 100, p_offset: 0 }, 1500),
+    lingua ? rpcWeb<HubWeb>("list_web_hubs", { p_lingua: lingua }, 1500) : Promise.resolve<EsitoRpc<HubWeb>>({ ok: true, rows: [] }),
+  ]);
+  if (!s.ok) console.error(`link interni di ${row.hash}: ${s.motivo}`);
+  if (!h.ok) console.error(`link interni di ${row.hash}: ${h.motivo}`);
+  const semi = s.ok ? semiValidi(s.rows) : [];
+  const hubs = h.ok ? hubValidi(h.rows) : [];
+  const io = semi.find((r) => r.hash === row.hash);
+  const hubCorso = io?.corso_slug
+    ? hubs.find((x) => x.materia_slug === io.materia_slug && x.corso_slug === io.corso_slug)
+    : undefined;
+  const hubM = io ? hubs.find((x) => x.materia_slug === io.materia_slug && x.corso_slug === null) : undefined;
+  const hub = hubCorso ?? hubM;
+  // L'indice italiano esiste sempre; quello di un'altra lingua col suo primo elenco.
+  const indice = lingua && (lingua === "it" || hubs.length > 0) ? urlElenco(lingua) : urlElenco("it");
+  const altri = semi.filter((r) => r.hash !== row.hash);
+  const stessoCorso = (r: SemeWeb) => !!io?.corso_slug && r.corso_slug === io.corso_slug;
+  const nomeM = (hubM?.materia ?? "").trim() || MATERIE[materia].it;
+  const nomeC = (hubCorso?.corso ?? "").trim() || (io?.course ?? "").trim();
+  return {
+    correlati: [...altri.filter(stessoCorso), ...altri.filter((r) => !stessoCorso(r))].slice(0, CORRELATI_MAX),
+    tutti: hub && lingua
+      ? {
+        href: urlElenco(lingua, hub.materia_slug, hub.corso_slug),
+        nome: (hubCorso ? hub.corso : hub.materia) ?? MATERIE[materia].it,
+      }
+      : null,
+    briciole: [
+      { nome: "Appunti", url: indice },
+      ...(hubM && lingua ? [{ nome: nomeM, url: urlElenco(lingua, hubM.materia_slug) }] : []),
+      ...(hubCorso && lingua && nomeC ? [{ nome: nomeC, url: urlElenco(lingua, hubCorso.materia_slug, hubCorso.corso_slug) }] : []),
+    ],
+    catalogo: indice,
+    corso: (io?.course ?? "").trim() || null,
+    hubMateria: hubM && lingua ? urlElenco(lingua, hubM.materia_slug) : null,
+  };
+}
+
+/// I campi della scheda di UN pack indicizzabile (get_web_scheda, 218).
+/// Best-effort come i link: 0 righe o un guasto tolgono voto, efficacia,
+/// categoria ed etichette, mai la pagina.
+async function fetchScheda(hash: string): Promise<SchedaWeb | null> {
+  const e = await rpcWeb<SchedaWeb>("get_web_scheda", { p_hash: hash }, 1500);
+  if (!e.ok) {
+    console.error(`scheda di ${hash}: ${e.motivo}`);
     return null;
   }
+  const r = e.rows[0];
+  return r && r.hash === hash ? r : null;
+}
+
+// ── Le rotte /{lingua}/appunti/… ────────────────────────────────────────────
+function nonTrovata(): Response {
+  const r = html(404, paginaStato("Elenco non trovato", "Questo elenco non c'è, o non c'è ancora.", {
+    icona: "eco",
+    azione: { testo: "Tutti i template", href: urlElenco("it") },
+  }));
+  r.headers.set("X-Robots-Tag", "noindex");
+  return r;
+}
+
+/// L'ordine della griglia, come il menu «Ordina» dell'app meno «Più popolari»
+/// (coincide con «Consigliati») e «A–Z» (esclusa anche lì). «Consigliati» è
+/// la pagina base, senza parametro.
+type Ordine = "consigliati" | "efficaci" | "votati" | "recenti";
+const ORDINI: ReadonlyArray<[Ordine, string, string | null]> = [
+  ["consigliati", "Consigliati", null],
+  ["efficaci", "Più efficaci", "Ordinato per guadagni di memoria misurati"],
+  ["votati", "Più votati", null],
+  ["recenti", "Più recenti", null],
+];
+const ordineDi = (s: string | null): Ordine => ORDINI.find(([o]) => o === s)?.[0] ?? "consigliati";
+
+/// Due query con gli stessi parametri NELLO STESSO ORDINE, decodificati: «%20»
+/// e «+» sono la stessa cosa, «?pagina=2&ordine=x» e «?ordine=x&pagina=2» no.
+function queryDiversa(a: URLSearchParams, b: URLSearchParams): boolean {
+  return JSON.stringify([...a]) !== JSON.stringify([...b]);
+}
+
+function sposta301(location: string): Response {
+  return new Response(null, {
+    status: 301,
+    headers: { Location: location, "Cache-Control": "public, max-age=300" },
+  });
+}
+
+async function rottaAppunti(m: RegExpMatchArray, reqUrl: URL): Promise<Response> {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    return html(500, paginaStato("Errore", "Server non configurato."));
+  }
+  const base = m[1] ?? "";
+  const lingua = m[2];
+  const coda = (m[3] ?? "").match(/^(?:\/([a-z]{2,20})(?:\/([a-z0-9-]{1,60}))?)?(\/?)$/);
+  if (!coda) return nonTrovata();
+  const [, slug, corso, barra] = coda;
+  // UN indirizzo per pagina: il server ricompone la query nel suo ordine
+  // (elenchi: ordine, pagina, ref; ricerca: q, materia, ref) e toglie il
+  // resto (utm_*, fbclid, ordine=consigliati, pagina=1). Il ref resta: è
+  // l'attribuzione di chi ha condiviso il link.
+  const par = reqUrl.searchParams;
+  const ref = sanitizeRef(par.get("ref"));
+  const giusti = new URLSearchParams();
+  if (slug === "cerca") {
+    if (corso) return nonTrovata();
+    const q = par.get("q");
+    const mRaw = par.get("materia");
+    const materia = mRaw !== null && RE_SLUG_MATERIA.test(mRaw) ? chiaveMateria(lingua, mRaw).chiave : null;
+    if (q !== null) giusti.set("q", q);
+    if (materia) giusti.set("materia", slugMateria(lingua, materia));
+    if (ref) giusti.set("ref", ref);
+    if (queryDiversa(par, giusti)) {
+      return sposta301(`${base}${percorsoElenco(lingua)}cerca${giusti.size ? `?${giusti}` : ""}`);
+    }
+    return await paginaCerca(lingua, q, materia);
+  }
+  if (corso && !RE_SLUG_CORSO.test(corso)) return nonTrovata();
+  const pRaw = par.get("pagina");
+  if (pRaw !== null && !/^[1-9][0-9]{0,3}$/.test(pRaw)) return nonTrovata();
+  const pagina = pRaw === null ? 1 : Number(pRaw);
+  const ordine = ordineDi(par.get("ordine"));
+  const { chiave: materia, sposta } = slug ? chiaveMateria(lingua, slug) : { chiave: null, sposta: false };
+  if (ordine !== "consigliati") giusti.set("ordine", ordine);
+  if (pagina > 1) giusti.set("pagina", String(pagina));
+  if (ref) giusti.set("ref", ref);
+  // Con la barra finale e con lo slug della lingua (/it/appunti/math/ →
+  // /it/appunti/matematica/). Location relativa come il 301 di /s/.
+  if (!barra || sposta || queryDiversa(par, giusti)) {
+    return sposta301(`${base}${percorsoElenco(lingua, materia, corso)}${giusti.size ? `?${giusti}` : ""}`);
+  }
+  if (!materia) return await paginaIndice(lingua, pagina, ordine);
+  return await paginaElenco(lingua, materia, corso ?? null, pagina, ordine);
+}
+
+/// Il nome di una materia nella lingua dell'elenco (list_web_hubs), con
+/// l'italiano come ripiego.
+function nomeMateria(hubs: HubWeb[], slug: string): string {
+  const h = hubs.find((x) => x.materia_slug === slug && x.corso_slug === null) ??
+    hubs.find((x) => x.materia_slug === slug);
+  return (h?.materia ?? "").trim() || MATERIE[slug]?.it || slug;
+}
+
+/// ` lang="…"` sui nomi che il database dà nella lingua dell'elenco.
+const langElenco = (lingua: string) => (lingua === "it" ? "" : ` lang="${esc(lingua)}"`);
+
+// ── Il catalogo come l'app (catalogo 218, 2026-09-24) ───────────────────────
+// Le schede, le strisce e i filtri copiano marketplace_widgets.dart (MW) e
+// marketplace_screen.dart (MS): stessi elementi, stesso ordine, stesse
+// misure. Via le azioni di scrittura (Installa, Segnala, voto) e i numeri che
+// il web non mostra (installazioni, autori). Nessuna soglia si ricalcola qui:
+// voto, efficacia e vetrine arrivano già filtrati dalla 218, e un NULL vuol
+// dire «non si mostra».
+
+/// Le glifi Material Rounded dell'app (MaterialIcons-Regular.otf, estratte
+/// con fontTools), in una griglia 24×24. Ogni pagina inlinea solo le sue.
+const ICONE: Record<string, string> = {
+  arrow:
+    "M5.02 12.98H16.17L11.3 17.86C10.92 18.28 10.92 18.89 11.3 19.31C11.67 19.69 12.33 19.69 12.7 19.31L19.31 12.7C19.69 12.33 19.69 11.67 19.31 11.3L12.7 4.69C12.33 4.31 11.67 4.31 11.3 4.69C10.92 5.11 10.92 5.72 11.3 6.09L16.17 11.02H5.02C4.45 11.02 3.98 11.44 3.98 12C3.98 12.56 4.45 12.98 5.02 12.98Z",
+  auto_awesome:
+    "M19.45 8.02 20.25 6.23 21.98 5.44C22.41 5.3 22.41 4.73 21.98 4.55L20.25 3.75L19.45 2.02C19.27 1.59 18.75 1.59 18.56 2.02L17.77 3.75L15.98 4.55C15.61 4.73 15.61 5.25 15.98 5.44L17.77 6.23L18.56 8.02C18.7 8.39 19.27 8.39 19.45 8.02ZM11.48 9.52 9.89 6C9.56 5.2 8.44 5.2 8.11 6L6.52 9.52L3 11.11C2.2 11.44 2.2 12.56 3 12.89L6.52 14.48L8.11 18C8.44 18.8 9.56 18.8 9.89 18L11.48 14.48L15 12.89C15.8 12.56 15.8 11.44 15 11.11L11.48 9.52ZM18.56 15.98 17.77 17.77 15.98 18.56C15.61 18.7 15.61 19.27 15.98 19.45L17.77 20.25L18.56 21.98C18.7 22.41 19.27 22.41 19.45 21.98L20.25 20.25L21.98 19.45C22.41 19.27 22.41 18.75 21.98 18.56L20.25 17.77L19.45 15.98C19.27 15.61 18.7 15.61 18.56 15.98Z",
+  auto_stories:
+    "M18.14 1.36 14.16 5.34C14.06 5.44 14.02 5.58 14.02 5.72V13.88C14.02 14.3 14.53 14.53 14.81 14.25L18.84 10.64C18.94 10.55 18.98 10.41 18.98 10.27V1.69C18.98 1.27 18.47 1.03 18.14 1.36ZM22.45 5.2C21.98 4.97 21.52 4.78 21 4.59V16.64C19.88 16.22 18.7 15.98 17.48 15.98C15.61 15.98 13.73 16.55 12 17.58V5.48C10.36 4.55 8.53 3.98 6.52 3.98C4.69 3.98 3 4.45 1.55 5.2C1.22 5.34 0.98 5.72 0.98 6.09V18.14C0.98 18.94 1.83 19.41 2.48 19.03C3.7 18.42 5.06 18 6.52 18C8.58 18 10.5 18.8 12 20.02C13.5 18.8 15.42 18 17.48 18C18.94 18 20.3 18.42 21.52 19.03C22.17 19.41 23.02 18.94 23.02 18.19V6.09C23.02 5.72 22.78 5.34 22.45 5.2Z",
+  chevron:
+    "M9.28 6.7C8.91 7.08 8.91 7.73 9.28 8.11L13.17 12L9.28 15.89C8.91 16.27 8.91 16.92 9.28 17.3C9.7 17.67 10.31 17.67 10.69 17.3L15.28 12.7C15.7 12.33 15.7 11.67 15.28 11.3L10.69 6.7C10.31 6.33 9.7 6.33 9.28 6.7Z",
+  chevron_l:
+    "M14.72 6.7C14.3 6.33 13.69 6.33 13.31 6.7L8.72 11.3C8.3 11.67 8.3 12.33 8.72 12.7L13.31 17.3C13.69 17.67 14.3 17.67 14.72 17.3C15.09 16.92 15.09 16.27 14.72 15.89L10.83 12L14.72 8.11C15.09 7.73 15.09 7.08 14.72 6.7Z",
+  cloud_off:
+    "M24 15C24 12.38 21.94 10.22 19.36 10.03C18.66 6.61 15.66 3.98 12 3.98C10.69 3.98 9.42 4.36 8.34 4.97L9.84 6.47C10.5 6.19 11.25 6 12 6C15.05 6 17.48 8.44 17.48 11.48V12H18.98C20.67 12 21.98 13.36 21.98 15C21.98 15.98 21.52 16.83 20.81 17.39L22.22 18.8C23.3 17.91 24 16.55 24 15ZM3.7 4.55C3.33 4.97 3.33 5.58 3.7 5.95L5.77 8.02H5.34C2.06 8.39 -0.42 11.39 0.05 14.81C0.47 17.86 3.19 20.02 6.23 20.02H17.72L19.03 21.28C19.41 21.7 20.06 21.7 20.44 21.28C20.81 20.91 20.81 20.25 20.44 19.88L5.11 4.55C4.73 4.17 4.08 4.17 3.7 4.55ZM6 18C3.8 18 2.02 16.22 2.02 14.02C2.02 11.81 3.8 9.98 6 9.98H7.73L15.75 18H6Z",
+  code:
+    "M8.72 15.89 4.78 12 8.72 8.11C9.09 7.69 9.09 7.08 8.72 6.7C8.3 6.33 7.69 6.33 7.31 6.7L2.72 11.3C2.3 11.67 2.3 12.33 2.72 12.7L7.31 17.3C7.69 17.67 8.3 17.67 8.72 17.3C9.09 16.92 9.09 16.31 8.72 15.89ZM15.28 15.89 19.22 12 15.28 8.11C14.91 7.69 14.91 7.08 15.28 6.7C15.7 6.33 16.31 6.33 16.69 6.7L21.28 11.3C21.7 11.67 21.7 12.33 21.28 12.7L16.69 17.3C16.31 17.67 15.7 17.67 15.28 17.3C14.91 16.92 14.91 16.31 15.28 15.89Z",
+  draw:
+    "M18.84 10.41 19.92 9.33C20.67 8.53 20.67 7.27 19.92 6.52L18.52 5.11C17.72 4.31 16.45 4.31 15.66 5.11L14.62 6.14L18.84 10.41ZM13.17 7.55 4.12 16.59C4.03 16.69 3.98 16.83 3.98 16.97V20.48C3.98 20.77 4.22 21 4.5 21H8.06C8.16 21 8.3 20.95 8.39 20.86L17.44 11.81L13.17 7.55ZM18.98 17.48C18.98 19.69 16.45 21 14.02 21C13.45 21 12.98 20.53 12.98 20.02C12.98 19.45 13.45 18.98 14.02 18.98C15.56 18.98 17.02 18.28 17.02 17.48C17.02 17.02 16.5 16.64 15.75 16.31L17.25 14.81C18.33 15.47 18.98 16.31 18.98 17.48ZM4.59 13.36C3.61 12.8 3 12.05 3 11.02C3 9.19 4.88 8.39 6.56 7.64C7.59 7.17 9 6.56 9 6C9 5.58 8.2 5.02 6.98 5.02C5.72 5.02 5.2 5.62 5.16 5.62C4.83 6.05 4.17 6.09 3.75 5.77C3.38 5.44 3.28 4.83 3.61 4.36C3.75 4.22 4.78 3 6.98 3C9.23 3 11.02 4.31 11.02 6C11.02 7.88 9.05 8.72 7.36 9.47C6.42 9.89 5.02 10.5 5.02 11.02C5.02 11.3 5.44 11.58 6.05 11.86L4.59 13.36Z",
+  drop:
+    "M8.72 11.72 11.3 14.3C11.67 14.67 12.33 14.67 12.7 14.3L15.28 11.72C15.94 11.06 15.47 9.98 14.58 9.98H9.42C8.53 9.98 8.06 11.06 8.72 11.72Z",
+  eco:
+    "M6.05 8.06C3.33 10.78 3.33 15.19 6.05 17.95C7.5 14.53 10.12 11.67 13.41 9.98C10.64 12.33 8.67 15.61 8.02 19.31C10.59 20.53 13.78 20.11 15.94 17.95C18.94 14.95 19.78 6.8 19.97 4.55C19.97 4.27 19.73 4.03 19.45 4.03C17.2 4.22 9.05 5.06 6.05 8.06Z",
+  event:
+    "M15.98 12.98H12.98C12.47 12.98 12 13.45 12 14.02V17.02C12 17.53 12.47 18 12.98 18H15.98C16.55 18 17.02 17.53 17.02 17.02V14.02C17.02 13.45 16.55 12.98 15.98 12.98ZM15.98 3V3.98H8.02V3C8.02 2.44 7.55 2.02 6.98 2.02C6.47 2.02 6 2.44 6 3V3.98H5.02C3.89 3.98 3 4.92 3 6V20.02C3 21.09 3.89 21.98 5.02 21.98H18.98C20.11 21.98 21 21.09 21 20.02V6C21 4.92 20.11 3.98 18.98 3.98H18V3C18 2.44 17.53 2.02 17.02 2.02C16.45 2.02 15.98 2.44 15.98 3ZM18 20.02H6C5.44 20.02 5.02 19.55 5.02 18.98V9H18.98V18.98C18.98 19.55 18.56 20.02 18 20.02Z",
+  flag:
+    "M14.02 6 13.27 4.55C13.12 4.22 12.75 3.98 12.38 3.98H6C5.44 3.98 5.02 4.45 5.02 5.02V20.02C5.02 20.53 5.44 21 6 21C6.56 21 6.98 20.53 6.98 20.02V14.02H12L12.7 15.47C12.89 15.8 13.22 15.98 13.59 15.98H18.98C19.55 15.98 20.02 15.56 20.02 15V6.98C20.02 6.47 19.55 6 18.98 6H14.02ZM18 14.02H14.02L12.98 12H6.98V6H12L12.98 8.02H18V14.02Z",
+  gavel:
+    "M2.02 21H12C12.56 21 12.98 21.47 12.98 21.98C12.98 22.55 12.56 23.02 12 23.02H2.02C1.45 23.02 0.98 22.55 0.98 21.98C0.98 21.47 1.45 21 2.02 21ZM5.25 8.06 8.06 5.25 20.81 17.95C21.56 18.75 21.56 20.02 20.81 20.81C20.02 21.56 18.75 21.56 17.95 20.81L5.25 8.06ZM13.73 2.39 16.55 5.25C17.34 6 17.34 7.31 16.55 8.06L15.14 9.47L9.47 3.84L10.92 2.44C11.67 1.64 12.94 1.64 13.73 2.39ZM3.84 9.47 9.47 15.14 8.06 16.55C7.31 17.34 6.05 17.34 5.25 16.55L2.44 13.73C1.64 12.94 1.64 11.67 2.44 10.88L3.84 9.47Z",
+  grid:
+    "M5.02 11.02H9C10.08 11.02 11.02 10.08 11.02 9V5.02C11.02 3.89 10.08 3 9 3H5.02C3.89 3 3 3.89 3 5.02V9C3 10.08 3.89 11.02 5.02 11.02ZM5.02 21H9C10.08 21 11.02 20.11 11.02 18.98V15C11.02 13.92 10.08 12.98 9 12.98H5.02C3.89 12.98 3 13.92 3 15V18.98C3 20.11 3.89 21 5.02 21ZM12.98 5.02V9C12.98 10.08 13.92 11.02 15 11.02H18.98C20.11 11.02 21 10.08 21 9V5.02C21 3.89 20.11 3 18.98 3H15C13.92 3 12.98 3.89 12.98 5.02ZM15 21H18.98C20.11 21 21 20.11 21 18.98V15C21 13.92 20.11 12.98 18.98 12.98H15C13.92 12.98 12.98 13.92 12.98 15V18.98C12.98 20.11 13.92 21 15 21Z",
+  healing:
+    "M17.72 12 21.7 8.06C22.08 7.64 22.08 7.03 21.7 6.61L17.39 2.3C16.97 1.92 16.36 1.92 15.94 2.3L12 6.28L8.02 2.3C7.78 2.11 7.55 2.02 7.31 2.02C7.03 2.02 6.8 2.11 6.61 2.3L2.25 6.61C1.88 7.03 1.88 7.64 2.25 8.06L6.23 12L2.25 15.98C1.88 16.41 1.88 17.02 2.25 17.39L6.61 21.75C6.98 22.12 7.59 22.12 8.02 21.75L12 17.77L15.94 21.75C16.17 21.94 16.41 22.03 16.69 22.03C16.92 22.03 17.2 21.94 17.39 21.75L21.7 17.39C22.12 17.02 22.12 16.41 21.7 15.98L17.72 12ZM12 9C12.56 9 12.98 9.47 12.98 9.98C12.98 10.55 12.56 11.02 12 11.02C11.44 11.02 11.02 10.55 11.02 9.98C11.02 9.47 11.44 9 12 9ZM7.31 10.97 3.66 7.36 7.31 3.7 10.92 7.31 7.31 10.97ZM9.98 12.98C9.47 12.98 9 12.56 9 12C9 11.44 9.47 11.02 9.98 11.02C10.55 11.02 11.02 11.44 11.02 12C11.02 12.56 10.55 12.98 9.98 12.98ZM12 15C11.44 15 11.02 14.53 11.02 14.02C11.02 13.45 11.44 12.98 12 12.98C12.56 12.98 12.98 13.45 12.98 14.02C12.98 14.53 12.56 15 12 15ZM14.02 11.02C14.53 11.02 15 11.44 15 12C15 12.56 14.53 12.98 14.02 12.98C13.45 12.98 12.98 12.56 12.98 12C12.98 11.44 13.45 11.02 14.02 11.02ZM16.64 20.34 13.03 16.73 16.64 13.08 20.3 16.69 16.64 20.34Z",
+  hub:
+    "M8.39 18.19C8.77 18.7 9 19.31 9 20.02C9 21.66 7.64 23.02 6 23.02C4.36 23.02 3 21.66 3 20.02C3 18.33 4.36 17.02 6 17.02C6.42 17.02 6.84 17.11 7.22 17.25L8.62 15.47C7.73 14.44 7.36 13.08 7.55 11.81L5.53 11.11C4.97 11.95 4.08 12.52 3 12.52C1.36 12.52 0 11.16 0 9.52C0 7.83 1.36 6.52 3 6.52C4.64 6.52 6 7.83 6 9.52C6 9.56 6 9.66 6 9.7L8.02 10.41C8.67 9.19 9.84 8.3 11.25 8.06V5.91C9.94 5.58 9 4.41 9 3C9 1.36 10.36 0 12 0C13.64 0 15 1.36 15 3C15 4.41 14.06 5.58 12.75 5.91V8.06C14.16 8.3 15.33 9.19 15.98 10.41L18 9.7C18 9.66 18 9.56 18 9.52C18 7.83 19.36 6.52 21 6.52C22.64 6.52 24 7.83 24 9.52C24 11.16 22.64 12.52 21 12.52C19.92 12.52 19.03 11.95 18.47 11.11L16.45 11.81C16.64 13.08 16.31 14.44 15.38 15.52L16.78 17.25C17.16 17.11 17.58 17.02 18 17.02C19.64 17.02 21 18.33 21 20.02C21 21.66 19.64 23.02 18 23.02C16.36 23.02 15 21.66 15 20.02C15 19.31 15.23 18.7 15.61 18.19L14.2 16.45C12.84 17.2 11.2 17.2 9.8 16.45L8.39 18.19Z",
+  menu_book:
+    "M17.48 4.5C15.56 4.5 13.45 4.92 12 6C10.55 4.92 8.44 4.5 6.52 4.5C5.06 4.5 3.52 4.73 2.2 5.3C1.5 5.62 0.98 6.33 0.98 7.12V18.42C0.98 19.73 2.2 20.67 3.47 20.34C4.45 20.11 5.48 20.02 6.52 20.02C8.06 20.02 9.7 20.25 11.06 20.91C11.67 21.23 12.33 21.23 12.94 20.91C14.25 20.25 15.94 20.02 17.48 20.02C18.47 20.02 19.55 20.11 20.53 20.34C21.75 20.67 22.97 19.73 22.97 18.42V7.12C22.97 6.33 22.5 5.62 21.75 5.3C20.48 4.73 18.94 4.5 17.48 4.5ZM21 17.25C21 17.86 20.44 18.33 19.78 18.19C19.03 18.05 18.28 18 17.48 18C15.8 18 13.36 18.66 12 19.5V8.02C13.36 7.17 15.8 6.52 17.48 6.52C18.42 6.52 19.31 6.61 20.2 6.8C20.67 6.89 21 7.31 21 7.78V17.25ZM13.97 11.02C13.64 11.02 13.36 10.83 13.27 10.5C13.12 10.08 13.36 9.66 13.73 9.56C15.28 9.05 17.3 8.91 19.12 9.09C19.5 9.14 19.83 9.52 19.78 9.94C19.73 10.36 19.36 10.64 18.94 10.59C17.3 10.41 15.56 10.55 14.2 10.97C14.11 10.97 14.06 11.02 13.97 11.02ZM13.97 13.69C13.64 13.69 13.36 13.45 13.27 13.17C13.12 12.75 13.36 12.33 13.73 12.19C15.28 11.72 17.3 11.53 19.12 11.77C19.5 11.81 19.83 12.19 19.78 12.61C19.73 12.98 19.36 13.31 18.94 13.27C17.3 13.08 15.56 13.22 14.2 13.64C14.11 13.64 14.06 13.69 13.97 13.69ZM13.97 16.31C13.64 16.31 13.36 16.12 13.27 15.8C13.12 15.42 13.36 15 13.73 14.86C15.28 14.39 17.3 14.2 19.12 14.44C19.5 14.48 19.83 14.86 19.78 15.23C19.73 15.66 19.36 15.94 18.94 15.89C17.3 15.7 15.56 15.89 14.2 16.31C14.11 16.31 14.06 16.31 13.97 16.31Z",
+  movie:
+    "M18 3.98 19.83 7.64C19.92 7.78 19.78 8.02 19.59 8.02H17.62C17.25 8.02 16.88 7.78 16.73 7.45L15 3.98H12.98L14.81 7.64C14.91 7.78 14.77 8.02 14.58 8.02H12.61C12.23 8.02 11.91 7.78 11.72 7.45L9.98 3.98H8.02L9.8 7.64C9.89 7.78 9.8 8.02 9.61 8.02H7.64C7.22 8.02 6.89 7.78 6.7 7.45L5.02 3.98H3.98C2.91 3.98 2.02 4.92 2.02 6V18C2.02 19.08 2.91 20.02 3.98 20.02H20.02C21.09 20.02 21.98 19.08 21.98 18V5.02C21.98 4.45 21.56 3.98 21 3.98H18Z",
+  music:
+    "M12 5.02V13.55C11.06 13.03 9.89 12.8 8.67 13.22C7.31 13.69 6.28 14.91 6.05 16.31C5.58 19.03 7.92 21.38 10.64 20.95C12.61 20.62 14.02 18.84 14.02 16.83V6.98H15.98C17.11 6.98 18 6.09 18 5.02C18 3.89 17.11 3 15.98 3H14.02C12.89 3 12 3.89 12 5.02Z",
+  palette:
+    "M12 2.02C6.47 2.02 2.02 6.47 2.02 12C2.02 17.53 6.47 21.98 12 21.98C13.36 21.98 14.48 20.86 14.48 19.5C14.48 18.89 14.25 18.28 13.88 17.81C13.78 17.72 13.73 17.62 13.73 17.48C13.73 17.2 13.97 17.02 14.25 17.02H15.98C19.31 17.02 21.98 14.3 21.98 11.02C21.98 6.05 17.53 2.02 12 2.02ZM17.48 12.98C16.69 12.98 15.98 12.33 15.98 11.48C15.98 10.69 16.69 9.98 17.48 9.98C18.33 9.98 18.98 10.69 18.98 11.48C18.98 12.33 18.33 12.98 17.48 12.98ZM14.48 9C13.69 9 12.98 8.34 12.98 7.5C12.98 6.66 13.69 6 14.48 6C15.33 6 15.98 6.66 15.98 7.5C15.98 8.34 15.33 9 14.48 9ZM5.02 11.48C5.02 10.69 5.67 9.98 6.52 9.98C7.31 9.98 8.02 10.69 8.02 11.48C8.02 12.33 7.31 12.98 6.52 12.98C5.67 12.98 5.02 12.33 5.02 11.48ZM11.02 7.5C11.02 8.34 10.31 9 9.52 9C8.67 9 8.02 8.34 8.02 7.5C8.02 6.66 8.67 6 9.52 6C10.31 6 11.02 6.66 11.02 7.5Z",
+  person:
+    "M12 5.91C13.17 5.91 14.11 6.84 14.11 8.02C14.11 9.14 13.17 10.08 12 10.08C10.83 10.08 9.89 9.14 9.89 8.02C9.89 6.84 10.83 5.91 12 5.91ZM12 14.91C14.95 14.91 18.09 16.36 18.09 17.02V18.09H5.91V17.02C5.91 16.36 9.05 14.91 12 14.91ZM12 3.98C9.8 3.98 8.02 5.81 8.02 8.02C8.02 10.22 9.8 12 12 12C14.2 12 15.98 10.22 15.98 8.02C15.98 5.81 14.2 3.98 12 3.98ZM12 12.98C9.33 12.98 3.98 14.34 3.98 17.02V18.98C3.98 19.55 4.45 20.02 5.02 20.02H18.98C19.55 20.02 20.02 19.55 20.02 18.98V17.02C20.02 14.34 14.67 12.98 12 12.98Z",
+  premium:
+    "M10.92 12.75 12 11.95 13.08 12.75C13.45 13.03 13.97 12.66 13.83 12.19L13.45 10.83L14.62 9.89C15 9.61 14.81 9 14.3 9H12.89L12.47 7.64C12.33 7.22 11.67 7.22 11.53 7.64L11.11 9H9.7C9.19 9 9 9.61 9.38 9.89L10.55 10.83L10.12 12.19C9.98 12.66 10.55 13.03 10.92 12.75ZM6 21.61C6 22.31 6.66 22.78 7.31 22.55L12 21L16.69 22.55C17.34 22.78 18 22.31 18 21.61V15.28C19.22 13.88 20.02 12.05 20.02 9.98C20.02 5.58 16.41 2.02 12 2.02C7.59 2.02 3.98 5.58 3.98 9.98C3.98 12.05 4.78 13.88 6 15.28V21.61ZM12 3.98C15.33 3.98 18 6.7 18 9.98C18 13.31 15.33 15.98 12 15.98C8.67 15.98 6 13.31 6 9.98C6 6.7 8.67 3.98 12 3.98Z",
+  psychology:
+    "M12.98 8.58C12.19 8.58 11.58 9.19 11.58 9.98C11.58 10.78 12.19 11.44 12.98 11.44C13.78 11.44 14.44 10.78 14.44 9.98C14.44 9.19 13.78 8.58 12.98 8.58ZM13.22 3C9.38 2.91 6.19 5.86 6 9.66L4.08 12.19C3.84 12.52 4.08 12.98 4.5 12.98H6V15.98C6 17.11 6.89 18 8.02 18H9V20.02C9 20.53 9.47 21 9.98 21H15C15.56 21 15.98 20.53 15.98 20.02V16.31C18.42 15.14 20.11 12.66 20.02 9.75C19.88 6.14 16.83 3.09 13.22 3ZM15.98 9.98C15.98 10.12 15.98 10.27 15.98 10.41L16.83 11.06C16.88 11.11 16.92 11.2 16.88 11.3L16.08 12.7C16.03 12.8 15.89 12.8 15.8 12.8L14.81 12.38C14.62 12.56 14.39 12.66 14.16 12.75L14.02 13.83C13.97 13.92 13.92 14.02 13.78 14.02H12.19C12.09 14.02 12 13.92 12 13.83L11.86 12.75C11.58 12.66 11.39 12.56 11.16 12.38L10.17 12.8C10.08 12.8 9.98 12.8 9.94 12.7L9.14 11.3C9.09 11.2 9.09 11.11 9.19 11.06L10.03 10.41C10.03 10.27 9.98 10.12 9.98 9.98C9.98 9.89 10.03 9.75 10.03 9.61L9.19 8.95C9.09 8.91 9.09 8.81 9.14 8.67L9.94 7.31C9.98 7.22 10.08 7.17 10.17 7.22L11.2 7.64C11.39 7.45 11.62 7.31 11.86 7.22L12 6.19C12 6.05 12.09 6 12.19 6H13.78C13.92 6 13.97 6.05 14.02 6.19L14.16 7.22C14.39 7.31 14.62 7.45 14.81 7.64L15.8 7.22C15.89 7.17 16.03 7.22 16.08 7.31L16.88 8.67C16.92 8.77 16.88 8.91 16.83 8.95L15.94 9.61C15.98 9.75 15.98 9.84 15.98 9.98Z",
+  psychology_o:
+    "M15.8 7.22 14.81 7.64C14.62 7.45 14.39 7.31 14.16 7.22L14.02 6.19C13.97 6.05 13.92 6 13.78 6H12.19C12.09 6 12 6.05 12 6.19L11.86 7.22C11.62 7.31 11.39 7.45 11.2 7.64L10.17 7.22C10.08 7.17 9.98 7.22 9.94 7.31L9.14 8.67C9.09 8.77 9.14 8.91 9.19 8.95L10.03 9.61C10.03 9.75 9.98 9.89 9.98 9.98C9.98 10.12 10.03 10.27 10.03 10.41L9.19 11.06C9.09 11.11 9.09 11.2 9.14 11.3L9.94 12.7C9.98 12.8 10.08 12.8 10.17 12.8L11.2 12.38C11.39 12.56 11.62 12.66 11.86 12.75L12 13.83C12 13.92 12.09 14.02 12.19 14.02H13.78C13.92 14.02 13.97 13.92 14.02 13.83L14.16 12.75C14.39 12.66 14.62 12.56 14.81 12.38L15.8 12.8C15.89 12.8 16.03 12.8 16.03 12.7L16.83 11.3C16.92 11.2 16.88 11.11 16.78 11.06L15.98 10.41C15.98 10.27 15.98 10.12 15.98 9.98C15.98 9.84 15.98 9.75 15.98 9.61L16.83 8.95C16.92 8.91 16.92 8.77 16.88 8.67L16.08 7.31C16.03 7.22 15.89 7.17 15.8 7.22ZM12.98 11.44C12.19 11.44 11.58 10.78 11.58 9.98C11.58 9.19 12.19 8.58 12.98 8.58C13.78 8.58 14.44 9.19 14.44 9.98C14.44 10.78 13.78 11.44 12.98 11.44ZM19.92 9.05C19.5 5.81 16.69 3.19 13.41 3C13.27 3 13.12 3 12.98 3C9.47 3 6.56 5.62 6.09 9L4.17 12.47C3.75 13.12 4.22 14.02 5.02 14.02H6V15.98C6 17.11 6.89 18 8.02 18H9V21H15.98V16.31C18.61 15.05 20.34 12.23 19.92 9.05ZM14.91 14.62 14.02 15.05V18.98H11.02V15.98H8.02V12H6.7L8.02 9.66C8.2 7.08 10.36 5.02 12.98 5.02C15.75 5.02 18 7.22 18 9.98C18 12.09 16.69 13.88 14.91 14.62Z",
+  schedule:
+    "M12 2.02C6.47 2.02 2.02 6.47 2.02 12C2.02 17.53 6.47 21.98 12 21.98C17.53 21.98 21.98 17.53 21.98 12C21.98 6.47 17.53 2.02 12 2.02ZM12 20.02C7.59 20.02 3.98 16.41 3.98 12C3.98 7.59 7.59 3.98 12 3.98C16.41 3.98 20.02 7.59 20.02 12C20.02 16.41 16.41 20.02 12 20.02ZM11.77 6.98H11.72C11.3 6.98 11.02 7.31 11.02 7.73V12.42C11.02 12.8 11.2 13.12 11.48 13.31L15.66 15.8C15.98 15.98 16.41 15.89 16.64 15.56C16.83 15.19 16.73 14.77 16.36 14.58L12.52 12.28V7.73C12.52 7.31 12.19 6.98 11.77 6.98Z",
+  school:
+    "M5.02 13.17V15.98C5.02 16.73 5.39 17.39 6.05 17.77L11.06 20.48C11.62 20.81 12.38 20.81 12.94 20.48L17.95 17.77C18.61 17.39 18.98 16.73 18.98 15.98V13.17L12.94 16.5C12.38 16.83 11.62 16.83 11.06 16.5L5.02 13.17ZM11.06 3.52 2.62 8.11C1.92 8.48 1.92 9.52 2.62 9.89L11.06 14.48C11.62 14.81 12.38 14.81 12.94 14.48L21 10.08V15.98C21 16.55 21.47 17.02 21.98 17.02C22.55 17.02 23.02 16.55 23.02 15.98V9.61C23.02 9.23 22.78 8.91 22.5 8.72L12.94 3.52C12.38 3.19 11.62 3.19 11.06 3.52Z",
+  science:
+    "M20.53 17.72 15 11.02V5.02H15.98C16.55 5.02 17.02 4.55 17.02 3.98C17.02 3.47 16.55 3 15.98 3H8.02C7.45 3 6.98 3.47 6.98 3.98C6.98 4.55 7.45 5.02 8.02 5.02H9V11.02L3.47 17.72C3.14 18.14 3 18.56 3 18.98C3 20.02 3.8 21 5.02 21H18.98C20.2 21 21 20.02 21 18.98C21 18.56 20.86 18.14 20.53 17.72Z",
+  search:
+    "M15.52 14.02H14.72L14.44 13.73C15.61 12.33 16.27 10.41 15.89 8.39C15.42 5.62 13.12 3.38 10.31 3.05C6.09 2.53 2.53 6.09 3.05 10.31C3.38 13.12 5.62 15.42 8.39 15.89C10.41 16.27 12.33 15.61 13.73 14.44L14.02 14.72V15.52L18.23 19.73C18.66 20.16 19.31 20.16 19.73 19.73C20.16 19.36 20.16 18.66 19.73 18.28L15.52 14.02ZM9.52 14.02C7.03 14.02 5.02 12 5.02 9.52C5.02 7.03 7.03 5.02 9.52 5.02C12 5.02 14.02 7.03 14.02 9.52C14.02 12 12 14.02 9.52 14.02Z",
+  sort:
+    "M3.98 18H8.02C8.53 18 9 17.53 9 17.02C9 16.45 8.53 15.98 8.02 15.98H3.98C3.47 15.98 3 16.45 3 17.02C3 17.53 3.47 18 3.98 18ZM3 6.98C3 7.55 3.47 8.02 3.98 8.02H20.02C20.53 8.02 21 7.55 21 6.98C21 6.47 20.53 6 20.02 6H3.98C3.47 6 3 6.47 3 6.98ZM3.98 12.98H14.02C14.53 12.98 15 12.56 15 12C15 11.44 14.53 11.02 14.02 11.02H3.98C3.47 11.02 3 11.44 3 12C3 12.56 3.47 12.98 3.98 12.98Z",
+  star:
+    "M12 17.25 16.17 19.78C16.92 20.25 17.86 19.55 17.62 18.7L16.55 13.97L20.2 10.78C20.86 10.22 20.53 9.14 19.64 9.05L14.81 8.62L12.94 4.17C12.56 3.38 11.44 3.38 11.06 4.17L9.19 8.62L4.36 9.05C3.47 9.09 3.14 10.22 3.8 10.78L7.45 13.97L6.38 18.7C6.14 19.55 7.08 20.25 7.83 19.78L12 17.25Z",
+  star_border:
+    "M19.64 9.05 14.81 8.62 12.94 4.17C12.56 3.38 11.44 3.38 11.06 4.17L9.19 8.62L4.36 9.05C3.47 9.09 3.14 10.22 3.8 10.78L7.45 13.97L6.38 18.7C6.14 19.55 7.08 20.25 7.83 19.78L12 17.25L16.17 19.78C16.92 20.25 17.86 19.55 17.62 18.7L16.55 13.97L20.2 10.78C20.86 10.22 20.53 9.09 19.64 9.05ZM12 15.42 8.25 17.67 9.23 13.41 5.91 10.5 10.31 10.12 12 6.09 13.69 10.12 18.09 10.5 14.77 13.41 15.75 17.67 12 15.42Z",
+  star_half:
+    "M19.64 9.05 14.81 8.62 12.94 4.17C12.56 3.38 11.44 3.38 11.06 4.17L9.19 8.62L4.36 9.05C3.47 9.09 3.14 10.22 3.8 10.78L7.45 13.97L6.38 18.7C6.14 19.55 7.08 20.25 7.83 19.78L12 17.25L16.17 19.78C16.92 20.25 17.86 19.55 17.62 18.7L16.55 13.97L20.2 10.78C20.86 10.22 20.53 9.09 19.64 9.05ZM12 15.42V6.09L13.69 10.12L18.09 10.5L14.77 13.41L15.75 17.67L12 15.42Z",
+  translate:
+    "M12.66 15.66C12.8 15.33 12.7 14.91 12.42 14.62L10.31 12.56L10.36 12.52C12.09 10.59 13.36 8.34 14.06 6H16.03C16.55 6 17.02 5.53 17.02 5.02V4.97C17.02 4.45 16.55 3.98 16.03 3.98H9.98V3C9.98 2.44 9.56 2.02 9 2.02C8.44 2.02 8.02 2.44 8.02 3V3.98H1.97C1.45 3.98 0.98 4.45 0.98 4.97C0.98 5.53 1.45 6 1.97 6H12.19C11.48 7.92 10.45 9.75 9 11.34C8.2 10.45 7.5 9.47 6.94 8.48C6.8 8.2 6.47 8.02 6.14 8.02C5.48 8.02 5.02 8.77 5.39 9.33C6 10.5 6.75 11.58 7.69 12.56L3.28 16.88C2.91 17.25 2.91 17.91 3.28 18.28C3.7 18.7 4.31 18.7 4.73 18.28L9 14.02L11.02 16.03C11.53 16.55 12.42 16.36 12.66 15.66ZM17.48 9.98C16.92 9.98 16.36 10.36 16.17 10.92L12.47 20.72C12.23 21.33 12.7 21.98 13.36 21.98C13.73 21.98 14.11 21.75 14.25 21.38L15.14 18.98H19.88L20.77 21.38C20.91 21.75 21.28 21.98 21.66 21.98C22.31 21.98 22.78 21.33 22.55 20.72L18.84 10.92C18.66 10.36 18.09 9.98 17.48 9.98ZM15.89 17.02 17.48 12.66 19.12 17.02H15.89Z",
+  trending:
+    "M16.83 6.84 18.28 8.3 13.41 13.17 10.12 9.89C9.75 9.47 9.09 9.47 8.72 9.89L2.72 15.89C2.3 16.27 2.3 16.92 2.72 17.3C3.09 17.67 3.75 17.67 4.12 17.3L9.42 12L12.7 15.28C13.08 15.7 13.73 15.7 14.11 15.28L19.69 9.7L21.14 11.16C21.47 11.44 21.98 11.25 21.98 10.78V6.52C21.98 6.23 21.8 6 21.52 6H17.2C16.78 6 16.55 6.56 16.83 6.84Z",
+  verified:
+    "M23.02 12 20.58 9.19 20.91 5.53 17.3 4.69 15.42 1.5 12 2.95 8.58 1.5 6.7 4.69 3.09 5.48 3.42 9.19 0.98 12 3.42 14.81 3.09 18.47 6.7 19.31 8.58 22.5 12 21.05 15.42 22.5 17.3 19.31 20.91 18.47 20.58 14.81 23.02 12ZM9.38 16.03 6.98 13.59C6.61 13.22 6.61 12.61 6.98 12.19L7.08 12.14C7.45 11.72 8.11 11.72 8.48 12.14L10.08 13.73L15.23 8.58C15.66 8.2 16.27 8.2 16.69 8.58L16.73 8.67C17.11 9.05 17.11 9.7 16.73 10.08L10.83 16.03C10.41 16.41 9.8 16.41 9.38 16.03Z",
+  work:
+    "M20.02 6H15.98V3.98C15.98 2.91 15.09 2.02 14.02 2.02H9.98C8.91 2.02 8.02 2.91 8.02 3.98V6H3.98C2.91 6 2.02 6.89 2.02 8.02V18.98C2.02 20.11 2.91 21 3.98 21H20.02C21.09 21 21.98 20.11 21.98 18.98V8.02C21.98 6.89 21.09 6 20.02 6ZM14.02 6H9.98V3.98H14.02V6Z",
+};
+
+const ic = (nome: string, classe = "") =>
+  `<svg class="ic${classe ? ` ${classe}` : ""}" aria-hidden="true" focusable="false"><use href="#i-${nome}"/></svg>`;
+
+/// I simboli che la pagina richiama, nell'ordine in cui compaiono.
+function spriteIcone(html: string): string {
+  const usati = [...new Set([...html.matchAll(/href="#i-([a-z_]+)"/g)].map((m) => m[1]))]
+    .filter((n) => Object.hasOwn(ICONE, n));
+  return usati.length
+    ? `<svg class="sprite" aria-hidden="true" focusable="false"><defs>${
+      usati.map((n) => `<symbol id="i-${n}" viewBox="0 0 24 24"><path d="${ICONE[n]}"/></symbol>`).join("")
+    }</defs></svg>`
+    : "";
+}
+
+/// Le categorie dell'enum dell'app (template_models.dart) con l'etichetta di
+/// app_it.arb e l'icona di marketplaceCategoryIcon. Fuori elenco = niente
+/// pillola: la 218 lo manda già NULL, e NULL non diventa «Personalizzato».
+const CATEGORIE: Record<string, [string, string]> = {
+  study: ["Studio", "menu_book"],
+  planner: ["Agenda", "event"],
+  journal: ["Diario", "auto_stories"],
+  calligraphy: ["Calligrafia", "draw"],
+  music: ["Musica", "music"],
+  storyboard: ["Storyboard", "movie"],
+  business: ["Business", "work"],
+  mindMap: ["Mappa mentale", "hub"],
+  science: ["Scienze", "science"],
+  language: ["Lingue", "translate"],
+  custom: ["Personalizzato", "palette"],
+};
+const categoriaDi = (c: unknown): [string, string] | null =>
+  typeof c === "string" && Object.hasOwn(CATEGORIE, c) ? CATEGORIE[c] : null;
+
+const ICONA_MATERIA: Record<string, string> = {
+  math: "menu_book",
+  physics: "science",
+  chemistry: "science",
+  biology: "science",
+  medicine: "healing",
+  law: "gavel",
+  economics: "work",
+  philosophy: "psychology",
+  history: "auto_stories",
+  language: "translate",
+  cs: "code",
+};
+const iconaMateria = (k: string | null) => (k && Object.hasOwn(ICONA_MATERIA, k) ? ICONA_MATERIA[k] : "menu_book");
+
+/// Un numero dal database, o null: PostgREST manda i numeric come numeri, ma
+/// un proxy può mandarli come stringhe.
+function numero(v: unknown): number | null {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+/// 1234 → «1234», 1 200 000 → «1,2 Mln»: come NumberFormat.compact dell'app.
+function numeroIt(n: number): string {
+  try {
+    return new Intl.NumberFormat("it-IT", { notation: "compact", maximumFractionDigits: 1 }).format(n);
+  } catch {
+    return String(n);
+  }
+}
+const votoIt = (v: number) => v.toFixed(1).replace(".", ",");
+const concetti = (n: number) => `${n} concett${n === 1 ? "o" : "i"}`;
+
+/// Cinque stelle come MW: piena se ≥ i, mezza se ≥ i − 0,5, vuota altrimenti.
+function stelle(voto: number, voti: number | null, classe = ""): string {
+  const s = [1, 2, 3, 4, 5]
+    .map((i) => (voto >= i ? ic("star") : voto >= i - 0.5 ? ic("star_half") : ic("star_border", "vuota")))
+    .join("");
+  const n = voti !== null ? `<span class="n" aria-hidden="true">(${esc(numeroIt(voti))})</span>` : "";
+  const detto = `Valutazione ${votoIt(voto)} su 5${voti !== null ? `, ${voti} vot${voti === 1 ? "o" : "i"}` : ""}`;
+  return `<span class="stelle${classe ? ` ${classe}` : ""}" role="img" aria-label="${detto}">${s}${n}</span>`;
+}
+
+/// Il pallino dell'autore: FNV-1a sulle unità UTF-16 del nome mostrato, come
+/// _inkfolioAuthorHue (MW:217-237). «Fluera» → sunset.
+function pallino(nome: string, classe = ""): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < nome.length; i++) h = Math.imul(h ^ nome.charCodeAt(i), 0x01000193) >>> 0;
+  const tinta = ["sunset", "amber", "rose", "grape"][h % 4];
+  const iniziale = [...nome.replace(/^@/, "")][0]?.toUpperCase() ?? "?";
+  return `<span class="pallino ${tinta}${classe ? ` ${classe}` : ""}" aria-hidden="true">${esc(iniziale)}</span>`;
+}
+
+/// «Nuovo» (MW:437-454): nessun distintivo, nessun voto mostrabile, e al
+/// massimo 7 giorni. L'app guarda le installazioni, che il web non ha.
+function nuovo(r: SemeWeb): boolean {
+  if (r.is_official === true || r.is_featured === true || numero(r.voto_medio) !== null) return false;
+  const eta = Date.now() - Date.parse(r.created_at ?? "");
+  return Number.isFinite(eta) && eta >= 0 && eta <= 7 * 86_400_000;
+}
+
+/// Il distintivo di fiducia piccolo: Ufficiale vince su In evidenza.
+function fiducia(r: { is_official?: boolean | null; is_featured?: boolean | null }): string {
+  if (r.is_official === true) {
+    return `<span class="fiducia" title="Ufficiale">${ic("verified")}<span class="vh">Ufficiale</span></span>`;
+  }
+  if (r.is_featured === true) {
+    return `<span class="fiducia evid" title="In evidenza">${ic("auto_awesome")}<span class="vh">In evidenza</span></span>`;
+  }
+  return "";
+}
+
+/// L'anteprima «foglio appuntato sulla carta»: cornice a righe da quaderno e
+/// foglio a proporzione fissa, così le miniature di una riga sono alte uguali.
+function anteprima(r: SemeWeb, subito: boolean, sopra: string): string {
+  const img = r.thumb_path ? publicUrl(r.thumb_path) : r.og_path ? publicUrl(r.og_path) : null;
+  const cat = categoriaDi(r.category);
+  const dentro = img
+    ? `<img src="${esc(img)}" alt="" width="400" height="300"${subito ? "" : ` loading="lazy"`} decoding="async" />`
+    : `<span class="rigatura">${ic(cat?.[1] ?? "menu_book", "cat")}</span>`;
+  return `<span class="cornice"><span class="foglio">${dentro}${sopra}</span></span>`;
+}
+
+/// La scheda della griglia e delle strisce (TemplateCard, MW:1073-1463). Tutta
+/// la scheda è UN link. La pillola dell'efficacia solo nella griglia.
+function schedaSeme(r: SemeWeb, griglia: boolean, subito = false): string {
+  const t = (r.title ?? "").trim() || "Senza titolo";
+  const cat = categoriaDi(r.category);
+  const sopra = (fiducia(r) || (nuovo(r) ? `<span class="nuovo">Nuovo</span>` : "")) +
+    (cat ? `<span class="categoria">${ic(cat[1])}${esc(cat[0])}</span>` : "");
+  // Mai author_code sulle pagine indicizzate (dati_web §1): oggi ci arrivano
+  // solo pack ufficiali, e l'autore degli studenti lo decide la F3.
+  const autore = r.is_official === true ? "Fluera" : null;
+  const eff = griglia ? numero(r.efficacia_pct) : null;
+  const voto = numero(r.voto_medio);
+  const n = numero(r.concept_count);
+  return `<li><a class="scheda" href="${SHARE}/s/${esc(r.hash)}">${anteprima(r, subito, sopra)}<span class="testi"><h3 class="t"${attrLingua(r)}>${esc(t)}</h3>${
+    autore ? `<span class="autore">${pallino(autore)}${esc(autore)}</span>` : ""
+  }${eff !== null ? `<span class="pillola">${ic("trending")}+${Math.round(eff)}% ritenzione</span>` : ""}${
+    voto !== null ? stelle(voto, numero(r.voti)) : ""
+  }<span class="piede-s"><span>${n !== null && n > 0 ? `${ic("hub")}${concetti(n)}` : ""}</span>${ic("chevron", "vai")}</span></span></a></li>`;
+}
+
+/// La scheda della striscia «In evidenza» (FeaturedTemplateCard, MW:2367-2626).
+function schedaEvidenza(r: SemeWeb): string {
+  const t = (r.title ?? "").trim() || "Senza titolo";
+  const voto = numero(r.voto_medio);
+  return `<li><a class="scheda evid" href="${SHARE}/s/${esc(r.hash)}">${anteprima(r, false, fiducia(r))}<span class="testi"><span class="col"><h3 class="t"${attrLingua(r)}>${esc(t)}</h3>${
+    r.is_official === true ? `<span class="autore">${pallino("Fluera", "p24")}Fluera</span>` : ""
+  }${voto !== null ? stelle(voto, numero(r.voti)) : ""}</span><span class="tondo" aria-hidden="true">${ic("arrow")}</span></span></a></li>`;
+}
+
+/// Il banner (_InkfolioFeaturedHero, MS:2358-2810): il primo In evidenza, con
+/// la palette OPPOSTA a quella della pagina. È il LCP dell'indice.
+function bannerEvidenza(r: SemeWeb): string {
+  const t = (r.title ?? "").trim() || "Senza titolo";
+  const img = r.thumb_path ? publicUrl(r.thumb_path) : r.og_path ? publicUrl(r.og_path) : null;
+  const voto = numero(r.voto_medio);
+  const n = numero(r.concept_count);
+  const riga = voto !== null
+    ? stelle(voto, numero(r.voti), "grandi")
+    : n !== null && n > 0
+    ? `<span class="e-conc">${ic("hub")}${concetti(n)}</span>`
+    : "<span></span>";
+  return `<div class="eroe"><a class="eroe-a" href="${SHARE}/s/${esc(r.hash)}"><span class="e-testi"><span class="occhiello">Selezionati dal team Fluera</span><h3${attrLingua(r)}>${esc(t)}</h3>${
+    r.is_official === true ? `<span class="e-autore"><span class="e-pal" aria-hidden="true">F</span>Fluera</span>` : ""
+  }</span><span class="e-img"><span class="e-foglio">${
+    img
+      ? `<img src="${esc(img)}" alt="" width="400" height="300" fetchpriority="high" decoding="async" />`
+      : `<span class="rigatura">${ic(categoriaDi(r.category)?.[1] ?? "menu_book", "cat")}</span>`
+  }</span></span><span class="e-voto">${riga}<span class="tondo grande" aria-hidden="true">${ic("arrow")}</span></span></a></div>`;
+}
+
+/// Intestazione di sezione (MS:1975-2059). «Vedi tutti» verso un ordine è
+/// nofollow: quelle pagine sono duplicati della base.
+function intestazione(
+  id: string,
+  icona: string,
+  titolo: string,
+  sotto: string | null,
+  vedi?: { href: string; nofollow: boolean },
+): string {
+  return `<div class="sez-testa">${ic(icona)}<div><h2 id="${id}">${esc(titolo)}</h2>${sotto ? `<p>${esc(sotto)}</p>` : ""}</div>${
+    vedi ? `<a class="vedi" href="${esc(vedi.href)}"${vedi.nofollow ? ` rel="nofollow"` : ""}>Vedi tutti${ic("chevron")}</a>` : ""
+  }</div>`;
+}
+
+/// Una striscia orizzontale che si scorre anche con le frecce della tastiera.
+const striscia = (titolo: string, schede: string, classe = "") =>
+  `<div class="striscia${classe ? ` ${classe}` : ""}" role="region" aria-label="${esc(titolo)}" tabindex="0"><ul>${schede}</ul></div>`;
+
+/// Le materie che hanno un elenco, nell'ordine di list_web_hubs.
+const materieDi = (hubs: HubWeb[]) =>
+  [...new Set(hubs.filter((x) => x.corso_slug === null).map((x) => x.materia_slug))];
+
+/// I chip delle MATERIE al posto dei chip categoria dell'app: sul web oggi
+/// ogni pack è «study», e la materia è il percorso. Link normali verso pagine
+/// indicizzabili; nella ricerca portano la ricerca con la materia.
+function chipMaterie(lingua: string, hubs: HubWeb[], attuale: string | null, q: string | null): string {
+  const href = (k: string | null) => {
+    if (q === null) return urlElenco(lingua, k);
+    const p = new URLSearchParams({ q });
+    if (k) p.set("materia", slugMateria(lingua, k));
+    return `${urlElenco(lingua)}cerca?${p}`;
+  };
+  const voce = (k: string | null, nome: string) =>
+    `<li><a class="chip" href="${esc(href(k))}"${attuale === k ? ` aria-current="page"` : ""}>${k ? ic(iconaMateria(k)) : ""}<span${
+      k ? langElenco(lingua) : ""
+    }>${esc(nome)}</span></a></li>`;
+  return `<nav class="chips" aria-label="Materie"><ul>${voce(null, "Tutte")}${
+    materieDi(hubs).map((k) => voce(k, nomeMateria(hubs, k))).join("")
+  }</ul></nav>`;
+}
+
+/// La faccetta «Tutti i corsi ▾» (MS:1791-1829): un <details> con link veri.
+/// Nell'indice i corsi stanno sotto il nome della loro materia.
+function faccettaCorso(lingua: string, hubs: HubWeb[], materia: string | null, corso: string | null): string {
+  const corsi = hubs.filter((h) => h.corso_slug !== null && (materia === null || h.materia_slug === materia));
+  if (corsi.length === 0) return "";
+  const nomeC = (h: HubWeb) => (h.corso ?? "").trim() || (h.corso_slug ?? "");
+  const voce = (h: HubWeb) =>
+    `<li><a href="${urlElenco(lingua, h.materia_slug, h.corso_slug)}"${
+      h.materia_slug === materia && h.corso_slug === corso ? ` aria-current="page"` : ""
+    }${langElenco(lingua)}>${esc(nomeC(h))}<span class="conta">(${Math.max(0, Number(h.n) || 0)})</span></a></li>`;
+  const attivo = corso ? corsi.find((h) => h.corso_slug === corso) : undefined;
+  const menu = materia
+    ? `<li><a href="${urlElenco(lingua, materia)}"${corso ? "" : ` aria-current="page"`}>Tutti i corsi</a></li><li role="separator"></li>${corsi.map(voce).join("")}`
+    : materieDi(hubs).map((k) => {
+      const suoi = corsi.filter((h) => h.materia_slug === k);
+      return suoi.length ? `<li class="gruppo"${langElenco(lingua)}>${esc(nomeMateria(hubs, k))}</li>${suoi.map(voce).join("")}` : "";
+    }).join("");
+  return `<details class="menu-a faccetta${attivo ? " attiva" : ""}"><summary>${ic("school")}<span>${esc(attivo ? nomeC(attivo) : "Tutti i corsi")}</span>${
+    ic("drop")
+  }</summary><ul class="menu" role="list">${menu}</ul></details>`;
+}
+
+/// «Ordina»: quattro link, e solo la griglia si riordina.
+function menuOrdina(base: string, ordine: Ordine): string {
+  const voci = ORDINI.map(([o, nome, nota]) =>
+    `<li><a href="${esc(o === "consigliati" ? base : `${base}?ordine=${o}`)}#tutti"${o === ordine ? ` aria-current="true"` : ""}${
+      o === "consigliati" ? "" : ` rel="nofollow"`
+    }>${nome}${nota ? `<small>${nota}</small>` : ""}</a></li>`
+  ).join("");
+  const attuale = ORDINI.find(([o]) => o === ordine)?.[1] ?? "Consigliati";
+  return `<details class="menu-a ordina"><summary aria-label="Ordina: ${attuale}">${ic("sort")}<span>${attuale}</span>${
+    ic("drop")
+  }</summary><ul class="menu" role="list">${voci}</ul></details>`;
+}
+
+/// Il canonical di un elenco: un ordine è la stessa pagina riordinata, quindi
+/// punta alla base senza ordine né pagina (e senza noindex: segnali in
+/// conflitto che Google sconsiglia).
+function canonico(base: string, pagina: number, ordine: Ordine): string {
+  if (ordine !== "consigliati") return base;
+  return pagina > 1 ? `${base}?pagina=${pagina}` : base;
+}
+
+/// Pagine vere al posto dello scroll infinito. Dentro un ordine i link sono
+/// nofollow; la pagina 1 non porta ?pagina=1.
+function navPagine(base: string, pagina: number, pagine: number, ordine: Ordine): string {
+  if (pagine <= 1) return "";
+  const url = (n: number) => {
+    const q = new URLSearchParams();
+    if (ordine !== "consigliati") q.set("ordine", ordine);
+    if (n > 1) q.set("pagina", String(n));
+    return `${base}${q.size ? `?${q}` : ""}`;
+  };
+  const nf = ordine === "consigliati" ? "" : " nofollow";
+  const numeri = [...new Set([1, pagina - 1, pagina, pagina + 1, pagine])].filter((n) => n >= 1 && n <= pagine).sort((a, b) => a - b);
+  const voci: string[] = [];
+  numeri.forEach((n, i) => {
+    if (i > 0 && n - numeri[i - 1] > 1) voci.push(`<span class="salto" aria-hidden="true">…</span>`);
+    voci.push(
+      n === pagina
+        ? `<span aria-current="page">${n}</span>`
+        : `<a href="${esc(url(n))}"${nf ? ` rel="nofollow"` : ""} aria-label="Pagina ${n}">${n}</a>`,
+    );
+  });
+  return `<nav class="pagine" aria-label="Pagine">${
+    pagina > 1 ? `<a class="lato" href="${esc(url(pagina - 1))}" rel="prev${nf}">${ic("chevron_l")}Pagina precedente</a>` : ""
+  }${voci.join("")}${
+    pagina < pagine ? `<a class="lato" href="${esc(url(pagina + 1))}" rel="next${nf}">Pagina successiva${ic("chevron")}</a>` : ""
+  }</nav>`;
+}
+
+/// La ricerca in cima (ARB:3500). Con una materia, si cerca dentro la materia.
+function formCerca(lingua: string, q = "", materia: string | null = null): string {
+  return `<form class="cerca" action="${urlElenco(lingua)}cerca" method="get" role="search">${ic("search", "lente")}<input type="search" name="q" value="${
+    esc(q)
+  }" minlength="2" maxlength="80" placeholder="Cerca template di studio…" aria-label="Cerca template di studio" enterkeyhint="search" />${
+    materia ? `<input type="hidden" name="materia" value="${esc(slugMateria(lingua, materia))}" />` : ""
+  }<button type="submit" aria-label="Cerca">${ic("arrow")}</button></form>`;
+}
+
+/// La fascia d'apertura (§ + titolo + stanghetta gialla + sottotitolo).
+const fascia = (titoloHtml: string, sotto: string) =>
+  `<div class="fascia"><span class="par" aria-hidden="true">§</span><div><h1>${titoloHtml}</h1><span class="stanghetta" aria-hidden="true"></span><p>${
+    esc(sotto)
+  }</p></div></div>`;
+
+/// Uno stato vuoto come MW:2087-2238.
+function statoVuoto(
+  icona: string,
+  titolo: string,
+  testo: string,
+  azione: { testo: string; href: string } | null,
+  livello: 1 | 2 = 2,
+): string {
+  return `<div class="vuoto"><span class="cerchio">${ic(icona)}</span><h${livello}>${esc(titolo)}</h${livello}><p>${esc(testo)}</p>${
+    azione ? `<a class="btn-tono" href="${esc(azione.href)}">${esc(azione.testo)}</a>` : ""
+  }</div>`;
+}
+
+/// «Tutti i template»: la griglia (le prime 5 immagini senza lazy) e le pagine.
+function sezioneTutti(semi: SemeWeb[], nav: string, titolo = "Tutti i template"): string {
+  return `<section class="sez" id="tutti" aria-labelledby="t-tutti">${intestazione("t-tutti", "grid", titolo, null)}<ul class="griglia">${
+    semi.map((r, i) => schedaSeme(r, true, i < 5)).join("")
+  }</ul>${nav}</section>`;
+}
+
+/// «Materie e corsi»: ogni elenco con un link, senza aprire un menu. Dopo la
+/// griglia, in piccolo, così non pesa sull'aspetto dell'app.
+function mappaCorsi(lingua: string, hubs: HubWeb[]): string {
+  const la = langElenco(lingua);
+  const voci = materieDi(hubs).map((k) => {
+    const corsi = hubs.filter((x) => x.materia_slug === k && x.corso_slug !== null)
+      .map((x) => `<li><a href="${urlElenco(lingua, k, x.corso_slug)}"${la}>${esc((x.corso ?? "").trim() || (x.corso_slug ?? ""))}</a></li>`)
+      .join("");
+    return `<li><a class="m" href="${urlElenco(lingua, k)}"${la}>${esc(nomeMateria(hubs, k))}</a>${corsi ? `<ul>${corsi}</ul>` : ""}</li>`;
+  }).join("");
+  return voci ? `<section class="mappa" aria-labelledby="t-mappa"><h2 id="t-mappa">Materie e corsi</h2><ul>${voci}</ul></section>` : "";
+}
+
+/// I menu <details> funzionano da soli; questo li chiude con Esc o con un
+/// clic fuori. Solo comodità: senza script la pagina funziona uguale.
+/// Porta anche in vista il chip o la scheda che prende il focus: Chromium non
+/// fa scorrere una fila se l'elemento è visibile anche solo in parte.
+const AIUTO_MENU = `<script>(function(){var D=document,d=D.querySelectorAll("details.menu-a"),o=D.addEventListener.bind(D);function c(e){for(var i=0;i<d.length;i++)if(!e||!d[i].contains(e.target))d[i].removeAttribute("open")}o("click",c);o("keydown",function(e){e.key==="Escape"&&c()});o("focusin",function(e){var t=e.target;t.closest(".chips a,.striscia a")&&t.scrollIntoView({block:"nearest",inline:"nearest"})})})();</script>`;
+
+function jsonLdElenco(
+  briciole: Array<{ nome: string; url: string }>,
+  pagina: { nome: string; descrizione: string; url: string; lingua: string },
+  voci: Array<{ nome: string; url: string; posizione: number }>,
+): unknown {
+  return {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "BreadcrumbList",
+        itemListElement: briciole.map((b, i) => ({ "@type": "ListItem", position: i + 1, name: b.nome, item: b.url })),
+      },
+      {
+        "@type": "CollectionPage",
+        name: pagina.nome,
+        description: pagina.descrizione,
+        url: pagina.url,
+        inLanguage: pagina.lingua,
+        publisher: { "@type": "Organization", name: "Fluera", url: SITE },
+        mainEntity: {
+          "@type": "ItemList",
+          itemListElement: voci.map((v) => ({ "@type": "ListItem", position: v.posizione, name: v.nome, url: v.url })),
+        },
+      },
+    ],
+  };
+}
+
+/// L'involucro di ogni pagina degli elenchi. Il noindex (meta e header) e il
+/// JSON-LD dipendono da UN parametro: dati strutturati solo dove Google entra.
+function paginaWeb(p: {
+  lingua: string;
+  titolo: string;
+  descrizione: string;
+  self: string | null;
+  siIndicizza: boolean;
+  jsonLd?: unknown;
+  corpo: string;
+  suIndice?: boolean;
+}): Response {
+  const dentro = `${testata(urlElenco(p.lingua), p.suIndice)}
+  <main class="in cat">
+    ${p.corpo}
+  </main>
+  ${piede()}`;
+  const body = `<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />${p.siIndicizza ? "" : `\n  <meta name="robots" content="noindex" />`}
+  <title>${esc(p.titolo)}</title>
+  <meta name="description" content="${esc(p.descrizione)}" />${p.self ? `\n  <link rel="canonical" href="${esc(p.self)}" />\n  <meta property="og:url" content="${esc(p.self)}" />` : ""}
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="Fluera" />
+  <meta property="og:title" content="${esc(p.titolo)}" />
+  <meta property="og:description" content="${esc(p.descrizione)}" />
+  <meta property="og:image" content="${esc(OG_FALLBACK)}" />
+  <meta name="twitter:card" content="summary_large_image" />${
+    p.siIndicizza && p.jsonLd ? `\n  <script type="application/ld+json">${jsonPerScript(p.jsonLd)}</script>` : ""
+  }${testaWeb(STILE_CATALOGO)}
+</head>
+<body>
+  ${spriteIcone(dentro)}${dentro}
+  ${AIUTO_MENU}
+</body>
+</html>`;
+  return paginaSeme(body, p.siIndicizza);
+}
+
+/// p_ordine si manda solo quando non è la base: così share nuovo regge anche
+/// su un database prima della 218 (la firma a 5 argomenti).
+const conOrdine = (o: Ordine) => (o === "consigliati" ? {} : { p_ordine: o });
+
+/// Le vetrine dell'indice, con i testi dell'app. «Vedi tutti» porta alla
+/// griglia della stessa pagina con l'ordine giusto; In evidenza non ce l'ha.
+const VETRINE: Record<string, { titolo: string; sotto: string; icona: string; vedi: Ordine | null }> = {
+  in_evidenza: { titolo: "In evidenza", sotto: "Selezionati dal team Fluera", icona: "auto_awesome", vedi: null },
+  piu_efficaci: { titolo: "Provati efficaci", sotto: "Template che aumentano davvero la ritenzione", icona: "premium", vedi: "efficaci" },
+  di_tendenza: { titolo: "Di tendenza", sotto: "Popolari tra chi studia questa settimana", icona: "trending", vedi: "consigliati" },
+  novita: { titolo: "Novità", sotto: "Appena pubblicati", icona: "schedule", vedi: "recenti" },
+};
+type Vetrina = { nome: string; righe: VetrinaWeb[] };
+
+/// Le vetrine nell'ordine in cui la 218 le restituisce, ognuna per posto.
+/// Quali escono (e da quante schede) lo decide solo il database.
+function vetrineDi(rows: VetrinaWeb[]): Vetrina[] {
+  const valide = rows.filter((r) => r && typeof r.hash === "string" && HASH_INTERO_RE.test(r.hash));
+  return [...new Set(valide.map((r) => r.vetrina))]
+    .filter((n) => typeof n === "string" && Object.hasOwn(VETRINE, n))
+    .map((nome) => ({
+      nome,
+      righe: valide.filter((r) => r.vetrina === nome).sort((a, b) => (Number(a.posto) || 0) - (Number(b.posto) || 0)),
+    }));
+}
+
+function sezioneVetrina(self: string, v: Vetrina): string {
+  const d = VETRINE[v.nome];
+  const id = `t-${v.nome.replace(/_/g, "-")}`;
+  const vedi = d.vedi === null
+    ? undefined
+    : d.vedi === "consigliati"
+    ? { href: `${self}#tutti`, nofollow: false }
+    : { href: `${self}?ordine=${d.vedi}#tutti`, nofollow: true };
+  const testa = intestazione(id, d.icona, d.titolo, d.sotto, vedi);
+  if (v.nome === "in_evidenza") {
+    const [primo, ...altri] = v.righe;
+    return `<section class="sez vetrina" data-vetrina="in_evidenza" aria-labelledby="${id}">${testa}${bannerEvidenza(primo)}${
+      altri.length ? striscia(d.titolo, altri.map(schedaEvidenza).join(""), "evid") : ""
+    }</section>`;
+  }
+  return `<section class="sez vetrina" data-vetrina="${esc(v.nome)}" aria-labelledby="${id}">${testa}${
+    striscia(d.titolo, v.righe.map((r) => schedaSeme(r, false)).join(""))
+  }</section>`;
+}
+
+/// /{lingua}/appunti/ — la vetrina dell'app: fascia, In evidenza, Provati
+/// efficaci, Di tendenza, Novità, poi «Tutti i template» a pagine vere e
+/// «Materie e corsi». L'indice italiano esiste sempre (in beta dice la
+/// verità: i primi pack arrivano), ma resta fuori da Google finché non c'è un
+/// elenco. Le altre lingue nascono col loro primo elenco.
+async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Promise<Response> {
+  const offset = (pagina - 1) * SEMI_PER_PAGINA;
+  if (offset > OFFSET_MAX) return nonTrovata();
+  const [h, s, v] = await Promise.all([
+    rpcWeb<HubWeb>("list_web_hubs", { p_lingua: lingua }),
+    rpcWeb<SemeWeb>("list_web_seeds", { p_lingua: lingua, p_limit: SEMI_PER_PAGINA, p_offset: offset, ...conOrdine(ordine) }),
+    // Le strisce sono un arricchimento della prima pagina: tetto di tempo, e
+    // un guasto le toglie e basta.
+    pagina === 1
+      ? rpcWeb<VetrinaWeb>("list_web_vetrine", { p_lingua: lingua, p_per_vetrina: 12 }, 1500)
+      : Promise.resolve<EsitoRpc<VetrinaWeb>>({ ok: true, rows: [] }),
+  ]);
+  if (!h.ok) return rispostaGuasto(`list_web_hubs(${lingua}): ${h.motivo}`);
+  const hubs = hubValidi(h.rows);
+  if (hubs.length === 0 && (lingua !== "it" || pagina > 1)) return nonTrovata();
+  const self = urlElenco(lingua);
+  const descrizione = "Pack di appunti divisi per materia, da aprire in Fluera: un canvas per imparare, dove ci scrivi sopra a mano.";
+  if (hubs.length === 0) {
+    return paginaWeb({
+      lingua,
+      titolo: "Template di studio e appunti per materia · Fluera",
+      descrizione,
+      self,
+      siIndicizza: false,
+      suIndice: true,
+      corpo: statoVuoto("eco", "Ancora nessun template", "I pack di studio arrivano presto. Torna a trovarci!", { testo: "Scopri Fluera", href: SITE }, 1),
+    });
+  }
+  if (!s.ok) return rispostaGuasto(`list_web_seeds(${lingua}): ${s.motivo}`);
+  if (!v.ok) console.error(`vetrine di ${lingua}: ${v.motivo}`);
+  const semi = semiValidi(s.rows);
+  if (pagina > 1 && semi.length === 0) return nonTrovata();
+  const totale = Math.max(Number(s.rows[0]?.totale ?? 0) || 0, offset + semi.length);
+  const pagine = Math.max(1, Math.ceil(totale / SEMI_PER_PAGINA));
+  const vetrine = v.ok ? vetrineDi(v.rows) : [];
+  // Il testo della fascia dice chi c'è davvero: finché ogni scheda è
+  // ufficiale, «dal team Fluera»; dalla F3, con gli studenti, quello dell'app.
+  const soloFluera = [...semi, ...vetrine.flatMap((x) => x.righe)].every((r) => r.is_official !== false);
+  const self2 = canonico(self, pagina, ordine);
+  return paginaWeb({
+    lingua,
+    titolo: `Template di studio e appunti per materia${pagina > 1 ? ` · pagina ${pagina}` : ""} · Fluera`,
+    descrizione,
+    self: self2,
+    siIndicizza: true,
+    suIndice: true,
+    jsonLd: ordine === "consigliati"
+      ? jsonLdElenco(
+        [{ nome: "Fluera", url: SITE }, { nome: "Appunti", url: self }],
+        { nome: "Template di studio e appunti per materia", descrizione, url: self2, lingua },
+        semi.map((r, i) => ({ nome: titoloSeme(r.title), url: `${SHARE}/s/${r.hash}`, posizione: offset + i + 1 })),
+      )
+      : undefined,
+    corpo: `${formCerca(lingua)}
+    <div class="filtri">${chipMaterie(lingua, hubs, null, null)}${faccettaCorso(lingua, hubs, null, null)}${menuOrdina(self, ordine)}</div>
+    ${
+      fascia(
+        soloFluera ? "Template di studio dal team Fluera" : "Template di studio dalla community",
+        soloFluera ? "Appunti scritti a mano, gratis da installare in Fluera." : "Appunti scritti a mano da chi studia, gratis da installare.",
+      )
+    }
+    ${vetrine.map((x) => sezioneVetrina(self, x)).join("\n    ")}
+    ${sezioneTutti(semi, navPagine(self, pagina, pagine, ordine))}
+    ${mappaCorsi(lingua, hubs)}`,
+  });
+}
+
+/// /{lingua}/appunti/{materia}/[{corso}/] — un elenco sopra soglia, o 404.
+/// È la vetrina filtrata dell'app (solo la griglia), più il titolo e il testo
+/// che servono a Google.
+async function paginaElenco(
+  lingua: string,
+  materia: string,
+  corso: string | null,
+  pagina: number,
+  ordine: Ordine,
+): Promise<Response> {
+  const offset = (pagina - 1) * SEMI_PER_PAGINA;
+  if (offset > OFFSET_MAX) return nonTrovata();
+  const [h, s] = await Promise.all([
+    rpcWeb<HubWeb>("list_web_hubs", { p_lingua: lingua }),
+    rpcWeb<SemeWeb>("list_web_seeds", {
+      p_lingua: lingua,
+      p_materia_slug: materia,
+      p_corso_slug: corso,
+      p_limit: SEMI_PER_PAGINA,
+      p_offset: offset,
+      ...conOrdine(ordine),
+    }),
+  ]);
+  if (!h.ok) return rispostaGuasto(`list_web_hubs(${lingua}): ${h.motivo}`);
+  if (!s.ok) return rispostaGuasto(`list_web_seeds(${lingua}/${materia}/${corso ?? ""}): ${s.motivo}`);
+  const hubs = hubValidi(h.rows);
+  const semi = semiValidi(s.rows);
+  // Sotto soglia = 404, non 410: l'elenco può nascere domani.
+  const hub = hubs.find((x) => x.materia_slug === materia && x.corso_slug === corso);
+  if (!hub) return nonTrovata();
+  if (pagina > 1 && semi.length === 0) return nonTrovata();
+
+  const totale = Math.max(Number(s.rows[0]?.totale ?? 0) || 0, offset + semi.length);
+  const pagine = Math.max(1, Math.ceil(totale / SEMI_PER_PAGINA));
+  const la = langElenco(lingua);
+  const nomeM = nomeMateria(hubs, materia);
+  const nomeC = corso ? (hub.corso ?? "").trim() || corso : null;
+  const haMateria = hubs.some((x) => x.materia_slug === materia && x.corso_slug === null);
+  const base = urlElenco(lingua, materia, corso);
+  const self = canonico(base, pagina, ordine);
+  const h1 = nomeC ?? nomeM;
+  const titolo = `${nomeC ? `${nomeC} · Appunti di ${nomeM}` : `Appunti di ${nomeM}`}${pagina > 1 ? ` · pagina ${pagina}` : ""} · Fluera`;
+  const descrizione = `Appunti di ${nomeC ? `${nomeC} (${nomeM})` : nomeM} da aprire in Fluera, un canvas per imparare: ci scrivi sopra a mano e li ripassi a libro chiuso.`;
+
+  const briciole = [
+    { nome: "Fluera", url: SITE },
+    { nome: "Appunti", url: urlElenco(lingua) },
+    ...(corso && !haMateria ? [] : [{ nome: nomeM, url: urlElenco(lingua, materia) }]),
+    ...(corso && nomeC ? [{ nome: nomeC, url: base }] : []),
+  ];
+  // Le briciole visibili: «Appunti › Matematica [› Analisi 1]», l'ultima è
+  // la pagina stessa.
+  const navBriciole = briciole.slice(1)
+    .map((b, i, a) => i === a.length - 1 ? `<span aria-current="page">${esc(b.nome)}</span>` : `<a href="${esc(b.url)}">${esc(b.nome)}</a>`)
+    .join(`<span class="sep" aria-hidden="true">›</span>`);
+  // L'introduzione scende SOTTO la griglia: la griglia si vede subito, come
+  // nell'app, e il testo resta nella pagina per chi arriva da Google.
+  const intro = !corso && pagina === 1 && lingua === "it" && MATERIE[materia]
+    ? `<section class="lettura" aria-labelledby="t-lettura"><h2 id="t-lettura">Studiare ${esc(nomeM)} a mano</h2><p>${esc(MATERIE[materia].intro)}</p></section>`
+    : "";
+  const nomeH1 = corso || !la ? esc(h1) : `<span${la}>${esc(h1)}</span>`;
+
+  return paginaWeb({
+    lingua,
+    titolo,
+    descrizione,
+    self,
+    siIndicizza: true, // anche con ?ordine=: il canonical alla base basta
+    jsonLd: ordine === "consigliati"
+      ? jsonLdElenco(
+        briciole,
+        { nome: h1, descrizione, url: self, lingua },
+        semi.map((r, i) => ({ nome: titoloSeme(r.title), url: `${SHARE}/s/${r.hash}`, posizione: offset + i + 1 })),
+      )
+      : undefined,
+    corpo: `${navBriciole ? `<nav class="briciole" aria-label="Percorso">${navBriciole}</nav>` : ""}
+    ${formCerca(lingua, "", materia)}
+    <div class="filtri">${chipMaterie(lingua, hubs, materia, null)}${faccettaCorso(lingua, hubs, materia, corso)}${menuOrdina(base, ordine)}</div>
+    ${fascia(`Appunti di ${nomeH1}`, `${totale} template di studio da aprire in Fluera.`)}
+    ${sezioneTutti(semi, navPagine(base, pagina, pagine, ordine))}
+    ${intro}`,
+  });
+}
+
+/// Minuscolo e senza accenti: «Perché» si trova scrivendo «perche».
+const perCercare = (s: string) => s.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+
+/// Tutti i semi indicizzabili di una lingua, fino a CERCA_MAX.
+async function semiDellaLingua(lingua: string): Promise<EsitoRpc<SemeWeb>> {
+  const primo = await rpcWeb<SemeWeb>("list_web_seeds", { p_lingua: lingua, p_limit: 100, p_offset: 0 });
+  if (!primo.ok) return primo;
+  const totale = Math.min(Number(primo.rows[0]?.totale ?? 0) || 0, CERCA_MAX);
+  const altri = [];
+  for (let off = 100; off < totale; off += 100) {
+    altri.push(rpcWeb<SemeWeb>("list_web_seeds", { p_lingua: lingua, p_limit: 100, p_offset: off }));
+  }
+  const rows = [...primo.rows];
+  for (const e of await Promise.all(altri)) {
+    if (!e.ok) return e;
+    rows.push(...e.rows);
+  }
+  return { ok: true, rows: semiValidi(rows) };
+}
+
+/// /{lingua}/appunti/cerca?q= — sempre noindex (e Disallow in robots.txt):
+/// ogni parola cercata sarebbe una pagina sottile. Cerca SOLO fra i semi
+/// indicizzabili (list_web_seeds), nel titolo, nella descrizione, nel corso e
+/// nel nome della materia.
+async function paginaCerca(lingua: string, qRaw: string | null, materia: string | null): Promise<Response> {
+  // Gli elenchi servono ai chip delle materie, e dicono se la lingua (o la
+  // materia chiesta) ha un catalogo.
+  const h = await rpcWeb<HubWeb>("list_web_hubs", { p_lingua: lingua });
+  if (!h.ok) return rispostaGuasto(`list_web_hubs(${lingua}): ${h.motivo}`);
+  const hubs = hubValidi(h.rows);
+  if (hubs.length === 0 && lingua !== "it") return nonTrovata();
+  if (materia && !hubs.some((x) => x.materia_slug === materia && x.corso_slug === null)) return nonTrovata();
+  const q = (qRaw ?? "").trim();
+  const n = [...q].length;
+  let esito = "";
+  let sotto = "Cerca per titolo, corso o materia.";
+  if (n > 0 && (n < 2 || n > 80)) {
+    esito = statoVuoto("search", "Cerca template di studio", "Scrivi da due a ottanta caratteri.", null);
+  } else if (n > 0) {
+    const e = await semiDellaLingua(lingua);
+    if (!e.ok) return rispostaGuasto(`ricerca (${lingua}): ${e.motivo}`);
+    const parole = perCercare(q).split(/\s+/).filter(Boolean);
+    const trovati = e.rows.filter((r) => {
+      if (materia && r.materia_slug !== materia) return false;
+      const testo = perCercare(
+        [r.title, r.description, r.course, r.materia_slug ? MATERIE[r.materia_slug]?.it : null].filter(Boolean).join(" "),
+      );
+      return parole.every((p) => testo.includes(p));
+    });
+    sotto = trovati.length === 1 ? "1 template trovato." : `${trovati.length} template trovati.`;
+    esito = trovati.length === 0
+      ? statoVuoto("eco", `Nessun risultato per "${q}"`, "Prova con un'altra materia, o azzera i filtri per vedere tutto.", {
+        testo: "Azzera filtri",
+        href: urlElenco(lingua),
+      })
+      : sezioneTutti(
+        trovati.slice(0, SEMI_PER_PAGINA),
+        trovati.length > SEMI_PER_PAGINA ? `<p class="altri">Ci sono altri risultati: prova con una parola in più.</p>` : "",
+        "Risultati",
+      );
+  }
+  return paginaWeb({
+    lingua,
+    titolo: `${n ? `«${q}» · ` : ""}Cerca template di studio · Fluera`,
+    descrizione: "Cerca fra i template di studio da aprire in Fluera.",
+    self: null,
+    siIndicizza: false, // la ricerca: mai su Google
+    corpo: `<nav class="briciole" aria-label="Percorso"><a href="${urlElenco(lingua)}">Appunti</a><span class="sep" aria-hidden="true">›</span><span aria-current="page">Cerca</span></nav>
+    ${formCerca(lingua, q, materia)}
+    <div class="filtri">${chipMaterie(lingua, hubs, materia, q)}</div>
+    ${fascia(n ? `Risultati per «${esc(q)}»` : "Cerca template di studio", sotto)}
+    ${esito}`,
+  });
+}
+
+// ── Impronta del build (/.well-known/fluera-build) ──────────────────────────
+// Lo sha256 dei BYTE del file in esecuzione, calcolato da crypto.subtle: per
+// gli stessi byte è identico per costruzione a `sha256sum index.ts`. Se la
+// piattaforma servisse il file riscritto (transpilato), l'impronta diverge e
+// il cancello va ROSSO — mai un verde inventato. Una lettura per isolate; un
+// fallimento non si memorizza, così la richiesta dopo ritenta.
+type Impronta = { sha256: string | null; file: string; motivo?: string };
+let _impronta: Promise<Impronta> | null = null;
+
+async function calcolaImpronta(): Promise<Impronta> {
+  const file = new URL(import.meta.url).pathname.split("/").pop() ?? "";
+  try {
+    const byte = await Deno.readFile(new URL(import.meta.url));
+    const d = new Uint8Array(await crypto.subtle.digest("SHA-256", byte));
+    return { sha256: Array.from(d, (b) => b.toString(16).padStart(2, "0")).join(""), file };
+  } catch (e) {
+    return { sha256: null, file, motivo: `lettura del sorgente fallita: ${e}` };
+  }
+}
+
+async function improntaBuild(): Promise<Impronta> {
+  _impronta ??= calcolaImpronta();
+  const v = await _impronta;
+  if (v.sha256 === null) _impronta = null;
+  return v;
 }
 
 const publicUrl = (p: string) => `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${p}`;
@@ -980,46 +2329,49 @@ function renderCollabPage(
 }
 
 // ── sitemap ──────────────────────────────────────────────────────────────────
-// Elenca i pack ufficiali/curati leggendoli con la chiave ANON: quello che la
-// RLS non lascia vedere non finisce nella sitemap, per costruzione. Un guasto
-// non deve mai restituire una sitemap VUOTA spacciata per valida — un urlset
-// senza URL dice al motore «non ho niente», e deindicizza. Quindi su errore si
-// risponde 503: il crawler ritenta, non conclude.
-const SITEMAP_LIMIT = 5000;
+// Semi ed elenchi da list_web_sitemap (213): la stessa regola delle pagine,
+// letta con la chiave ANON. Un guasto non deve mai restituire una sitemap
+// VUOTA spacciata per valida — un urlset senza URL dice al motore «non ho
+// niente», e deindicizza. Quindi su errore si risponde 503: il crawler
+// ritenta, non conclude.
+type RigaSitemap = { tipo: string; lingua: string | null; path: string; lastmod: string | null };
+/// Il path di un elenco come lo scrive la 213 ('/{lingua}/{materia}[/{corso}]'):
+/// la pagina vive sotto /{lingua}/appunti/…/.
+const RE_PATH_HUB = /^\/([a-z]{2,3})\/([a-z]{2,20})(?:\/((?=[a-z0-9-]{1,60}$)[a-z0-9]+(?:-[a-z0-9]+)*))?$/;
+const RE_PATH_SEME = new RegExp(`^/s/(${HASH_RE.source})$`);
 
 async function sitemapResponse(): Promise<Response> {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     return new Response("sitemap unavailable", { status: 503 });
   }
   try {
-    // Via RPC, non con una SELECT sulla tabella: in produzione la lettura
-    // diretta risponde `42501 permission denied` con la chiave anon (misurato
-    // il 2026-08-06). L'RPC `list_official_seed_urls` (migration 135) espone
-    // SOLO hash + updated_at dei pack ufficiali pubblicamente visibili.
-    const resp = await fetch(
-      `${SUPABASE_URL}/rest/v1/rpc/list_official_seed_urls`,
-      {
-        method: "POST",
-        headers: {
-          apikey: SUPABASE_ANON_KEY,
-          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify({ p_limit: SITEMAP_LIMIT }),
-      },
-    );
-    if (!resp.ok) throw new Error(`REST ${resp.status}`);
-    const rows = (await resp.json()) as Array<
-      { hash: string; updated_at: string | null }
-    >;
-    const urls = rows
-      .filter((r) => HASH_RE.test(r.hash))
+    const e = await rpcWeb<RigaSitemap>("list_web_sitemap", {}, 8000);
+    if (!e.ok) throw new Error(e.motivo);
+    const giorno = (s: string | null) => (s && /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : null);
+    const indici = new Map<string, string | null>();
+    const voci: Array<{ loc: string; lastmod: string | null }> = [];
+    for (const r of e.rows) {
+      if (!r || typeof r.path !== "string") continue;
+      const lm = giorno(r.lastmod);
+      const hub = r.tipo === "hub" ? r.path.match(RE_PATH_HUB) : null;
+      if (hub) {
+        voci.push({ loc: urlElenco(hub[1], hub[2], hub[3]), lastmod: lm });
+        // L'indice di una lingua è indicizzabile appena esiste un suo elenco.
+        const prima = indici.get(hub[1]);
+        indici.set(hub[1], prima === undefined || (lm && (!prima || lm > prima)) ? lm : prima);
+      } else if (r.tipo === "seme" && RE_PATH_SEME.test(r.path)) {
+        voci.push({ loc: `${SHARE}${r.path}`, lastmod: lm });
+      }
+    }
+    const tutte = [...[...indici].map(([l, lm]) => ({ loc: urlElenco(l), lastmod: lm })), ...voci];
+    // ⚠️ Zero righe = 503, come promette la 135 (righe 56-60): un urlset vuoto
+    // dice al motore «non ho niente» e deindicizza. Fino al 2026-09-24 qui
+    // usciva 200 vuoto (misurato dal vivo).
+    if (tutte.length === 0) throw new Error("zero pagine indicizzabili");
+    const urls = tutte
       .map((r) => {
-        const lastmod = r.updated_at
-          ? `\n    <lastmod>${esc(r.updated_at.slice(0, 10))}</lastmod>`
-          : "";
-        return `  <url>\n    <loc>https://share.fluera.dev/s/${esc(r.hash)}</loc>${lastmod}\n  </url>`;
+        const lastmod = r.lastmod ? `\n    <lastmod>${esc(r.lastmod)}</lastmod>` : "";
+        return `  <url>\n    <loc>${esc(r.loc)}</loc>${lastmod}\n  </url>`;
       })
       .join("\n");
     return new Response(
@@ -1092,8 +2444,11 @@ async function ogImageResponse(hash: string): Promise<Response> {
   // Resolve the base image first — it doubles as the graceful-fallback target.
   let baseUrl = OG_FALLBACK;
   try {
-    const row = await fetchTemplate(hash);
-    if (row) {
+    const esito = await fetchTemplate(hash);
+    const row = esito.tipo === "trovato" ? esito.row : null;
+    // 🔞 Non-general: nessuna miniatura né titolo nemmeno nell'immagine —
+    // solo il ripiego generico, come la pagina.
+    if (row && row.content_maturity === "general") {
       baseUrl = row.og_path
         ? publicUrl(row.og_path)
         : row.thumb_path
@@ -1129,6 +2484,18 @@ async function ogImageResponse(hash: string): Promise<Response> {
 // ricopia in un Uint8Array su ArrayBuffer: una copia da poche centinaia di KB,
 // irrilevante. Finché il modulo era importato dinamicamente il tipo era `any` e
 // niente di tutto questo si vedeva — l'import statico l'ha fatto emergere.
+/// I numeri stampati nell'og.png, fuori da resvg perché il cancello li possa
+/// leggere senza WASM. Niente install_count (gonfiabile, S7) e il voto solo
+/// sopra il tetto.
+export function ogNumeri(row: SeedRow): { stats: string; showStar: boolean } {
+  const concepts = Math.max(0, row.concept_count ?? 0);
+  const rating = votoMostrabile(row);
+  const parts: string[] = [];
+  if (rating > 0) parts.push(rating.toFixed(1));
+  if (concepts > 0) parts.push(`${concepts} concett${concepts === 1 ? "o" : "i"}`);
+  return { stats: parts.join("     ·     "), showStar: rating > 0 };
+}
+
 async function buildOgPng(
   row: SeedRow,
   baseUrl: string,
@@ -1141,19 +2508,7 @@ async function buildOgPng(
     (row.title ?? "Template di studio").trim() || "Template di studio",
     30,
   );
-  const concepts = Math.max(0, row.concept_count ?? 0);
-  const installs = Math.max(0, row.install_count ?? 0);
-  const rating = (row.rating_count ?? 0) > 0
-    ? (row.rating_sum ?? 0) / (row.rating_count ?? 1)
-    : 0;
-  const parts: string[] = [];
-  if (rating > 0) parts.push(rating.toFixed(1));
-  if (installs > 0) {
-    parts.push(`${fmtIt(installs)} student${installs === 1 ? "e" : "i"}`);
-  }
-  if (concepts > 0) parts.push(`${concepts} concett${concepts === 1 ? "o" : "i"}`);
-  const stats = parts.join("     ·     ");
-  const showStar = rating > 0;
+  const { stats, showStar } = ogNumeri(row);
   const statsX = showStar ? 110 : 64;
   // hand-coded 5-point star (resvg renders only fontBuffers glyphs → no emoji).
   const star =
@@ -1205,93 +2560,368 @@ function mimeOf(b: Uint8Array): string {
   if (b[0] === 0xff && b[1] === 0xd8) return "image/jpeg";
   return "image/png";
 }
-// Italian thousands shorthand: reuse fmt() but comma-decimal ("1,2k").
-function fmtIt(n: number): string {
-  return fmt(n).replace(".", ",");
-}
 function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s;
 }
 
 // ── Rendering ───────────────────────────────────────────────────────────────
 
-function renderPage(
-  row: SeedRow,
-  hash: string,
-  ogImageUrl: string,
-  platform: "ios" | "android" | "other",
-  ref: string,
-): string {
-  // C1: canonical share link carries the OPTIONAL "?ref={code}" so the app's
-  // Universal/App-Link open + any onward reshare keep the attribution chain.
-  const self = `https://share.fluera.dev/s/${hash}${ref ? `?ref=${encodeURIComponent(ref)}` : ""}`;
-  const title = (row.title ?? "Template di studio").trim() || "Template di studio";
-  const author = row.is_official ? "Fluera" : row.author_code ? `@${row.author_code.slice(0, 8)}` : "Anonimo";
-  const concepts = Math.max(0, row.concept_count ?? 0);
-  const installs = Math.max(0, row.install_count ?? 0);
-  const rating = (row.rating_count ?? 0) > 0 ? (row.rating_sum ?? 0) / (row.rating_count ?? 1) : 0;
-  const ratingN = Math.max(0, row.rating_count ?? 0);
+/// Il voto medio, o 0 se non si deve mostrare (sotto RATING_MIN_VOTI).
+function votoMostrabile(row: SeedRow): number {
+  const n = Math.max(0, row.rating_count ?? 0);
+  return n >= RATING_MIN_VOTI ? (row.rating_sum ?? 0) / n : 0;
+}
 
-  // SOCIAL PROOF in the unfurl: crawlers render og:title / og:description but
-  // NOT the chips below — so the live counts must be folded INTO those tags or
-  // they never reach the chat-preview card. Build a compact proof prefix
-  // (e.g. "★4.8 · 12k installazioni · 5 concetti") and prepend it.
-  const proofParts = [
-    rating > 0 ? `★${rating.toFixed(1)}${ratingN > 0 ? ` (${fmt(ratingN)})` : ""}` : "",
-    installs > 0 ? `${fmt(installs)} student${installs === 1 ? "e" : "i"}` : "",
-    concepts > 0 ? `${concepts} concett${concepts === 1 ? "o" : "i"}` : "",
-  ].filter(Boolean);
-  const proof = proofParts.join(" · ");
+/// JSON dentro un <script> inline: `JSON.stringify` da solo non basta, perché
+/// una stringa con «</script>» chiuderebbe il tag. Si scappano «<», «>», «&»
+/// e i due separatori di riga che i vecchi parser JS non accettano.
+export function jsonPerScript(v: unknown): string {
+  return JSON.stringify(v)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
 
-  const baseDescription = (row.description ?? "").trim() ||
-    `Un template di studio${row.discipline ? ` di ${row.discipline}` : ""} con ${concepts} concett${concepts === 1 ? "o" : "i"}. Installalo in Fluera e parte un ripasso programmato — il trapianto cognitivo nel tuo modello di studio.`;
-  // og:* / twitter:* SOCIAL-PROOF-augmented strings (the card). On-page <title>
-  // and the visible <p class="desc"> stay clean (chips already show the proof).
-  const ogTitle = proof ? `${title} · ${proof}` : title;
-  const ogDescription = proof ? `${proof} — ${baseDescription}` : baseDescription;
+/// I link verso l'app e verso gli store di una pagina /s/, e lo script che
+/// sceglie quello giusto NEL BROWSER.
+///
+/// 📱 PERCHÉ NEL BROWSER (S6, 2026-09-24): prima il server sceglieva dallo
+/// user-agent, ma `html()` mette la pagina 120 s nella cache di bordo con
+/// Vary solo su Accept-Language — la cache poteva servire la variante Android
+/// a un computer, e a Google una pagina diversa da quella degli utenti. Ora
+/// l'HTML è identico byte per byte per ogni user-agent.
+///
+/// 🏪 STORE CHIUSO (S8): come /get, /i, /p, /collab e /r, Play solo con
+/// ANDROID_STORE_LIVE === "true", altrimenti /beta — Play oggi risponde 404.
+///
+/// Perché intent:// su Android: navigare verso l'URL della pagina stessa la
+/// RICARICA soltanto, e su iOS gli Universal Links non scattano su una
+/// navigazione nello stesso dominio. L'intent apre l'app se c'è (con questo
+/// URL, ref compreso), altrimenti Chrome segue S.browser_fallback_url.
+function collegamentiSeme(rowHash: string, ref: string) {
+  const androidLive = (Deno.env.get("ANDROID_STORE_LIVE") ?? "") === "true";
+  const referrer = `s=${rowHash}${ref ? `&ref=${ref}` : ""}`;
+  const playUrl = androidLive
+    ? `https://play.google.com/store/apps/details?id=${BUNDLE_ID}&referrer=${encodeURIComponent(referrer)}`
+    : null;
+  const iosFrag = `s=${rowHash}${ref ? `&ref=${encodeURIComponent(ref)}` : ""}`;
+  const iosUrl = APPLE_APP_ID ? `https://apps.apple.com/app/id${APPLE_APP_ID}#${iosFrag}` : null;
+  const refQ = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+  // Il link che l'app riceve: porta il ref, perché l'attribuzione è sua.
+  const appLink = `https://share.fluera.dev/s/${rowHash}${refQ}`;
+  const androidIntent = `intent://share.fluera.dev/s/${rowHash}${refQ}#Intent;scheme=https;package=${BUNDLE_ID};S.browser_fallback_url=${
+    encodeURIComponent(playUrl ?? `${SITE}/beta`)
+  };end`;
+  const script = `<script>
+    (function () {
+      var c = ${jsonPerScript({ android: androidIntent, ios: iosUrl, apri: "Apri in Fluera" })};
+      var ua = navigator.userAgent || "";
+      var a = document.getElementById("apri");
+      if (!a) return;
+      var h = /iphone|ipad|ipod/i.test(ua) ? c.ios : /android/i.test(ua) ? c.android : null;
+      if (h) { a.setAttribute("href", h); a.textContent = c.apri; }
+    })();
+  </script>`;
+  return { playUrl, iosUrl, appLink, script };
+}
 
-  // C1 ref forwarding: thread "ref" into BOTH the Play Store referrer payload
-  // and the iOS app-argument / fragment so the install attributes to the sharer.
-  const referrer = `s=${hash}${ref ? `&ref=${ref}` : ""}`;
-  const playUrl = `https://play.google.com/store/apps/details?id=${BUNDLE_ID}&referrer=${encodeURIComponent(referrer)}`;
-  const iosFrag = `s=${hash}${ref ? `&ref=${encodeURIComponent(ref)}` : ""}`;
-  const iosUrl = APPLE_APP_ID ? `https://apps.apple.com/app/id${APPLE_APP_ID}#${iosFrag}` : SITE;
-  // COLD-MOBILE CTA. A same-URL "try the app first" JS hop can never work
-  // from this page: on Android navigating to the page's own URL just RELOADS
-  // it (the new document commits in <700ms on any decent network, killing the
-  // store-fallback timer — a CTA that reloads the page instead of converting),
-  // and iOS Universal Links deliberately do not trigger on same-domain
-  // navigation. So, no JS:
-  //   • Android → a Chrome `intent://` URL: opens the app when installed
-  //     (delivering this exact /s URL, ref included), else the browser follows
-  //     S.browser_fallback_url to the Play page (which carries seed + ref in
-  //     the install referrer). Handled natively by Chrome & friends.
-  //   • iOS → the App Store directly (the apple-itunes-app Smart App Banner
-  //     above covers the installed-app case); marketing site if no store id.
-  //   • Desktop/other → the marketing site.
-  const androidIntent = `intent://share.fluera.dev/s/${hash}${
-    ref ? `?ref=${encodeURIComponent(ref)}` : ""
-  }#Intent;scheme=https;package=${BUNDLE_ID};S.browser_fallback_url=${encodeURIComponent(playUrl)};end`;
-  const primaryHref = platform === "android"
-    ? androidIntent
-    : platform === "ios"
-      ? iosUrl
-      : SITE;
-  const primaryLabel = platform === "other" ? "Scopri Fluera" : "Apri in Fluera";
+/// Il meta del banner di Safari: SOLO con un id vero. Prima usciva
+/// «app-id=fluera», che non è un id App Store.
+function metaAppleItunes(appLink: string): string {
+  return APPLE_APP_ID
+    ? `\n  <meta name="apple-itunes-app" content="app-id=${esc(APPLE_APP_ID)}, app-argument=${esc(appLink)}" />`
+    : "";
+}
 
-  const chips = [
-    row.discipline ? chip(row.discipline) : "",
-    concepts > 0 ? chip(`${concepts} concetti`) : "",
-    installs > 0 ? chip(`${fmt(installs)} student${installs === 1 ? "e" : "i"}`) : "",
-    rating > 0 ? chip(`★ ${rating.toFixed(1)}`) : "",
-  ].join("");
+/// og:image (S9): se la riga ha og_path, l'immagine nello Storage — senza far
+/// girare resvg a ogni unfurl (Deno Deploy Free: 10 ore di CPU al mese).
+/// Le dimensioni si dichiarano solo dove sono VERE: /s/{hash}/og.png compone
+/// a 1200×630, e `<hash>-og.png` è il percorso che l'app carica dopo
+/// `SeedThumbnailRenderer.renderOgImage` (1200×630 fissi). Un
+/// `official/<hash>_og.png` viene da `publish_curated_seed.mjs --og`, cioè da
+/// un file qualunque: lì niente dimensioni.
+function ogImmagine(row: SeedRow): { url: string; dimensioni: boolean } {
+  if (row.og_path) {
+    return {
+      url: publicUrl(row.og_path),
+      dimensioni: /^[A-Za-z0-9]+-og\.png$/.test(row.og_path),
+    };
+  }
+  return { url: `https://share.fluera.dev/s/${row.hash}/og.png`, dimensioni: true };
+}
 
+/// 🔞 La pagina di un seme NON general: risolve (un link non deve morire, 070)
+/// ma non porta titolo, descrizione, immagine, autore né og specifici.
+function renderPaginaRiservata(row: SeedRow, ref: string): string {
+  const self = `https://share.fluera.dev/s/${row.hash}`;
+  const l = collegamentiSeme(row.hash, ref);
+  const title = "Contenuto disponibile nell'app";
+  const desc = "Questo contenuto è disponibile nell'app Fluera.";
   return `<!doctype html>
 <html lang="it">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
   <title>${esc(title)} · Fluera</title>
+  <meta name="description" content="${esc(desc)}" />
+  <link rel="canonical" href="${esc(self)}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="Fluera" />
+  <meta property="og:url" content="${esc(self)}" />
+  <meta property="og:title" content="Fluera" />
+  <meta property="og:description" content="${esc(desc)}" />
+  <meta property="og:image" content="${esc(OG_FALLBACK)}" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Fluera" />
+  <meta name="twitter:description" content="${esc(desc)}" />
+  <meta name="twitter:image" content="${esc(OG_FALLBACK)}" />${metaAppleItunes(l.appLink)}${testaWeb(`
+    .riservata{max-width:30rem;padding-top:clamp(24px,8vw,72px)}
+    .riservata h1{font-size:clamp(1.75rem,9vw,3rem)}
+    p.desc{margin:18px 0 32px;color:var(--muted);font-size:1.0625rem}
+    .cta{display:flex;flex-direction:column;gap:12px}`)}
+</head>
+<body>
+  ${testata()}
+  <main class="in"><div class="riservata">
+    <h1>${esc(title)}</h1>
+    <p class="desc">Per vederlo apri il link in Fluera.</p>
+    <div class="cta">
+      <a class="btn primary" id="apri" href="${esc(SITE)}">Scopri Fluera</a>
+      ${l.playUrl ? `<a class="btn ghost" href="${esc(l.playUrl)}">Google Play</a>` : `<a class="btn ghost" href="${esc(SITE)}/beta">Entra nella beta</a>`}
+      ${l.iosUrl ? `<a class="btn ghost" href="${esc(l.iosUrl)}">App Store</a>` : ""}
+    </div>
+  </div></main>
+  <footer class="piede"><div class="in"><a href="https://share.fluera.dev/report?hash=${esc(row.hash)}">Segnala questo contenuto</a></div></footer>
+  ${l.script}
+</body>
+</html>`;
+}
+
+/// La lingua del contenuto di un seme come tag BCP 47 canonico, o null se
+/// `locale` non è un tag valido.
+/// ⚠️ È un'APPROSSIMAZIONE: dall'app `locale` è la lingua dell'INTERFACCIA di
+/// chi pubblica (_study_seed.dart: Localizations.languageCode), non quella
+/// degli appunti. Per i pack ufficiali — gli unici su Google — la dichiara chi
+/// li pubblica (publish_curated_seed.mjs --locale).
+export function linguaContenuto(row: { locale: string | null }): string | null {
+  const l = (row.locale ?? "").trim();
+  if (!/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*$/.test(l)) return null;
+  try {
+    return Intl.getCanonicalLocales(l)[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/// ` lang="…"` per un blocco del seme, o "" quando è italiano come la pagina.
+function attrLingua(row: { locale: string | null }): string {
+  const l = linguaContenuto(row);
+  return l && l.split("-")[0].toLowerCase() !== "it" ? ` lang="${esc(l)}"` : "";
+}
+
+/// 🧾 Dati strutturati (F1, 2026-09-24), SOLO per le pagine indicizzabili:
+/// il chiamante decide, qui non si ricontrolla. Niente aggregateRating né
+/// review: sono voti raccolti da noi sul nostro prodotto, cioè le recensioni
+/// «auto-servite» che le regole di Google escludono dai risultati arricchiti.
+/// jsonPerScript e non JSON.stringify: un titolo con «</script>» chiuderebbe
+/// il tag e il resto diventerebbe HTML.
+function jsonLdSeme(
+  row: SeedRow,
+  d: {
+    self: string;
+    title: string;
+    description: string;
+    image: string;
+    briciole: Array<{ nome: string; url: string }>;
+    materia: string | null;
+    corso: string | null;
+    scheda: SchedaWeb | null;
+  },
+): string {
+  const tags = etichette(d.scheda);
+  const dati = {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "BreadcrumbList",
+        // Le briciole vere: Fluera › Appunti › Materia › Corso › titolo, solo
+        // verso elenchi che esistono.
+        itemListElement: [{ nome: "Fluera", url: SITE }, ...d.briciole, { nome: d.title, url: d.self }]
+          .map((b, i) => ({ "@type": "ListItem", position: i + 1, name: b.nome, item: b.url })),
+      },
+      {
+        "@type": "LearningResource",
+        name: d.title,
+        description: d.description,
+        image: d.image,
+        // La stessa scelta del lang dei blocchi: senza tag valido il contenuto
+        // eredita lang="it" dalla pagina, e il markup dice lo stesso.
+        inLanguage: linguaContenuto(row) ?? "it",
+        url: d.self,
+        isAccessibleForFree: (row.price_cents ?? 0) === 0,
+        publisher: { "@type": "Organization", name: "Fluera", url: SITE },
+        ...(d.materia ? { about: { "@type": "Thing", name: d.materia } } : {}),
+        ...(tags.length ? { keywords: tags.join(", ") } : {}),
+        ...(d.scheda?.created_at ? { dateCreated: d.scheda.created_at } : {}),
+        ...(d.scheda?.updated_at ? { dateModified: d.scheda.updated_at } : {}),
+        ...(d.corso ? { educationalLevel: d.corso } : {}),
+      },
+    ],
+  };
+  return `\n  <script type="application/ld+json">${jsonPerScript(dati)}</script>`;
+}
+
+/// Le etichette della scheda: la 218 le pulisce già (8, da 40 caratteri).
+const etichette = (s: SchedaWeb | null): string[] =>
+  Array.isArray(s?.tags) ? s.tags.filter((t): t is string => typeof t === "string" && t.trim() !== "").slice(0, 8) : [];
+
+/// «Ti potrebbero interessare», «Tutti gli appunti di …» e il catalogo: solo
+/// sulle indicizzabili.
+function sezioneCorrelati(v: Vicini): string {
+  const schede = v.correlati.map((r) => schedaSeme(r, false)).join("");
+  const elenco = schede
+    ? `<h2 id="t-correlati">Ti potrebbero interessare</h2>${striscia("Ti potrebbero interessare", schede)}`
+    : "";
+  const tutti = v.tutti ? `<p><a href="${esc(v.tutti.href)}">Tutti gli appunti di ${esc(v.tutti.nome)} →</a></p>` : "";
+  return `<nav class="correlati" aria-label="Altri template">${elenco}<div class="link-el">${tutti}<p><a href="${
+    esc(v.catalogo)
+  }">Tutto il catalogo →</a></p></div></nav>`;
+}
+
+function renderPage(
+  row: SeedRow,
+  ref: string,
+  vicini: Vicini,
+  scheda: SchedaWeb | null,
+): string {
+  // S3: UN indirizzo, senza query. Il ref prima finiva qui dentro, e ogni
+  // condivisione creava per Google una pagina diversa; ora vive solo nei link
+  // verso l'app e gli store (collegamentiSeme) e nell'app-argument.
+  const hash = row.hash;
+  const self = `https://share.fluera.dev/s/${hash}`;
+  const siIndicizza = indicizzabile(row);
+  const og = ogImmagine(row);
+  const l = collegamentiSeme(hash, ref);
+  const title = (row.title ?? "Template di studio").trim() || "Template di studio";
+  // Come l'app: «@» + 6 caratteri del codice (MW:179-207). Un autore non
+  // ufficiale arriva solo su una /s/ noindex.
+  const author = row.is_official ? "Fluera" : row.author_code ? `@${row.author_code.slice(0, 6)}` : "@anonimo";
+  const concepts = Math.max(0, row.concept_count ?? 0);
+  // S7: install_count MAI (si gonfia con chiamate anonime, 047). Sulle
+  // indicizzabili voto ed efficacia arrivano da get_web_scheda, già sotto le
+  // soglie della 218: 0 righe o un guasto = nessun numero, mai un ripiego su
+  // get_study_seed. Sulle noindex resta RATING_MIN_VOTI di share.
+  const votoUgc = votoMostrabile(row) > 0 ? votoMostrabile(row) : null;
+  const voto = siIndicizza ? numero(scheda?.voto_medio) : votoUgc;
+  const voti = siIndicizza ? numero(scheda?.voti) : votoUgc !== null ? Math.max(0, row.rating_count ?? 0) : null;
+  const nConcetti = numero(scheda?.concept_count) ?? (concepts > 0 ? concepts : null);
+  const eff = numero(scheda?.efficacia_pct);
+  const effN = numero(scheda?.efficacia_studenti);
+  const cat = categoriaDi(scheda?.category);
+  const tags = etichette(scheda);
+  // Tre stati (186): NULL = non dichiarato, e non si scrive niente.
+  const ia = row.ai_generated === true;
+  const lingua = attrLingua(row);
+  // In pagina la pagina degli appunti (miniatura 3:4) quando c'è: la card og
+  // ha il banner di un'altra grafica. Gli og:* restano quelli di ogImmagine.
+  const foglio = row.thumb_path ? publicUrl(row.thumb_path) : null;
+
+  // SOCIAL PROOF in the unfurl: crawlers render og:title / og:description but
+  // NOT the chips below — so the live counts must be folded INTO those tags or
+  // they never reach the chat-preview card. Build a compact proof prefix
+  // (e.g. "★4,8 (12) · 5 concetti") and prepend it.
+  const proofParts = [
+    voto !== null ? `★${votoIt(voto)}${voti !== null ? ` (${numeroIt(voti)})` : ""}` : "",
+    nConcetti !== null ? concetti(nConcetti) : "",
+  ].filter(Boolean);
+  const proof = proofParts.join(" · ");
+
+  // Il nome della materia, mai la chiave grezza («math»): nel chip e nella
+  // descrizione di ripiego, che finisce anche negli og e nel JSON-LD.
+  const disciplina = nomeDisciplina(row.discipline);
+  const disciplinaInFrase = disciplina && materiaDi(row.discipline) ? disciplina.toLowerCase() : disciplina;
+  const baseDescription = (row.description ?? "").trim() ||
+    `Un template di studio${disciplinaInFrase ? ` di ${disciplinaInFrase}` : ""} con ${concepts} concett${concepts === 1 ? "o" : "i"}. Installalo in Fluera e parte un ripasso programmato — il trapianto cognitivo nel tuo modello di studio.`;
+  // og:* / twitter:* SOCIAL-PROOF-augmented strings (the card). On-page <title>
+  // and the visible <p class="desc"> stay clean (chips already show the proof).
+  const ogTitle = proof ? `${title} · ${proof}` : title;
+  const ogDescription = proof ? `${proof} — ${baseDescription}` : baseDescription;
+  const descrizione = (row.description ?? "").trim();
+  const dove = vicini.corso ?? disciplina;
+
+  const distintivo = row.is_official
+    ? `<span class="distintivo uff">${ic("verified")}Ufficiale</span>`
+    : scheda?.is_featured === true
+    ? `<span class="distintivo evid">${ic("auto_awesome")}In evidenza</span>`
+    : "";
+  const materiaV = disciplina
+    ? vicini.hubMateria
+      ? `<a class="v materia" href="${esc(vicini.hubMateria)}">${esc(disciplina)}</a>`
+      : `<span class="v materia">${esc(disciplina)}</span>`
+    : `<span class="v">—</span>`;
+  // Il riquadro a tre caselle (TD:1139-1197) senza installazioni: il loro
+  // posto va ai concetti veri (nell'app «1» fisso) e alla materia.
+  const riquadro = `<div class="riquadro">
+          <div class="cella">${ic("star")}<span class="v"${voto === null ? ` title="Il voto compare da 5 voti"` : ""}>${
+    voto !== null ? votoIt(voto) : "—"
+  }</span><span class="e">Valutazione${voti !== null ? ` (${esc(numeroIt(voti))})` : ""}</span></div>
+          <div class="cella">${ic("hub")}<span class="v">${nConcetti !== null ? esc(numeroIt(nConcetti)) : "—"}</span><span class="e">Concetti</span></div>
+          <div class="cella">${ic(iconaMateria(materiaDi(row.discipline)))}${materiaV}<span class="e">Materia</span></div>
+        </div>`;
+  const briciole = vicini.briciole.map((b) => `<a href="${esc(b.url)}">${esc(b.nome)}</a>`).join(`<span class="sep" aria-hidden="true">›</span>`);
+
+  const dentro = `${testata(vicini.catalogo)}
+  <main class="in">
+    ${briciole ? `<nav class="briciole" aria-label="Percorso">${briciole}</nav>` : ""}
+    <div class="pack">
+      <figure class="pack-img"><span class="foglio-g">${
+    foglio
+      ? `<img src="${esc(foglio)}" alt="${esc(title)}" width="600" height="800" fetchpriority="high" />`
+      : `<span class="iniziale" aria-hidden="true">${esc([...title][0]?.toUpperCase() ?? "F")}</span>`
+  }</span></figure>
+      <div class="pack-info">
+        <div class="titolo-riga"><h1${lingua}>${esc(title)}</h1>${distintivo}</div>
+        ${ia ? `<span class="ia">Generato dall'IA</span>` : ""}
+        <p class="di">${ic("person")}di ${esc(author)}</p>
+        ${riquadro}
+        ${
+    eff !== null
+      ? `<div class="eff"><span class="pillola">${ic("trending")}+${Math.round(eff)}% ritenzione</span>${
+        effN !== null ? `<span>misurato su ${esc(numeroIt(effN))} studenti</span>` : ""
+      }</div>`
+      : ""
+  }
+        <div class="azioni">
+          <a class="btn primary" id="apri" href="${esc(SITE)}">Scopri Fluera</a>
+          ${l.playUrl ? `<a class="btn ghost" href="${esc(l.playUrl)}">Google Play</a>` : `<a class="btn ghost" href="${esc(SITE)}/beta">Entra nella beta</a>`}
+          ${l.iosUrl ? `<a class="btn ghost" href="${esc(l.iosUrl)}">App Store</a>` : ""}
+        </div>
+        <p class="segnala-riga"><a class="segnala" href="https://share.fluera.dev/report?hash=${esc(hash)}">${ic("flag")}Segnala</a></p>
+        ${
+    cat || tags.length
+      ? `<section class="blocco" aria-labelledby="t-argomenti"><h2 id="t-argomenti">Argomenti</h2><ul class="tag-l">${
+        cat ? `<li class="tag cat">${ic(cat[1])}${esc(cat[0])}</li>` : ""
+      }${tags.map((t) => `<li class="tag"${lingua}>${esc(t)}</li>`).join("")}</ul></section>`
+      : ""
+  }
+        <section class="blocco" aria-labelledby="t-descrizione"><h2 id="t-descrizione">Descrizione</h2>${
+    descrizione ? `<p class="desc"${lingua}>${esc(descrizione)}</p>` : `<p class="desc-vuota">Nessuna descrizione disponibile.</p>`
+  }</section>
+        <div class="nota">${ic("psychology_o")}<p>Aprendolo in Fluera, i concetti di questo template entrano nel tuo modello di studio, con un primo ripasso programmato per domani.</p></div>
+      </div>${siIndicizza ? `\n      ${sezioneCorrelati(vicini)}` : ""}
+    </div>
+  </main>
+  ${piede(hash)}`;
+
+  return `<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />${siIndicizza ? "" : `\n  <meta name="robots" content="noindex" />`}
+  <title>${esc(title)}${dove ? ` · ${esc(dove)}` : ""} · Fluera</title>
   <meta name="description" content="${esc(ogDescription)}" />
   <link rel="canonical" href="${esc(self)}" />
   <meta property="og:type" content="article" />
@@ -1299,59 +2929,365 @@ function renderPage(
   <meta property="og:url" content="${esc(self)}" />
   <meta property="og:title" content="${esc(ogTitle)}" />
   <meta property="og:description" content="${esc(ogDescription)}" />
-  <meta property="og:image" content="https://share.fluera.dev/s/${hash}/og.png" />
-  <meta property="og:image:width" content="1200" />
-  <meta property="og:image:height" content="630" />
+  <meta property="og:image" content="${esc(og.url)}" />${og.dimensioni ? `\n  <meta property="og:image:width" content="1200" />\n  <meta property="og:image:height" content="630" />` : ""}
   <meta property="og:image:alt" content="${esc(title)}" />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="${esc(ogTitle)}" />
   <meta name="twitter:description" content="${esc(ogDescription)}" />
-  <meta name="twitter:image" content="https://share.fluera.dev/s/${hash}/og.png" />
-  <meta name="apple-itunes-app" content="app-id=${esc(APPLE_APP_ID || "fluera")}, app-argument=${esc(self)}" />
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body { margin:0; background:#0a0a0b; color:#f4f4f5; font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-    .wrap { max-width:680px; margin:0 auto; padding:24px 20px 64px; }
-    .brand { display:flex; align-items:center; gap:8px; font-weight:600; color:#a1a1aa; margin-bottom:20px; }
-    .hero { width:100%; aspect-ratio:1200/630; border-radius:16px; overflow:hidden; background:#18181b; border:1px solid #ffffff14; }
-    .hero img { width:100%; height:100%; object-fit:cover; display:block; }
-    h1 { font-size:26px; line-height:1.25; margin:22px 0 6px; }
-    .by { color:#a1a1aa; font-size:14px; margin:0 0 14px; }
-    .chips { display:flex; flex-wrap:wrap; gap:8px; margin:0 0 18px; }
-    .chip { font-size:13px; color:#d4d4d8; background:#ffffff0f; border:1px solid #ffffff14; border-radius:999px; padding:5px 11px; }
-    p.desc { color:#d4d4d8; }
-    .cta { display:flex; flex-direction:column; gap:10px; margin-top:26px; }
-    .btn { display:flex; align-items:center; justify-content:center; gap:8px; text-decoration:none; font-weight:600; padding:15px 18px; border-radius:14px; }
-    .btn.primary { background:#6366f1; color:#fff; }
-    .btn.ghost { background:#ffffff0f; color:#f4f4f5; border:1px solid #ffffff1f; }
-    .note { color:#71717a; font-size:13px; text-align:center; margin-top:18px; }
-    .report { text-align:center; margin-top:22px; }
-    .report a { color:#71717a; font-size:13px; }
-    a { color:inherit; }
-  </style>
+  <meta name="twitter:image" content="${esc(og.url)}" />${metaAppleItunes(l.appLink)}${
+    siIndicizza
+      ? jsonLdSeme(row, {
+        self,
+        title,
+        description: baseDescription,
+        image: og.url,
+        briciole: vicini.briciole,
+        materia: disciplina,
+        corso: vicini.corso,
+        scheda,
+      })
+      : ""
+  }${testaWeb(STILE_CATALOGO + STILE_PACK)}
 </head>
 <body>
-  <div class="wrap">
-    <div class="brand">🌱 Fluera · Template di studio</div>
-    <div class="hero"><img src="${esc(ogImageUrl)}" alt="${esc(title)}" loading="eager" /></div>
-    <h1>${esc(title)}</h1>
-    <p class="by">di ${esc(author)}</p>
-    ${chips ? `<div class="chips">${chips}</div>` : ""}
-    <p class="desc">${esc(baseDescription)}</p>
-    <div class="cta">
-      <a class="btn primary" href="${esc(primaryHref)}">${esc(primaryLabel)}</a>
-      <a class="btn ghost" href="${esc(playUrl)}">Google Play</a>
-      ${APPLE_APP_ID ? `<a class="btn ghost" href="${esc(iosUrl)}">App Store</a>` : ""}
-    </div>
-    <p class="note">Installando in Fluera, i concetti di questo template vengono trapiantati nel tuo modello di studio — con un ripasso programmato per domani.</p>
-    <p class="report"><a href="https://share.fluera.dev/report?hash=${esc(hash)}">Segnala questo contenuto</a></p>
-  </div>
+  ${spriteIcone(dentro)}${dentro}
+  ${l.script}
 </body>
 </html>`;
 }
 
-const chip = (s: string) => `<span class="chip">${esc(s)}</span>`;
+// ── Lo stile delle pagine pubbliche: /s/, pagina riservata, elenchi ─────────
+// «Inkfolio», la grafica del catalogo dell'app (fluera_theme / marketplace_
+// theme.dart): carta crema, inchiostro caldo, titoli in Instrument Serif, un
+// solo accento blu e il giallo solo come decorazione. Da fluera.dev restano il
+// marchio, la testata, il piede e l'accento. I colori dell'app sono variabili
+// CSS, anche in scuro; i nomi di prima (--bg, --fg…) restano come alias. I
+// caratteri arrivano da fluera.dev (CORS aperto); i ripieghi hanno le
+// metriche misurate, così l'arrivo del font non sposta il testo. Solo CSS
+// inline: share non serve file statici. Titoli e nomi arrivano dal database:
+// overflow-wrap e colonne a minimo zero, così una parola lunga non allarga la
+// pagina a 360 px.
+const FONT_SITO = `${SITE}/fonts`;
+const STILE_WEB =
+  `@font-face{font-family:"Sora Fluera";src:url(${FONT_SITO}/Sora-Bold.woff2) format("woff2");font-weight:700;font-display:swap}` +
+  `@font-face{font-family:"Playfair Fluera";src:url(${FONT_SITO}/PlayfairDisplay-SemiBoldItalic.woff2) format("woff2");font-style:italic;font-weight:600;font-display:swap}` +
+  `@font-face{font-family:"Sora Fallback";src:local("Arial Bold"),local("Arial");font-weight:700;size-adjust:107.8%;ascent-override:90%;descent-override:26.9%;line-gap-override:0%}` +
+  `@font-face{font-family:"Playfair Fallback";src:local("Georgia Italic"),local("Georgia");font-style:italic;font-weight:600;size-adjust:95.2%;ascent-override:113.7%;descent-override:26.4%;line-gap-override:0%}` +
+  // Instrument Serif ha un solo peso: l'app chiede w600 (_serifStyle) e Flutter
+  // lo ispessisce in sintesi. I titoli chiedono 600 e il browser fa lo stesso;
+  // mai font-synthesis:none, o escono più sottili che nell'app.
+  `@font-face{font-family:"Instrument Serif";src:url(${FONT_SITO}/InstrumentSerif-Regular.woff2) format("woff2");font-weight:400;font-display:swap;unicode-range:U+0000-024F,U+2000-206F,U+20AC,U+2190-2193}` +
+  // Metriche misurate con fontTools (Instrument Serif contro Liberation
+  // Serif, che ha quelle di Times New Roman).
+  `@font-face{font-family:"Instrument Fallback";src:local("Times New Roman"),local("Liberation Serif");size-adjust:83.8%;ascent-override:118.1%;descent-override:37%;line-gap-override:0%}` +
+  `@font-face{font-family:"Caveat Fluera";src:url(${FONT_SITO}/Caveat-Regular.woff2) format("woff2");font-weight:400;font-display:swap}
+    :root{color-scheme:light dark;--carta:#FAF8F2;--carta-alta:#FFFFFF;--foglio:#FFFDF8;--lavata:#F7F3EB;--rialzo:#F1EBDD;--inchiostro:#23211B;--inchiostro-2:#6E6656;--accento:#2563EB;--accento-t:#2563EB;--accento-h:#1D4ED8;--accento-velo:#DCE6FB;--su-accento-velo:#16357A;--taupe:#EFE9DB;--filo:#E5DECE;--filo-2:#EFE8D9;--evidenziatore:#FFE55C;--stella-vuota:rgb(110 102 86/.45);--pal-sunset:#F0E1D7;--pal-sunset-t:#6E4A36;--pal-amber:#EEE6CF;--pal-amber-t:#5E4E2C;--pal-rose:#F0DFE2;--pal-rose-t:#6C3E48;--pal-grape:#E4DEEC;--pal-grape-t:#4C3F64;--serif:"Instrument Serif","Instrument Fallback",Georgia,"Times New Roman",serif;--mano:"Caveat Fluera",cursive;--sans:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;--bg:var(--carta);--sup:var(--foglio);--fg:var(--inchiostro);--forte:var(--inchiostro);--muted:var(--inchiostro-2);--dim:var(--inchiostro-2);--riga:var(--filo-2);--riga2:var(--filo);--acc:var(--accento-t);--btn:var(--accento);--btn-t:#FFFFFF;--btn-h:var(--accento-h);--img:var(--rialzo)}
+    @media(prefers-color-scheme:dark){:root{--carta:#221E16;--carta-alta:#322C22;--foglio:#2A251C;--lavata:#302B21;--rialzo:#3A3327;--inchiostro:#F2ECE0;--inchiostro-2:#A79E8A;--accento-t:#A8C7FA;--accento-h:#3B74F0;--accento-velo:#1E3054;--su-accento-velo:#C7D9FF;--taupe:#322D22;--filo:#3D3629;--filo-2:#322D23;--stella-vuota:rgb(167 158 138/.4);--pal-sunset:#43342B;--pal-sunset-t:#E6C7B4;--pal-amber:#3F3825;--pal-amber-t:#E2CFA0;--pal-rose:#422E33;--pal-rose-t:#E6C0C8;--pal-grape:#362F44;--pal-grape-t:#CCC0E0}}
+    *{box-sizing:border-box}
+    html{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;-webkit-text-size-adjust:100%}
+    body{margin:0;background:var(--carta);color:var(--inchiostro);font:16px/1.5 var(--sans);overflow-wrap:break-word}
+    a{color:var(--accento-t);text-underline-offset:3px}
+    .in{max-width:1168px;margin:0 auto;padding-inline:16px}
+    .sprite{position:absolute;width:0;height:0;overflow:hidden}
+    .ic{width:1em;height:1em;flex:none;fill:currentColor;vertical-align:middle}
+    .vh{position:absolute!important;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+    .testata{border-bottom:1px solid var(--filo-2)}
+    .testata .in{height:60px;display:flex;align-items:center;gap:16px}
+    .marchio{display:inline-flex;align-items:baseline;margin-right:auto;direction:ltr;color:var(--inchiostro);text-decoration:none;font-size:1.125rem;line-height:1;white-space:nowrap}
+    .marchio b{font-family:"Sora Fluera","Sora Fallback",system-ui,sans-serif;font-weight:700;letter-spacing:.052em}
+    .marchio i{margin-inline-start:.02em;font-family:"Playfair Fluera","Playfair Fallback",Georgia,serif;font-weight:600;letter-spacing:.026em}
+    .testata-nav{display:flex;align-items:center;gap:14px}
+    .sez{font:14px/1 var(--sans);color:var(--inchiostro-2);text-decoration:none}
+    .sez[aria-current]{color:var(--inchiostro);font-weight:600}
+    a.sez:hover{color:var(--inchiostro);text-decoration:underline}
+    .btn-beta{display:inline-flex;align-items:center;min-height:36px;padding:0 14px;border-radius:12px;background:var(--accento);color:#FFFFFF;font:600 14px/1 var(--sans);text-decoration:none;white-space:nowrap}
+    .btn-beta:hover{background:var(--accento-h)}
+    h1,h2,h3{margin:0;color:var(--inchiostro);font-family:var(--serif);font-weight:600;letter-spacing:0}
+    h1{font-size:28px;line-height:1.12;text-wrap:balance;overflow-wrap:anywhere}
+    :is(h1,h2,h3):is(:lang(ar),:lang(hi),:lang(ja),:lang(ko),:lang(zh)){font-family:var(--sans)}
+    p,li{text-wrap:pretty}
+    .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:48px;padding:0 20px;border-radius:12px;font:600 16px/1.2 var(--sans);text-align:center;text-decoration:none;transition:background-color 120ms ease-out,border-color 120ms ease-out,transform 120ms ease-out}
+    .btn.primary{background:var(--accento);color:#FFFFFF}
+    .btn.primary:hover{background:var(--accento-h)}
+    .btn.ghost{border:1px solid var(--filo);background:var(--carta);color:var(--inchiostro)}
+    .btn.ghost:hover{border-color:var(--inchiostro-2)}
+    :focus-visible{outline:2px solid var(--accento-t);outline-offset:3px}
+    .piede{margin-top:64px;border-top:1px solid var(--filo-2);font:14px/1.4 var(--sans);color:var(--inchiostro-2)}
+    .piede .in{display:flex;flex-wrap:wrap;gap:8px 24px;justify-content:space-between;align-items:center;padding-block:24px}
+    .piede a{color:var(--inchiostro-2);text-decoration:none}
+    .piede a:hover{color:var(--inchiostro);text-decoration:underline}
+    .vuoto{max-width:480px;margin:48px auto 24px;padding:0 24px;text-align:center}
+    .stato .vuoto{margin-top:120px}
+    .vuoto .cerchio{display:grid;place-items:center;width:76px;height:76px;margin:0 auto 18px;border-radius:50%;background:var(--lavata);color:var(--inchiostro-2)}
+    .vuoto .cerchio .ic{width:34px;height:34px}
+    .vuoto h1,.vuoto h2{font-size:20px;line-height:1.25}
+    .vuoto p{margin:8px 0 20px;font:14px/1.5 var(--sans);color:var(--inchiostro-2)}
+    .btn-tono{display:inline-flex;align-items:center;min-height:44px;padding:0 20px;border-radius:12px;background:var(--accento-velo);color:var(--su-accento-velo);font:600 14px/1 var(--sans);text-decoration:none}
+    @media(min-width:640px){.in{padding-inline:24px}}
+    @media(prefers-reduced-motion:no-preference){.btn:active{transform:scale(.98)}}
+    @media(prefers-reduced-motion:reduce){*{transition:none!important}}`;
+
+/// Le schede, le strisce e i filtri degli elenchi (e di «Ti potrebbero
+/// interessare» sulla /s/). Misure dell'app fino a 1023 px.
+/// Sotto i 1024 «Ordina» scende accanto al corso: nella riga dei chip toglieva
+/// spazio, e con tre materie la terza finiva tutta nella sfumatura.
+/// La fila dei chip e le strisce hanno un margine negativo e un padding che
+/// fanno posto all'anello del focus (2 + 3 px), che sborda e veniva tagliato. La
+/// lista è max-content perché il padding destro di un contenitore più stretto
+/// dei figli non entra nello scorrimento: a fine corsa l'ultimo chip restava
+/// nella sfumatura e l'ultima scheda attaccata al bordo. Da 1024 px le colonne
+/// delle strisce sono in % della lista, che quindi torna auto.
+const STILE_CATALOGO = `
+    main.cat{padding-top:2px}
+    nav.briciole{margin:14px 0 0;font:12px/1.5 var(--sans);color:var(--inchiostro-2)}
+    nav.briciole a{color:inherit;text-decoration:none}
+    nav.briciole a:hover{color:var(--inchiostro);text-decoration:underline}
+    nav.briciole .sep{margin:0 6px}
+    nav.briciole [aria-current]{color:var(--inchiostro)}
+    form.cerca{position:relative;display:flex;align-items:center;height:52px;margin:14px 0 0;border:1px solid var(--filo-2);border-radius:14px;background:var(--foglio)}
+    form.cerca:focus-within{border-color:var(--accento-t);box-shadow:0 0 0 .5px var(--accento-t)}
+    form.cerca .lente{position:absolute;left:16px;width:22px;height:22px;color:var(--inchiostro-2);pointer-events:none}
+    form.cerca input{flex:1;min-width:0;height:100%;padding:0 4px 0 50px;border:0;background:none;color:var(--inchiostro);font:16px/1 var(--sans);outline:none}
+    form.cerca input::placeholder{color:var(--inchiostro-2)}
+    form.cerca button{display:grid;place-items:center;width:44px;height:44px;margin-right:4px;border:0;border-radius:12px;background:none;color:var(--inchiostro-2);cursor:pointer}
+    form.cerca button .ic{width:22px;height:22px}
+    form.cerca button:hover{background:var(--lavata);color:var(--inchiostro)}
+    .filtri{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px 8px;margin-top:16px}
+    nav.chips{grid-column:1/-1;min-width:0;overflow-x:auto;scrollbar-width:none;-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 24px),transparent);mask-image:linear-gradient(to right,#000 calc(100% - 24px),transparent);margin:-4px 0 -4px -6px}
+    nav.chips:focus-within{-webkit-mask-image:none;mask-image:none}
+    nav.chips::-webkit-scrollbar{display:none}
+    nav.chips ul{display:flex;gap:8px;box-sizing:border-box;width:max-content;min-width:100%;margin:0;padding:6px 24px 6px 6px;list-style:none}
+    nav.chips a{scroll-margin-inline:24px}
+    details.faccetta{grid-column:1;justify-self:start}
+    details.ordina{grid-column:2}
+    a.chip{display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 14px;border:1px solid var(--filo-2);border-radius:999px;background:var(--lavata);color:var(--inchiostro-2);font:600 13px/1 var(--sans);white-space:nowrap;text-decoration:none;transition:background-color 120ms ease-out}
+    a.chip .ic{width:17px;height:17px}
+    a.chip:hover{background:var(--rialzo)}
+    a.chip[aria-current]{border-color:var(--accento-t);background:var(--accento);color:#FFFFFF;font-weight:700}
+    details.menu-a{position:relative;flex:none}
+    details.menu-a>summary{display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 8px 0 12px;border:1px solid var(--filo-2);border-radius:999px;background:var(--lavata);color:var(--inchiostro);font:600 12px/1 var(--sans);white-space:nowrap;list-style:none;cursor:pointer}
+    details.menu-a>summary::-webkit-details-marker{display:none}
+    details.menu-a>summary .ic{width:18px;height:18px;color:var(--inchiostro-2)}
+    details.menu-a>summary:hover,details.menu-a[open]>summary{background:var(--rialzo)}
+    details.faccetta.attiva>summary{border-color:var(--accento-t);background:var(--accento-velo);color:var(--su-accento-velo)}
+    details.faccetta.attiva>summary .ic{color:var(--su-accento-velo)}
+    .menu{position:absolute;z-index:20;top:calc(100% + 6px);right:0;width:max-content;min-width:220px;max-width:min(320px,calc(100vw - 32px));max-height:min(440px,70vh);overflow:auto;margin:0;padding:8px;list-style:none;border:1px solid var(--filo-2);border-radius:14px;background:var(--carta-alta);box-shadow:0 8px 24px rgb(0 0 0/.12)}
+    details.faccetta .menu{right:auto;left:0}
+    .menu a{display:flex;flex-direction:column;justify-content:center;gap:2px;min-height:40px;padding:6px 12px;border-radius:10px;color:var(--inchiostro);font:14px/1.3 var(--sans);text-decoration:none}
+    details.faccetta .menu a{flex-direction:row;align-items:center;justify-content:flex-start}
+    .menu a:hover{background:var(--lavata)}
+    .menu a[aria-current]{color:var(--accento-t);font-weight:600}
+    .menu small{color:var(--inchiostro-2);font-size:12px;font-weight:400}
+    .menu .conta{margin-left:8px;color:var(--inchiostro-2);font-weight:400}
+    .menu .gruppo{padding:10px 12px 4px;color:var(--inchiostro-2);font:600 11px/1.2 var(--sans);letter-spacing:.04em;text-transform:uppercase}
+    .menu [role=separator]{height:1px;margin:6px 4px;background:var(--filo-2)}
+    .fascia{display:flex;gap:10px;margin:22px 4px 4px}
+    .fascia .par{padding-top:2px;color:var(--inchiostro-2);font:600 26px/1 var(--serif);opacity:.45}
+    .fascia>div{min-width:0}
+    .stanghetta{display:block;width:46px;height:6px;margin:10px 0 12px;border-radius:999px;background:var(--evidenziatore)}
+    .fascia p{margin:0;color:var(--inchiostro-2);font:16px/1.45 var(--sans)}
+    .sez-testa{display:flex;align-items:flex-start;gap:8px;margin:22px 0 10px}
+    .sez-testa>.ic{width:19px;height:19px;margin-top:5px;color:var(--inchiostro-2)}
+    .sez-testa>div{flex:1;min-width:0}
+    .sez-testa h2{font-size:21px;line-height:1.2}
+    .sez-testa p{margin:2px 0 0;color:var(--inchiostro-2);font:12px/1.35 var(--sans)}
+    .vedi{display:inline-flex;align-items:center;gap:2px;min-height:48px;margin:-10px -8px -10px 0;padding:0 8px;color:var(--accento-t);font:600 14px/1 var(--sans);white-space:nowrap;text-decoration:none}
+    .vedi .ic{width:18px;height:18px}
+    .vedi:hover{text-decoration:underline}
+    .striscia{margin:-4px -16px 0;padding:6px 16px 10px;overflow-x:auto;scroll-snap-type:x mandatory;overscroll-behavior-x:contain;scroll-padding-inline:16px;scrollbar-width:thin}
+    .striscia:focus-visible{outline-offset:-2px}
+    .striscia ul{display:grid;grid-auto-flow:column;grid-auto-columns:150px;gap:10px;width:max-content;margin:0;padding:0;list-style:none}
+    .striscia li{display:flex;scroll-snap-align:start}
+    .striscia.evid ul{grid-auto-columns:260px;gap:14px}
+    ul.griglia{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:0;padding:0;list-style:none}
+    ul.griglia>li{display:flex;min-width:0}
+    a.scheda{display:flex;flex-direction:column;width:100%;min-width:0;border:1px solid var(--filo);border-radius:16px;background:var(--carta);color:var(--inchiostro);text-decoration:none;transition:border-color 120ms ease-out,transform 120ms ease-out}
+    a.scheda:hover{border-color:color-mix(in srgb,var(--inchiostro-2) 45%,transparent)}
+    a.scheda:hover .t,.eroe-a:hover h3{text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:3px}
+    .cornice{display:block;margin:10px 10px 0;padding:8px;border:1px solid var(--filo-2);border-radius:12px;background:repeating-linear-gradient(to bottom,transparent 0 10.5px,color-mix(in srgb,var(--filo-2) 60%,transparent) 10.5px 11px) var(--rialzo)}
+    .foglio{position:relative;display:block;aspect-ratio:4/3;overflow:hidden;border-radius:8px;background:var(--foglio)}
+    .foglio img,.e-foglio img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center}
+    .rigatura{position:absolute;inset:0;display:grid;place-items:center;background:repeating-linear-gradient(to bottom,transparent 0 10px,var(--filo) 10px 11px) var(--foglio)}
+    .rigatura .cat{width:30px;height:30px;color:color-mix(in srgb,var(--inchiostro-2) 28%,transparent)}
+    .fiducia{position:absolute;top:8px;left:8px;display:grid;place-items:center;width:22px;height:22px;border:1px solid var(--filo-2);border-radius:8px;background:var(--accento);color:#FFFFFF}
+    .fiducia .ic{width:13px;height:13px}
+    .fiducia.evid{background:var(--taupe);color:var(--inchiostro)}
+    .nuovo{position:absolute;top:8px;left:8px;padding:3px 7px;border:1px solid var(--filo-2);border-radius:8px;background:var(--taupe);color:var(--inchiostro);font:600 11px/1.2 var(--sans)}
+    .categoria{position:absolute;bottom:8px;left:8px;display:inline-flex;align-items:center;gap:4px;max-width:calc(100% - 16px);padding:3px 8px;border-radius:8px;background:rgb(0 0 0/.62);color:#FFFFFF;font:600 11px/1.3 var(--sans);white-space:nowrap}
+    .categoria .ic{width:12px;height:12px}
+    .testi{display:flex;flex-direction:column;flex:1;gap:5px;min-width:0;padding:9px 12px 11px}
+    .testi .t{overflow:hidden;font-size:15.5px;line-height:1.15;white-space:nowrap;text-overflow:ellipsis}
+    .autore{display:flex;align-items:center;gap:6px;min-width:0;color:var(--inchiostro-2);font:12px/1.3 var(--sans)}
+    .pallino{display:inline-grid;place-items:center;flex:none;width:20px;height:20px;border-radius:50%;font:700 9px/1 var(--sans)}
+    .pallino.p24{width:24px;height:24px;font-size:11px}
+    .pallino.sunset{background:var(--pal-sunset);color:var(--pal-sunset-t)}
+    .pallino.amber{background:var(--pal-amber);color:var(--pal-amber-t)}
+    .pallino.rose{background:var(--pal-rose);color:var(--pal-rose-t)}
+    .pallino.grape{background:var(--pal-grape);color:var(--pal-grape-t)}
+    .pillola{display:inline-flex;align-self:flex-start;align-items:center;gap:4px;padding:3px 8px;border:1px solid var(--filo-2);border-radius:8px;background:var(--taupe);color:var(--inchiostro);font:600 11px/1.3 var(--sans);white-space:nowrap}
+    .pillola .ic{width:13px;height:13px}
+    .stelle{display:inline-flex;align-items:center;color:var(--accento-t)}
+    .stelle .ic{width:13px;height:13px}
+    .stelle .vuota{color:var(--stella-vuota)}
+    .stelle .n{margin-left:4px;color:var(--inchiostro-2);font:11px/1 var(--sans)}
+    .piede-s{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:auto;padding-top:3px;color:var(--inchiostro-2);font:11px/1.3 var(--sans)}
+    .piede-s>span{display:inline-flex;align-items:center;gap:4px;min-width:0}
+    .piede-s .ic{width:13px;height:13px}
+    .piede-s .vai{width:20px;height:20px;color:var(--accento-t)}
+    a.scheda.evid{border-radius:18px}
+    a.scheda.evid .cornice{margin:12px 12px 0;padding:10px;border-radius:13px}
+    a.scheda.evid .foglio{aspect-ratio:3/2;border-radius:9px}
+    a.scheda.evid .testi{flex-direction:row;align-items:flex-end;gap:10px;padding:10px 12px 12px 14px}
+    a.scheda.evid .col{display:flex;flex:1;flex-direction:column;gap:7px;min-width:0}
+    a.scheda.evid .t{font-size:19px;line-height:1.1}
+    .tondo{display:grid;place-items:center;flex:none;width:36px;height:36px;border-radius:50%;background:var(--accento);color:#FFFFFF}
+    .tondo .ic{width:20px;height:20px}
+    .tondo.grande{width:40px;height:40px}
+    .tondo.grande .ic{width:22px;height:22px}
+    .eroe{--e-fondo:#221E16;--e-testo:#F2ECE0;--e-cornice:#3A3327;--e-foglio:#2A251C;--e-filo:#322D23;--e-occhiello:#FFE55C;--e-stelle:#A8C7FA;--e-pal:#1E3054;--e-pal-t:#C7D9FF;container-type:inline-size;margin:0 0 14px}
+    .eroe-a{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;padding:16px;border-radius:16px;background:var(--e-fondo);color:var(--e-testo);text-decoration:none;box-shadow:0 10px 20px rgb(36 31 23/.23);transition:transform 120ms ease-out}
+    .e-testi{display:flex;flex-direction:column;min-width:0}
+    .occhiello{color:var(--e-occhiello);font:20px/1 var(--mano)}
+    .eroe h3{display:-webkit-box;margin-top:6px;overflow:hidden;color:var(--e-testo);font-size:24px;line-height:1.12;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+    .e-autore{display:flex;align-items:center;gap:8px;margin-top:10px;color:color-mix(in srgb,var(--e-testo) 72%,transparent);font:14px/1.3 var(--sans)}
+    .e-pal{display:grid;place-items:center;width:26px;height:26px;border:1px solid color-mix(in srgb,var(--e-testo) 18%,transparent);border-radius:50%;background:var(--e-pal);color:var(--e-pal-t);font:700 12px/1 var(--sans)}
+    .e-img{display:block;padding:10px;border:1px solid var(--e-filo);border-radius:12px;background:var(--e-cornice)}
+    .e-foglio{position:relative;display:block;height:118px;overflow:hidden;border-radius:8px;background:var(--e-foglio)}
+    .e-voto{display:flex;align-items:center;justify-content:space-between;gap:12px}
+    .eroe .stelle{color:var(--e-stelle)}
+    .eroe .stelle .ic{width:16px;height:16px}
+    .eroe .stelle .vuota{color:color-mix(in srgb,var(--e-testo) 30%,transparent)}
+    .eroe .stelle .n{color:color-mix(in srgb,var(--e-testo) 72%,transparent);font-size:13px}
+    .e-conc{display:inline-flex;align-items:center;gap:6px;color:color-mix(in srgb,var(--e-testo) 72%,transparent);font:600 14px/1 var(--sans)}
+    .e-conc .ic{width:15px;height:15px}
+    @container (min-width:440px){.eroe-a{grid-template-columns:minmax(0,6fr) minmax(0,5fr);grid-template-rows:1fr auto;column-gap:18px}.e-testi{grid-column:1;grid-row:1}.e-img{grid-column:2;grid-row:1/3;align-self:center}.e-voto{grid-column:1;grid-row:2}.e-foglio{height:190px}}
+    nav.pagine{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:8px;margin-top:28px}
+    nav.pagine a,nav.pagine [aria-current]{display:inline-flex;align-items:center;justify-content:center;gap:4px;min-width:40px;height:40px;padding:0 12px;border:1px solid var(--filo-2);border-radius:999px;background:var(--lavata);color:var(--inchiostro);font:600 14px/1 var(--sans);text-decoration:none}
+    nav.pagine a:hover{background:var(--rialzo)}
+    nav.pagine [aria-current]{border-color:var(--accento);background:var(--accento);color:#FFFFFF}
+    nav.pagine .salto{color:var(--inchiostro-2)}
+    nav.pagine .ic{width:18px;height:18px}
+    .altri{margin:16px 0 0;color:var(--inchiostro-2);font:14px/1.4 var(--sans);text-align:center}
+    .mappa{margin-top:48px;padding-top:22px;border-top:1px solid var(--filo-2)}
+    .mappa h2{margin-bottom:12px;font-size:21px}
+    .mappa>ul{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px 24px;margin:0;padding:0;list-style:none}
+    .mappa .m{color:var(--inchiostro);font:600 14px/1.4 var(--sans);text-decoration:none}
+    .mappa ul ul{margin:4px 0 0;padding:0;list-style:none}
+    .mappa ul ul a{display:inline-block;padding:3px 0;color:var(--inchiostro-2);font:14px/1.4 var(--sans);text-decoration:none}
+    .mappa a:hover{color:var(--accento-t);text-decoration:underline}
+    .lettura{max-width:68ch;margin-top:40px;padding-top:22px;border-top:1px solid var(--filo-2)}
+    .lettura h2{margin-bottom:10px;font-size:21px}
+    .lettura p{margin:0;color:var(--inchiostro-2);font:16px/1.6 var(--sans)}
+    @media(prefers-color-scheme:dark){.eroe{--e-fondo:#FAF8F2;--e-testo:#23211B;--e-cornice:#F1EBDD;--e-foglio:#FFFDF8;--e-filo:#EFE8D9;--e-occhiello:#2563EB;--e-stelle:#2563EB;--e-pal:#DCE6FB;--e-pal-t:#16357A}}
+    @media(min-width:640px){.striscia{margin:-4px -24px 0;padding-inline:24px;scroll-padding-inline:24px}ul.griglia{grid-template-columns:repeat(3,minmax(0,1fr))}}
+    @media(min-width:800px){ul.griglia{grid-template-columns:repeat(4,minmax(0,1fr))}}
+    @media(min-width:1024px){nav.chips{grid-column:1;grid-row:1}details.ordina{grid-row:1}details.faccetta{grid-row:2}.fascia h1{font-size:36px}.sez-testa{margin-top:36px}.vedi{min-height:32px;margin-block:0}ul.griglia{grid-template-columns:repeat(5,minmax(0,1fr));gap:16px}.striscia{container-type:inline-size}.striscia ul{grid-auto-columns:calc((100cqi - 5*12px)/6);gap:12px}.striscia.evid ul{grid-auto-columns:calc((100cqi - 2*14px)/3);gap:14px}.eroe h3{font-size:30px}.e-foglio{height:260px}}
+    @media(prefers-reduced-motion:no-preference){a.scheda:active,.eroe-a:active,a.chip:active{transform:scale(.98)}}`;
+
+/// La pagina del pack (TemplateDetailScreen): una colonna di 820 come l'app,
+/// due colonne da 1024. Sotto i 1024 la barra dei bottoni resta in basso.
+const STILE_PACK = `
+    .pack{display:flex;flex-direction:column;max-width:820px;margin:0 auto}
+    .pack-info{display:contents}
+    .pack-img{margin:12px 0 18px;padding:12px;border:1px solid var(--filo-2);border-radius:16px;background:var(--rialzo)}
+    .foglio-g{position:relative;display:block;aspect-ratio:4/3;overflow:hidden;border-radius:10px;background:var(--foglio)}
+    .foglio-g img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center}
+    .iniziale{position:absolute;inset:0;display:grid;place-items:center;background:linear-gradient(135deg,var(--accento-velo),var(--rialzo));color:color-mix(in srgb,var(--su-accento-velo) 60%,transparent);font:600 44px/1 var(--serif)}
+    .titolo-riga{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:6px 12px}
+    .titolo-riga h1{display:-webkit-box;flex:1 1 220px;min-width:0;overflow:hidden;font-size:26px;line-height:1.15;-webkit-line-clamp:3;-webkit-box-orient:vertical}
+    .distintivo{display:inline-flex;align-items:center;gap:5px;margin-top:4px;padding:3px 8px;border:1px solid var(--filo-2);border-radius:8px;font:600 11px/1.3 var(--sans);white-space:nowrap}
+    .distintivo .ic{width:13px;height:13px}
+    .distintivo.uff{border-color:var(--accento);background:var(--accento);color:#FFFFFF}
+    .distintivo.evid{background:var(--taupe);color:var(--inchiostro)}
+    .ia{align-self:flex-start;margin-top:8px;padding:3px 8px;border-radius:12px;background:var(--lavata);color:var(--inchiostro-2);font:500 10px/1.3 var(--sans)}
+    .di{display:flex;align-items:center;gap:6px;margin:8px 0 0;color:var(--inchiostro-2);font:12px/1.3 var(--sans)}
+    .di .ic{width:16px;height:16px}
+    .riquadro{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin-top:16px;padding:14px 4px;border:1px solid var(--filo-2);border-radius:12px;background:var(--foglio)}
+    .cella{display:flex;flex-direction:column;align-items:center;gap:4px;min-width:0;padding:0 6px;text-align:center}
+    .cella+.cella{border-left:1px solid var(--filo-2)}
+    .cella .ic{width:16px;height:16px;color:var(--inchiostro-2)}
+    .cella .v{max-width:100%;color:var(--inchiostro);font:600 17px/1.3 var(--sans);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+    .cella a.v{color:var(--accento-t);text-decoration:none}
+    .cella a.v:hover{text-decoration:underline}
+    .cella .e{color:var(--inchiostro-2);font:11px/1.3 var(--sans)}
+    .eff{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin-top:12px;color:var(--inchiostro-2);font:12px/1.3 var(--sans)}
+    .pack .blocco h2{margin:26px 0 10px;font-size:19px;line-height:1.2}
+    .tag-l{display:flex;flex-wrap:wrap;gap:8px;margin:0;padding:0;list-style:none}
+    .tag{display:inline-flex;align-items:center;gap:5px;max-width:220px;padding:4px 9px;border-radius:8px;background:var(--rialzo);color:var(--inchiostro-2);font:600 11.5px/1.3 var(--sans);overflow-wrap:anywhere}
+    .tag .ic{width:14px;height:14px}
+    .tag.cat{background:color-mix(in srgb,var(--accento-velo) 50%,transparent);color:var(--su-accento-velo)}
+    p.desc,.desc-vuota{margin:0;color:var(--inchiostro);font:16px/1.6 var(--sans)}
+    .desc-vuota{color:var(--inchiostro-2)}
+    .nota{display:flex;gap:10px;margin-top:22px;padding:12px 14px;border:1px solid var(--filo-2);border-radius:12px;background:color-mix(in srgb,var(--accento-velo) 35%,transparent);color:var(--inchiostro-2);font:13px/1.45 var(--sans)}
+    .nota .ic{width:20px;height:20px;color:var(--accento-t)}
+    .nota p{margin:0}
+    .azioni{position:sticky;bottom:0;z-index:10;order:3;display:flex;gap:10px;margin:24px -16px 0;padding:10px 16px 12px;border-top:1px solid var(--filo-2);background:var(--carta)}
+    .azioni .btn{flex:1 1 0;min-height:52px;padding:0 12px}
+    .segnala-riga{order:1;margin:18px 0 0}
+    .segnala{display:inline-flex;align-items:center;gap:4px;color:var(--inchiostro-2);font:12px/1.3 var(--sans);text-decoration:none}
+    .segnala .ic{width:16px;height:16px}
+    .segnala:hover{color:var(--inchiostro);text-decoration:underline}
+    .correlati{order:2;margin-top:24px;padding-top:20px;border-top:1px solid var(--filo-2)}
+    .correlati h2{margin-bottom:12px;font-size:19px}
+    .link-el{display:flex;flex-wrap:wrap;gap:0 24px;font:600 14px/1.4 var(--sans)}
+    .link-el p{margin:8px 0 0}
+    .link-el a{text-decoration:none}
+    .link-el a:hover{text-decoration:underline}
+    @media(min-width:640px){.azioni{margin-inline:-24px;padding-inline:24px}}
+    @media(min-width:1024px){.pack{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,6fr);column-gap:48px;align-items:start;max-width:none}.pack-info{display:flex;flex-direction:column;padding-top:24px}.pack-img{position:sticky;top:24px;margin:24px 0 0}.foglio-g{aspect-ratio:3/4}.titolo-riga h1{font-size:34px}.azioni{position:static;order:0;margin:20px 0 0;padding:0;border:0;background:none}.azioni .btn{flex:0 1 auto;min-width:180px}.segnala-riga{order:0;margin-top:12px}.correlati{grid-column:1/-1;margin-top:40px}}`;
+
+/// Meta del tema, preload del carattere dei titoli e lo stile (base + pagina).
+function testaWeb(css: string): string {
+  return `
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#FAF8F2" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#221E16" media="(prefers-color-scheme: dark)" />
+  <link rel="preload" href="${FONT_SITO}/InstrumentSerif-Regular.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="${FONT_SITO}/Sora-Bold.woff2" as="font" type="font/woff2" crossorigin />
+  <style>
+    ${STILE_WEB}
+    ${css}
+  </style>`;
+}
+
+/// La testata: il marchio come su fluera.dev («Flu» Sora, «era» Playfair) e,
+/// al posto della AppBar «Catalogo» dell'app, il link all'indice e la beta.
+function testata(indice = urlElenco("it"), suIndice = false): string {
+  return `<header class="testata"><div class="in"><a class="marchio" href="${SITE}" aria-label="Fluera"><b aria-hidden="true">Flu</b><i aria-hidden="true">era</i></a><nav class="testata-nav" aria-label="Sezioni"><a class="sez" href="${
+    esc(indice)
+  }"${suIndice ? ` aria-current="page"` : ""}>Catalogo</a><a class="btn-beta" href="${SITE}/beta">Entra nella beta</a></nav></div></header>`;
+}
+
+function piede(hash?: string): string {
+  return `<footer class="piede"><div class="in"><a href="${SITE}">Che cos'è Fluera →</a>${
+    hash ? `<a href="https://share.fluera.dev/report?hash=${esc(hash)}">Segnala un contenuto</a>` : ""
+  }</div></footer>`;
+}
+
+/// 404, 410, 500 e 503 delle pagine /s/ e degli elenchi, come gli stati vuoti
+/// dell'app. Le altre rotte (OAuth, /report, /c…) restano su statusPage.
+function paginaStato(
+  headline: string,
+  body: string,
+  o: { icona?: string; azione?: { testo: string; href: string } } = {},
+): string {
+  const dentro = `${testata()}
+  <main class="in"><div class="stato">${
+    statoVuoto(o.icona ?? "eco", headline, body, o.azione ?? { testo: "Tutti i template", href: urlElenco("it") }, 1)
+  }</div></main>`;
+  return `<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>${esc(headline)} · Fluera</title>${testaWeb("")}
+</head>
+<body>
+  ${spriteIcone(dentro)}${dentro}
+</body>
+</html>`;
+}
 
 function statusPage(headline: string, body: string): string {
   return `<!doctype html><html lang="it"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="robots" content="noindex" /><title>${esc(headline)} · Fluera</title><style>body{margin:0;background:#0a0a0b;color:#f4f4f5;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center}div{max-width:420px;padding:24px}h1{font-size:22px;margin:0 0 8px}p{color:#a1a1aa;margin:0 0 20px}a{color:#818cf8}</style></head><body><div><h1>${esc(headline)}</h1><p>${esc(body)}</p><a href="${SITE}">Vai a Fluera →</a></div></body></html>`;
@@ -1619,11 +3555,6 @@ function sanitizeRef(raw: string | null): string {
   if (!raw) return "";
   const cleaned = raw.replace(/[^A-Za-z0-9._~-]/g, "");
   return cleaned.slice(0, 64);
-}
-function fmt(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
-  return String(n);
 }
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -1955,8 +3886,25 @@ const mcpIso = (ms: number | null | undefined) =>
 // restano su mcpIso, dove l'istante è quello vero.
 export const mcpExamDay = (ms: number | null | undefined) =>
   ms == null ? null : new Date(ms + 43_200_000).toISOString().slice(0, 10);
-const mcpDaysLeft = (examMs: number | null, now: number) =>
-  examMs == null ? null : Math.ceil((examMs - now) / 86_400_000);
+// 📅 Giorni di CALENDARIO fra oggi e l'esame — non una differenza in
+// millisecondi. Era `Math.ceil((examMs - now) / 86_400_000)`: a fuso costante
+// dava il numero giusto, ma quando fra oggi e l'esame cade un cambio d'ora fra
+// due mezzanotti locali passano 23 o 25 ore e il conto scivola di uno, su
+// TUTTI i giorni in cui il cambio sta nell'intervallo. È la stessa classe che
+// in Dart ha già prodotto quattro ricadute (`calendarDaysUntilExam`).
+//
+// Ancorato a MEZZOGIORNO come `mcpExamDay` qui sopra, e per la stessa ragione:
+// `exam_date_ms` è la mezzanotte LOCALE del device, il server vede solo UTC, e
+// lo scarto di 12 h recupera il giorno inteso per ogni fuso in (−12, +12].
+//
+// ⚠️ LIMITE dichiarato: il fuso del device non arriva al server, quindi resta
+// un'incertezza di ±1 giorno per chi è lontano da UTC. Questa riparazione
+// toglie la deriva da cambio d'ora, non quella.
+const mcpDaysLeft = (examMs: number | null, now: number) => {
+  if (examMs == null) return null;
+  const giorno = (ms: number) => Math.floor((ms + 43_200_000) / 86_400_000);
+  return giorno(examMs) - giorno(now);
+};
 // 🔗 R3 — Il concetto nel link. La rotta /r/ legge e sanifica `?concept=`, e
 // il gestore deep-link lo estrae: il connettore non lo passava, quindi ogni
 // consiglio atterrava sulla tela e lasciava allo studente il compito di

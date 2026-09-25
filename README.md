@@ -88,8 +88,38 @@ separate, perche' confonderle e' costato tre giri il 2026-08-13:
 
 Gira **ogni giorno** (la deriva arriva col tempo, non con un push: questo
 dominio ha tenuto un build vecchio per MESI) ed e' certificato da
-`mirror_in_sync_controls.sh` — 8 difetti seminati, ognuno deve produrre un
-rosso, compresi «sorgente troncato» e «rispecchiato ma non promosso».
+`mirror_in_sync_controls.sh` — 12 controlli, ognuno deve produrre l'esito
+atteso, compresi «sorgente troncato» e «rispecchiato ma non promosso».
+
+> ⏱️ **Il raw ha 5 minuti di cache, e sbaglia nei DUE versi.**
+> `raw.githubusercontent.com` risponde `max-age=300`, e i nodi di bordo
+> servono oggetti di eta' diversa (misurato: `source-age` 47 e 171 s a due
+> secondi di distanza).
+> • *Locale avanti, raw indietro* → il cancello gridava «NON rispecchiato» su
+>   un repo allineato, e mandava a promuovere a mano una revisione gia'
+>   promossa (2026-09-05, mattina).
+> • *Locale indietro, raw concorde, repo avanti* → il caso PEGGIORE: il
+>   confronto passava, il cancello diceva «allineato» e `deploy.sh` usciva con
+>   «niente da fare» **senza pubblicare il rientro**. Il dominio restava sul
+>   build sbagliato: esattamente il guasto che questo cancello esiste per
+>   impedire. Trovato lo stesso giorno da una revisione avversariale, dopo che
+>   la prima cura ne aveva chiuso solo meta'.
+>
+> **Il raw non decide piu'.** Il verdetto di (A) e' il confronto fra lo sha del
+> blob locale e quello che il repo di pubblicazione ha davvero:
+> 1. `git fetch --depth=1` — niente CDN, **niente limite di richieste**, ~0,9 s
+>    e ~190 KB; da qui arriva anche il contenuto remoto vero per il diff;
+> 2. in ripiego lo sha dall'API di GitHub (60 richieste/ora anonime: e' un
+>    ripiego, non la strada);
+> 3. se nessuno dei due risponde, **non si afferma l'allineamento**. Che il raw
+>    combaci non e' una prova, e il cancello lo dice.
+>
+> I controlli 7-11 pinzano le cinque uscite; l'8 e l'11 sono quelli che
+> mancavano. Nessun controllo dipende dalla quota dell'API: quelli del ripiego
+> usano un'API finta servita in locale, perche' un controllo che si spegne
+> quando la quota finisce e' un dado, non un controllo. E la batteria si
+> CONQUISTA la sua porta verificando una sentinella: un server fantasma di una
+> corsa precedente le aveva gia' falsato un esito.
 
 Il repo pubblicato e' **pubblico**, quindi il cancello non ha bisogno di
 credenziali: `bash mirror_in_sync.sh` gira anche in locale, subito.
