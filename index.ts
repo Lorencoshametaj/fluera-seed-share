@@ -3657,6 +3657,23 @@ function html(status: number, body: string): Response {
     },
   });
 }
+/// Le pagine del collegamento OAuth portano uno stato firmato legato a una
+/// persona: mai in cache (la cache di bordo di html() le terrebbe 120 s), mai
+/// in una cornice altrui (il bottone «Autorizza» sotto un clic rubato), mai
+/// nel Referer verso un'altra origine.
+function htmlOauth(status: number, body: string): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": "frame-ancestors 'none'",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
 function json(obj: unknown): Response {
   return new Response(JSON.stringify(obj), {
     status: 200,
@@ -4963,19 +4980,19 @@ async function oauthAuthorize(req: Request, url: URL): Promise<Response> {
   // 🔑 Gli errori PRIMA di aver validato client+redirect NON si rimandano al
   // redirect_uri (sarebbe un open redirect): si mostrano qui.
   if (p.get("response_type") !== "code") {
-    return html(400, statusPage("Richiesta non valida", "response_type deve essere «code»."));
+    return htmlOauth(400, statusPage("Richiesta non valida", "response_type deve essere «code»."));
   }
   if (!clientId || !redirectUri) {
-    return html(400, statusPage("Richiesta non valida", "Mancano client_id o redirect_uri."));
+    return htmlOauth(400, statusPage("Richiesta non valida", "Mancano client_id o redirect_uri."));
   }
   const client = await oauthLoadClient(clientId);
   if (!client) {
-    return html(400, statusPage("Applicazione sconosciuta", "Questo client non è registrato."));
+    return htmlOauth(400, statusPage("Applicazione sconosciuta", "Questo client non è registrato."));
   }
   if (!client.redirect_uris.includes(redirectUri)) {
     // Confronto ESATTO, mai per prefisso: un match parziale è la via classica
     // per farsi consegnare i codici altrove.
-    return html(400, statusPage("Indirizzo di ritorno non valido", "Non corrisponde a quelli registrati."));
+    return htmlOauth(400, statusPage("Indirizzo di ritorno non valido", "Non corrisponde a quelli registrati."));
   }
   // Da qui in poi l'errore può tornare al client, che è registrato.
   const back = (err: string, desc: string) => {
@@ -5023,7 +5040,7 @@ async function oauthAuthorize(req: Request, url: URL): Promise<Response> {
     "code_challenge", b64url(await sha256(await pkceVerifierFor(statoFirmato))),
   );
   sbAuth.searchParams.set("code_challenge_method", "s256");
-  return html(200, renderOauthSignIn(client.client_name || clientId, sbAuth.toString()));
+  return htmlOauth(200, renderOauthSignIn(client.client_name || clientId, sbAuth.toString()));
 }
 
 type OauthRichiesta = {
@@ -5032,7 +5049,19 @@ type OauthRichiesta = {
   challenge: string;
   state: string;
   resource: string;
+  /// Chi ha fatto l'accesso. C'è SOLO nello stato del CONSENSO, che firma il
+  /// callback dopo lo scambio del codice con Supabase; lo stato dell'ANDATA
+  /// (quello di /oauth/authorize, che chiunque può farsi dare) non ce l'ha.
+  /// 🔴 Fino al 2026-09-25 l'utente viaggiava in un campo nascosto del modulo,
+  /// fuori dalla firma: chiunque aveva uno stato dell'andata poteva approvare
+  /// scrivendo lì l'uuid di un altro e ricevere un token sul suo studio.
+  userId?: string;
 };
+
+/// Quanto vale uno stato firmato. Copre l'accesso con Google/Apple all'andata
+/// e la lettura della schermata di consenso al ritorno: oltre, si ricomincia.
+const OAUTH_STATE_TTL_S = 15 * 60;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 // Lo stato viaggia FIRMATO — UNA sola funzione per produrlo, così non può
 // più esistere una via che impacchetta senza firmare: senza firma, chi torna
@@ -5049,12 +5078,17 @@ export async function pkceVerifierFor(statePayload: string): Promise<string> {
   return b64url(mac); // 43 caratteri base64url, la lunghezza che la RFC vuole
 }
 
-export async function oauthSignState(r: OauthRichiesta): Promise<string> {
-  const payload = b64url(enc.encode(JSON.stringify(r)));
+/// `ora` esiste per i test: in produzione è sempre l'orologio.
+export async function oauthSignState(r: OauthRichiesta, ora = Date.now()): Promise<string> {
+  const payload = b64url(enc.encode(JSON.stringify({ ...r, iat: Math.floor(ora / 1000) })));
   const sig = await crypto.subtle.sign("HMAC", await hmacKey(), enc.encode(payload));
   return `${payload}.${b64url(sig)}`;
 }
-export async function oauthOpenState(signed: string): Promise<OauthRichiesta | null> {
+/// Solo la firma: il contenuto se l'HMAC torna, null altrimenti. Il tempo lo
+/// guardano i due chiamanti qui sotto.
+async function oauthVerifiedPayload(
+  signed: string,
+): Promise<(OauthRichiesta & { iat?: unknown }) | null> {
   const i = signed.lastIndexOf(".");
   if (i < 0) return null;
   const payload = signed.slice(0, i);
@@ -5066,10 +5100,44 @@ export async function oauthOpenState(signed: string): Promise<OauthRichiesta | n
       enc.encode(payload),
     );
     if (!ok) return null;
-    return JSON.parse(new TextDecoder().decode(b64urlDecode(payload))) as OauthRichiesta;
+    return JSON.parse(new TextDecoder().decode(b64urlDecode(payload))) as
+      OauthRichiesta & { iat?: unknown };
   } catch {
     return null;
   }
+}
+/// null se la firma non torna, se manca l'istante di firma o se è scaduto.
+export async function oauthOpenState(signed: string, ora = Date.now()): Promise<OauthRichiesta | null> {
+  const d = await oauthVerifiedPayload(signed);
+  if (!d) return null;
+  const { iat, ...r } = d;
+  const adesso = Math.floor(ora / 1000);
+  // Uno stato senza istante è di prima del 2026-09-25: non scade mai, quindi
+  // non vale. Il server firma solo interi. Un minuto di tolleranza per gli
+  // orologi delle istanze.
+  if (
+    typeof iat !== "number" || !Number.isInteger(iat) ||
+    adesso - iat > OAUTH_STATE_TTL_S || iat - adesso > 60
+  ) {
+    return null;
+  }
+  return r;
+}
+/// Firma valida ma tempo scaduto (o mai scritto): la richiesta è autentica,
+/// quindi si può rimandare al SUO client un «access_denied» invece di lasciare
+/// la persona su una pagina senza uscita. Il redirect_uri sta dentro la firma
+/// ed è stato confrontato ESATTO con quelli registrati all'andata: non è un
+/// open redirect. Non conia niente. `conUtente` dice quale stato si aspetta
+/// il chiamante (consenso sì, andata no): quello dell'altra fase resta un 400.
+async function oauthExpiredRedirect(signed: string, conUtente: boolean): Promise<Response | null> {
+  const d = await oauthVerifiedPayload(signed);
+  if (!d || (d.userId !== undefined) !== conUtente) return null;
+  const u = new URL(d.redirectUri);
+  u.searchParams.set("error", "access_denied");
+  u.searchParams.set("error_description", "sessione scaduta: riprova il collegamento");
+  u.searchParams.set("iss", OAUTH_ISSUER);
+  if (d.state) u.searchParams.set("state", d.state);
+  return Response.redirect(u.toString(), 302);
 }
 
 async function oauthLoadClient(
@@ -5139,16 +5207,34 @@ provider che hai scelto.</p>`,
   );
 }
 
+/// Dove finirà l'accesso, detto in parole. Il nome dell'app lo scrive chi la
+/// registra e può mentire (chiunque può chiamarsi «Claude»); l'host di ritorno
+/// è dove il codice arriva davvero.
+function destinatarioOauth(redirectUri: string): string {
+  try {
+    const u = new URL(redirectUri);
+    if (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]") {
+      return "un programma su questo computer";
+    }
+    return u.host;
+  } catch {
+    return redirectUri;
+  }
+}
+
 function renderOauthConsent(
   clientName: string,
-  ident: { userId: string; email: string },
+  email: string,
   r: OauthRichiesta,
+  statoConsenso: string,
 ): string {
-  // Lo stato firmato viaggia nel form: il POST di approvazione non si fida di
-  // nulla che il browser possa aver riscritto.
+  // Identità e richiesta vengono solo dallo stato firmato; dal modulo
+  // /oauth/approve legge soltanto la scelta Autorizza/Annulla.
   return oauthShell(
     "Autorizzare?",
     `<h1>${esc(clientName)} potrà leggere il tuo stato di studio</h1>
+<p>L'accesso verrà consegnato a <strong>${esc(destinatarioOauth(r.redirectUri))}</strong>.
+Se il collegamento non l'hai avviato tu, annulla.</p>
 <p>Cosa vedrà:</p>
 <ul>
   <li>i tuoi corsi, con date d'esame ed esiti;</li>
@@ -5160,12 +5246,11 @@ function renderOauthConsent(
 testo riconosciuto, le immagini. E non può scrivere nulla: il ripasso che
 conta si fa dentro Fluera, a libro chiuso.</p>
 <form method="POST" action="/oauth/approve">
-  <input type="hidden" name="req" value="__STATO__">
-  <input type="hidden" name="uid" value="${esc(ident.userId)}">
+  <input type="hidden" name="req" value="${esc(statoConsenso)}">
   <button class="btn" type="submit" name="ok" value="1">Autorizza</button>
   <button class="btn ghost" type="submit" name="ok" value="0">Annulla</button>
 </form>
-<p class="who">Accesso come ${esc(ident.email)} · Puoi revocare quando vuoi da
+<p class="who">Accesso come ${esc(email)} · Puoi revocare quando vuoi da
 Impostazioni → Funzioni cognitive → Collega il tuo assistente.</p>`,
   );
 }
@@ -5175,7 +5260,13 @@ async function oauthCallback(url: URL): Promise<Response> {
   const signed = url.searchParams.get("fluera_state") ?? "";
   const r = await oauthOpenState(signed);
   if (!r) {
-    return html(400, statusPage("Sessione scaduta", "Riprova il collegamento dall'inizio."));
+    return await oauthExpiredRedirect(signed, false) ??
+      htmlOauth(400, statusPage("Sessione scaduta", "Riprova il collegamento dall'inizio."));
+  }
+  // Qui torna solo lo stato dell'ANDATA: uno che porta già un utente è uno
+  // stato del consenso rimesso in circolo.
+  if (r.userId !== undefined) {
+    return htmlOauth(400, statusPage("Sessione scaduta", "Riprova il collegamento dall'inizio."));
   }
   const code = url.searchParams.get("code") ?? "";
   if (!code) {
@@ -5187,23 +5278,39 @@ async function oauthCallback(url: URL): Promise<Response> {
   }
   const ident = await supabaseIdentityFromCode(code, signed);
   if (!ident) {
-    return html(400, statusPage("Accesso non riuscito", "Riprova il collegamento."));
+    return htmlOauth(400, statusPage("Accesso non riuscito", "Riprova il collegamento."));
   }
   const client = await oauthLoadClient(r.clientId);
-  const pagina = renderOauthConsent(client?.client_name || r.clientId, ident, r)
-    .replace("__STATO__", esc(await oauthSignState(r)));
-  return html(200, pagina);
+  // 🔑 L'identità entra nella FIRMA qui, e da nessun'altra parte: è l'unico
+  // punto in cui il server sa chi ha fatto l'accesso.
+  const statoConsenso = await oauthSignState({ ...r, userId: ident.userId });
+  return htmlOauth(
+    200,
+    renderOauthConsent(client?.client_name || r.clientId, ident.email, r, statoConsenso),
+  );
 }
 
 // ── /oauth/approve — l'utente ha deciso: si conia il codice ────────────────
 async function oauthApprove(req: Request): Promise<Response> {
   if (req.method !== "POST") return oauthError("invalid_request", "usa POST", 405);
-  const form = await req.formData();
-  const r = await oauthOpenState(String(form.get("req") ?? ""));
-  if (!r) return html(400, statusPage("Sessione scaduta", "Riprova dall'inizio."));
-  const uid = String(form.get("uid") ?? "");
-  if (!/^[0-9a-f-]{36}$/.test(uid)) {
-    return html(400, statusPage("Richiesta non valida", "Identità mancante."));
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch {
+    return htmlOauth(400, statusPage("Richiesta non valida", "Riprova dall'inizio."));
+  }
+  const stato = String(form.get("req") ?? "");
+  const r = await oauthOpenState(stato);
+  if (!r) {
+    return await oauthExpiredRedirect(stato, true) ??
+      htmlOauth(400, statusPage("Sessione scaduta", "Riprova dall'inizio."));
+  }
+  // 🔴 L'utente viene SOLO dallo stato firmato del consenso. Un campo del
+  // modulo lo scrive chiunque; lo stato dell'andata non ha utente e qui non
+  // vale (vedi OauthRichiesta.userId).
+  const uid = r.userId ?? "";
+  if (!UUID_RE.test(uid)) {
+    return htmlOauth(400, statusPage("Sessione scaduta", "Riprova dall'inizio."));
   }
   const u = new URL(r.redirectUri);
   if (r.state) u.searchParams.set("state", r.state);
@@ -5219,7 +5326,7 @@ async function oauthApprove(req: Request): Promise<Response> {
   // server rifiuterebbe comunque) sarebbe una porta che non porta da nessuna
   // parte. Meglio dirlo qui.
   if (!await oauthUserHasDigestConsent(uid)) {
-    return html(200, oauthShell(
+    return htmlOauth(200, oauthShell(
       "Manca un passaggio",
       `<h1>Prima attiva «Assistente AI collegato»</h1>
 <p>Il collegamento legge il tuo estratto di studio, e quell'estratto viene
@@ -5245,7 +5352,7 @@ collegato</strong>, poi riprova da qui.</p>`,
     }),
   });
   if (!ins || !ins.ok) {
-    return html(503, statusPage("Riprova", "Non è stato possibile completare ora."));
+    return htmlOauth(503, statusPage("Riprova", "Non è stato possibile completare ora."));
   }
   u.searchParams.set("code", code);
   return Response.redirect(u.toString(), 302);
