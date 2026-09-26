@@ -36,6 +36,12 @@ import { initWasm, Resvg } from "https://esm.sh/@resvg/resvg-wasm@2.6.2";
 
 const BUCKET = "public-study-seeds";
 const SITE = "https://fluera.dev";
+/// Le icone del marchio, dalle pagine di fluera.dev (2026-09-27): prima share
+/// non ne dichiarava nessuna, e /favicon.ico rimandava alla home HTML — scheda
+/// del browser e risultati di Google con l'icona vuota.
+const ICONE_SITO =
+  `<link rel="icon" type="image/png" sizes="32x32" href="${SITE}/favicon.png" />` +
+  `<link rel="apple-touch-icon" sizes="180x180" href="${SITE}/apple-touch-icon.png" />`;
 const BUNDLE_ID = Deno.env.get("ANDROID_PACKAGE") ?? "com.fluera.fluera";
 const APPLE_TEAM_ID = Deno.env.get("APPLE_TEAM_ID") ?? "7T5647HRV6";
 const APPLE_APP_ID = Deno.env.get("APPLE_APP_ID") ?? ""; // numeric store id, when published
@@ -172,6 +178,14 @@ export const servi = async (req: Request): Promise<Response> => {
   // dare visibilità sui motori a contenuti caricati dagli utenti, che è una
   // decisione di moderazione, non di SEO. Finché il marketplace è curated-first
   // si indicizza solo ciò di cui rispondiamo noi.
+  // /favicon.ico lo chiedono da soli browser e crawler: prima cadeva nel
+  // ripiego e finiva con un 302 sulla home HTML di fluera.dev (2026-09-27).
+  if (path === "/favicon.ico") {
+    return new Response(null, {
+      status: 301,
+      headers: { Location: `${SITE}/favicon.ico`, "Cache-Control": "public, max-age=86400" },
+    });
+  }
   if (/\/robots\.txt$/.test(path)) {
     return new Response(
       [
@@ -506,7 +520,7 @@ export const servi = async (req: Request): Promise<Response> => {
     return html(
       200,
       `<!doctype html><html lang="${t.lang}"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">${ICONE_SITO}
 <meta name="robots" content="noindex">
 <title>${esc(t.titolo)} — Fluera</title>
 <style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#F6F7F9;color:#1B2030}main{text-align:center;padding:2rem;max-width:26rem}h1{font-size:1.5rem;line-height:1.25}a.btn{display:inline-block;margin-top:1rem;padding:.7rem 1.4rem;border-radius:10px;background:#2F4DC0;color:#fff;text-decoration:none;font-weight:600}a.alt{display:inline-block;margin-top:1rem;color:#2F4DC0}p{color:#5C6475}@media(prefers-color-scheme:dark){body{background:#101319;color:#E8EAF1}p{color:#9AA3B5}}</style>
@@ -1666,7 +1680,7 @@ function paginaWeb(p: {
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />${p.siIndicizza ? "" : `\n  <meta name="robots" content="noindex" />`}
+  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}${p.siIndicizza ? "" : `\n  <meta name="robots" content="noindex" />`}
   <title>${esc(p.titolo)}</title>
   <meta name="description" content="${esc(p.descrizione)}" />${p.self ? `\n  <link rel="canonical" href="${esc(p.self)}" />\n  <meta property="og:url" content="${esc(p.self)}" />` : ""}
   <meta property="og:type" content="website" />
@@ -2062,7 +2076,7 @@ function renderGhostPage(row: GhostShareRow, hash: string): string {
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
   <title>${esc(title)} · Fluera</title>
   <meta name="description" content="${esc(desc)}" />
   <link rel="canonical" href="${esc(self)}" />
@@ -2192,7 +2206,7 @@ function renderPrivateSeedPage(
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
   <meta name="robots" content="noindex" />
   <meta name="referrer" content="no-referrer" />
   <title>${esc(title)} \u00b7 Fluera</title>
@@ -2327,7 +2341,7 @@ function renderCollabPage(
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
   <meta name="robots" content="noindex" />
   <!-- Il token dell'invito vive nell'URL. Senza questo, ogni clic sul bottone
        dello store lo spedirebbe a Google/Apple nell'header Referer — e i
@@ -2718,7 +2732,7 @@ function renderPaginaRiservata(row: SeedRow, ref: string): string {
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
   <meta name="robots" content="noindex" />
   <title>${esc(title)} · Fluera</title>
   <meta name="description" content="${esc(desc)}" />
@@ -2749,7 +2763,7 @@ function renderPaginaRiservata(row: SeedRow, ref: string): string {
       ${l.iosUrl ? `<a class="btn ghost" href="${esc(l.iosUrl)}">App Store</a>` : ""}
     </div>
   </div></main>
-  <footer class="piede"><div class="in"><a href="https://share.fluera.dev/report?hash=${esc(row.hash)}">Segnala questo contenuto</a></div></footer>
+  ${piede(row.hash)}
   ${l.script}
 </body>
 </html>`;
@@ -2983,7 +2997,7 @@ function renderPage(
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />${siIndicizza ? "" : `\n  <meta name="robots" content="noindex" />`}
+  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}${siIndicizza ? "" : `\n  <meta name="robots" content="noindex" />`}
   <title>${esc(title)}${dove ? ` · ${esc(dove)}` : ""} · Fluera</title>
   <meta name="description" content="${esc(ogDescription)}" />
   <link rel="canonical" href="${esc(self)}" />
@@ -3076,7 +3090,9 @@ const STILE_WEB =
     .btn.ghost:hover{border-color:var(--inchiostro-2)}
     :focus-visible{outline:2px solid var(--accento-t);outline-offset:3px}
     .piede{margin-top:64px;border-top:1px solid var(--filo-2);font:14px/1.4 var(--sans);color:var(--inchiostro-2)}
-    .piede .in{display:flex;flex-wrap:wrap;gap:8px 24px;justify-content:space-between;align-items:center;padding-block:24px}
+    .piede .in{display:flex;flex-direction:column;gap:10px;padding-block:24px}
+    .piede-riga{display:flex;flex-wrap:wrap;gap:8px 24px}
+    .piede .titolare{margin:0;font-size:12px;line-height:1.5}
     .piede a{color:var(--inchiostro-2);text-decoration:none}
     .piede a:hover{color:var(--inchiostro);text-decoration:underline}
     .vuoto{max-width:480px;margin:48px auto 24px;padding:0 24px;text-align:center}
@@ -3342,10 +3358,19 @@ function testata(indice = urlElenco("it"), suIndice = false): string {
   }"${suIndice ? ` aria-current="page"` : ""}>Catalogo</a><a class="btn-beta" href="${SITE}/beta">Entra nella beta</a></nav></div></header>`;
 }
 
+/// Il piede di ogni pagina del catalogo, delle pagine di stato e del pack
+/// riservato. 2026-09-27: fino a qui c'era solo «Che cos'è Fluera»; una pagina
+/// pubblica che raccoglie dati (i log del server, il modulo Segnala) deve dire
+/// chi è il titolare e dove sono informativa, termini e un contatto — gli
+/// stessi dati dell'informativa pubblicata (fluera.dev/legal/privacy/, § 1).
 function piede(hash?: string): string {
-  return `<footer class="piede"><div class="in"><a href="${SITE}">Che cos'è Fluera →</a>${
-    hash ? `<a href="https://share.fluera.dev/report?hash=${esc(hash)}">Segnala un contenuto</a>` : ""
-  }</div></footer>`;
+  return `<footer class="piede"><div class="in">
+  <div class="piede-riga"><a href="${SITE}/it/">Che cos'è Fluera →</a>${
+    hash ? `<a href="https://share.fluera.dev/report?hash=${esc(hash)}">Segnala questo contenuto</a>` : ""
+  }</div>
+  <nav class="piede-riga" aria-label="Informazioni legali"><a href="${SITE}/legal/privacy/">Privacy</a><a href="${SITE}/legal/terms/">Termini</a><a href="mailto:support@fluera.dev">Contatti</a></nav>
+  <p class="titolare">© ${new Date().getUTCFullYear()} Fluera · Titolare: Lorenco Shametaj, Via Boccaccio 44, 35128 Padova (PD)</p>
+</div></footer>`;
 }
 
 /// 404, 410, 500 e 503 delle pagine /s/ e degli elenchi, come gli stati vuoti
@@ -3358,12 +3383,13 @@ function paginaStato(
   const dentro = `${testata()}
   <main class="in"><div class="stato">${
     statoVuoto(o.icona ?? "eco", headline, body, o.azione ?? { testo: "Tutti i template", href: urlElenco("it") }, 1)
-  }</div></main>`;
+  }</div></main>
+  ${piede()}`;
   return `<!doctype html>
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
   <meta name="robots" content="noindex" />
   <title>${esc(headline)} · Fluera</title>${testaWeb("")}
 </head>
@@ -3374,7 +3400,7 @@ function paginaStato(
 }
 
 function statusPage(headline: string, body: string): string {
-  return `<!doctype html><html lang="it"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="robots" content="noindex" /><title>${esc(headline)} · Fluera</title><style>body{margin:0;background:#0a0a0b;color:#f4f4f5;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center}div{max-width:420px;padding:24px}h1{font-size:22px;margin:0 0 8px}p{color:#a1a1aa;margin:0 0 20px}a{color:#818cf8}</style></head><body><div><h1>${esc(headline)}</h1><p>${esc(body)}</p><a href="${SITE}">Vai a Fluera →</a></div></body></html>`;
+  return `<!doctype html><html lang="it"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}<meta name="robots" content="noindex" /><title>${esc(headline)} · Fluera</title><style>body{margin:0;background:#0a0a0b;color:#f4f4f5;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center}div{max-width:420px;padding:24px}h1{font-size:22px;margin:0 0 8px}p{color:#a1a1aa;margin:0 0 20px}a{color:#818cf8}</style></head><body><div><h1>${esc(headline)}</h1><p>${esc(body)}</p><a href="${SITE}">Vai a Fluera →</a></div></body></html>`;
 }
 
 // ── Public report channel (DSA Art.16 / DMCA) ────────────────────────────────
@@ -3515,7 +3541,7 @@ function reportForm(hash: string, error?: string): string {
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
   <meta name="robots" content="noindex" />
   <title>Segnala un contenuto · Fluera</title>
   <style>
@@ -5179,7 +5205,7 @@ async function supabaseIdentityFromCode(
 
 const oauthShell = (titolo: string, corpo: string) =>
   `<!doctype html><html lang="it"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">${ICONE_SITO}
 <meta name="robots" content="noindex">
 <title>${esc(titolo)} — Fluera</title>
 <style>
@@ -5590,7 +5616,7 @@ function renderConnectPage(req: Request): string {
       rev: "You can revoke at any time from the app. Revoking consent closes every session and deletes the stored digest. The review that counts still happens here: closed-book, in your own handwriting.",
     };
   return `<!doctype html><html lang="${it ? "it" : "en"}"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">${ICONE_SITO}
 <title>${esc(t.h)} — Fluera</title>
 <style>body{font-family:system-ui,sans-serif;margin:0;background:#F6F7F9;color:#1B2030;line-height:1.6}
 main{max-width:38rem;margin:0 auto;padding:3rem 1.25rem 4rem}
