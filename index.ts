@@ -614,8 +614,9 @@ export const servi = async (req: Request): Promise<Response> => {
   }
 
   // ── /report (public, no-login DSA Art.16 / DMCA takedown intake) ───────────
-  // A report channel linked from every /s/{hash} page. GET renders a minimal
-  // self-contained form (the seed hash is carried in the query); POST validates,
+  // A report channel linked from every /s/{hash} page. GET renders the form
+  // (the seed hash is carried in the query; without one, a page that says
+  // where to start — a notice must name its content); POST validates,
   // rate-limits, and forwards the notice to the SERVICE-ROLE RPC
   // file_takedown_notice — the ONLY database write an anonymous reporter can
   // make. SECURITY: add a CAPTCHA (hCaptcha / Cloudflare Turnstile) here BEFORE
@@ -624,7 +625,11 @@ export const servi = async (req: Request): Promise<Response> => {
   if (/\/report\/?$/.test(path)) {
     if (req.method === "POST") return await handleReportPost(req);
     const qHash = (reqUrl.searchParams.get("hash") ?? "").trim().toLowerCase();
-    return html(200, reportForm(REPORT_HASH_RE.test(qHash) ? qHash : ""));
+    const qNumero = reqUrl.searchParams.get("numero") ?? "";
+    if (REPORT_HASH_RE.test(qHash) && REPORT_NUMERO_RE.test(qNumero)) {
+      return htmlSegnala(200, reportRicevuta(qHash, qNumero, reqUrl.searchParams.get("email") === "1"));
+    }
+    return htmlSegnala(200, reportForm(REPORT_HASH_RE.test(qHash) ? qHash : ""));
   }
 
   // ── /s/{hash}/og.png → social card with the LIVE numbers baked into the
@@ -3374,7 +3379,8 @@ function piede(hash?: string): string {
 }
 
 /// 404, 410, 500 e 503 delle pagine /s/ e degli elenchi, come gli stati vuoti
-/// dell'app. Le altre rotte (OAuth, /report, /c…) restano su statusPage.
+/// dell'app. Le altre rotte (OAuth, /c…) restano su statusPage; /report ha
+/// la sua cornice, paginaSegnala.
 function paginaStato(
   headline: string,
   body: string,
@@ -3404,27 +3410,54 @@ function statusPage(headline: string, body: string): string {
 }
 
 // ── Public report channel (DSA Art.16 / DMCA) ────────────────────────────────
-// Anonymous, no-login takedown intake reachable from every share page. Kept
-// fully self-contained (inline HTML/CSS, no imports) and dark-themed to match
-// the share surface. NOTE: gate this with a CAPTCHA (hCaptcha / Cloudflare
-// Turnstile) before heavy public exposure — the rate-limit below is only a
-// per-isolate floor.
+// Anonymous, no-login takedown intake reachable from every share page.
+// 2026-09-27: the form now asks what art. 16(2) DSA lists — why the content is
+// illegal (a), name and email (c), the good-faith declaration (d) — plus, for
+// copyright, what Creator Terms 6.2 require (name and email as signature and
+// contact, the rightsholder's standing); says who processes the reporter's
+// data next to the fields; gives a receipt number through a 303 (reloading
+// the receipt never re-sends the form) and a one-shot token (a double click
+// never files two notices); and wears the catalogue's look (it was a
+// black-and-violet page with a sprout for a logo). NOTE: gate this with a
+// CAPTCHA (hCaptcha / Cloudflare Turnstile) before heavy public exposure — the
+// rate-limit below is only a per-isolate floor.
 
 const REPORT_HASH_RE = /^[a-f0-9]{8,64}$/;
 // Reason taxonomy (value → visible IT label). Mirrors the seed_takedown_notices
 // reason set; a 'copyright' report maps to notice_type 'dmca', everything else
 // to 'illegal_content'.
 const REPORT_REASONS: ReadonlyArray<[string, string]> = [
-  ["child-safety", "Sicurezza dei minori (CSAM / adescamento)"],
+  ["child-safety", "Sicurezza dei minori (abusi o adescamento)"],
   ["sexual", "Contenuto sessuale o esplicito"],
   ["violence", "Violenza o incitamento alla violenza"],
   ["hate", "Incitamento all'odio"],
-  ["copyright", "Violazione di copyright (DMCA)"],
-  ["pii", "Dati personali / violazione della privacy"],
+  ["copyright", "Violazione del diritto d'autore"],
+  ["pii", "Dati personali di qualcuno, pubblicati senza permesso"],
   ["spam", "Spam o truffa"],
   ["other", "Altro"],
 ];
 const REPORT_REASON_SET = new Set(REPORT_REASONS.map(([v]) => v));
+// Fluera's choice, not the law's: a child-safety report is accepted without an
+// explanation (a witness may not want to describe the material). Art. 16(2)(c)
+// DSA exempts only name and email for those offences — and here name and email
+// are optional for every reason except copyright.
+const REPORT_SPIEGAZIONE_FACOLTATIVA = "child-safety";
+// Creator Terms 6.2: a copyright notice names who holds the right and how to
+// reach them — the typed name is the signature.
+const REPORT_CON_FIRMA = "copyright";
+const REPORT_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const REPORT_TOKEN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const REPORT_NUMERO_RE = /^[1-9][0-9]{0,17}$/;
+
+/// Cuts at `n` UTF-16 units without leaving half an emoji behind: a lone high
+/// surrogate makes the JSON that PostgREST reads invalid, and the notice would
+/// fail at every retry. CRLF (what browsers send for a textarea's newline)
+/// becomes LF first, so a text within maxlength is never cut.
+function taglia(s: string, n: number): string {
+  let r = s.replace(/\r\n/g, "\n").trim().slice(0, n);
+  if (/[\uD800-\uDBFF]$/.test(r)) r = r.slice(0, -1);
+  return r;
+}
 
 // Basic per-IP, per-isolate rate limit. This is a FLOOR only (resets on cold
 // start, isolate-local); it is NOT a substitute for a CAPTCHA.
@@ -3452,63 +3485,95 @@ function clientIp(req: Request): string {
   return first || req.headers.get("x-real-ip") || "unknown";
 }
 
+/// Every /report response. Never cached: after a POST the page carries back the
+/// name and email the reporter typed (html()'s s-maxage=120 would keep them at
+/// the edge), and the form must not sit in someone else's frame under a
+/// stolen click.
+function htmlSegnala(status: number, body: string): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": "frame-ancestors 'none'",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+type ValoriSegnala = { reason: string; detail: string; name: string; email: string; goodFaith: boolean; invio: string };
+const SEGNALA_VUOTO: ValoriSegnala = { reason: "", detail: "", name: "", email: "", goodFaith: false, invio: "" };
+
 async function handleReportPost(req: Request): Promise<Response> {
   let form: FormData;
   try {
     form = await req.formData();
   } catch {
-    return html(400, statusPage("Segnalazione non valida", "Modulo non leggibile. Riprova."));
+    return htmlSegnala(400, paginaSegnalaMessaggio("Segnalazione non valida", "Il modulo non si è potuto leggere. Riprova."));
   }
   const hash = String(form.get("hash") ?? "").trim().toLowerCase();
-  const reason = String(form.get("reason") ?? "").trim();
-  const email = String(form.get("email") ?? "").trim();
-  const detail = String(form.get("detail") ?? "").trim();
+  const invio = String(form.get("invio") ?? "").trim().toLowerCase();
+  const v: ValoriSegnala = {
+    reason: String(form.get("reason") ?? "").trim(),
+    detail: taglia(String(form.get("detail") ?? ""), 5000),
+    name: taglia(String(form.get("name") ?? ""), 200),
+    email: taglia(String(form.get("email") ?? ""), 320),
+    goodFaith: String(form.get("good_faith") ?? "") === "1",
+    // A form without a valid token (a page cached before 2026-09-27) still
+    // files: it just loses the double-click guard.
+    invio: REPORT_TOKEN_RE.test(invio) ? invio : "",
+  };
 
   // Rate-limit FIRST — before any validation — so malformed / spam POSTs are
   // throttled too (a spammer can't dodge the limiter by sending an invalid
   // reason and getting a cheap 400 before the limiter runs).
   if (reportRateLimited(clientIp(req))) {
-    return html(429, statusPage("Troppe segnalazioni", "Troppe segnalazioni da questa rete. Riprova tra qualche minuto."));
+    return htmlSegnala(429, paginaSegnalaMessaggio("Troppe segnalazioni", "Troppe segnalazioni da questa rete. Riprova fra qualche minuto.", hash));
   }
 
-  // hash + reason are mandatory; contact + detail are optional (anonymous
-  // reports are allowed under DSA Art.16). The RPC re-validates + hard-caps.
-  if (!REPORT_HASH_RE.test(hash)) {
-    return html(400, statusPage("Segnalazione non valida", "Il riferimento del contenuto non è valido."));
+  if (!REPORT_HASH_RE.test(hash)) return htmlSegnala(400, reportSenzaContenuto());
+  if (!REPORT_REASON_SET.has(v.reason)) {
+    return htmlSegnala(400, reportForm(hash, "Scegli il motivo della segnalazione.", v));
   }
-  if (!REPORT_REASON_SET.has(reason)) {
-    return html(400, reportForm(hash, "Seleziona un motivo valido per la segnalazione."));
+  if (v.reason !== REPORT_SPIEGAZIONE_FACOLTATIVA && v.detail.length < 10) {
+    return htmlSegnala(400, reportForm(hash, "Spiega perché il contenuto è illecito o viola le regole: senza una spiegazione la segnalazione non si può esaminare.", v));
+  }
+  if (v.email && !REPORT_EMAIL_RE.test(v.email)) {
+    return htmlSegnala(400, reportForm(hash, "L'indirizzo email non sembra valido. Correggilo, oppure lascia il campo vuoto.", v));
+  }
+  if (v.reason === REPORT_CON_FIRMA && (!v.name || !v.email)) {
+    return htmlSegnala(400, reportForm(hash, "Per una violazione del diritto d'autore servono il nome di chi ne è titolare (o di chi agisce per suo conto) e un'email: valgono come firma e recapito della segnalazione.", v));
+  }
+  if (!v.goodFaith) {
+    return htmlSegnala(400, reportForm(hash, "Per inviare la segnalazione serve la dichiarazione di buona fede in fondo al modulo.", v));
   }
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    return html(500, statusPage("Errore", "Server non configurato."));
+    return htmlSegnala(500, paginaSegnalaMessaggio("Errore", "Il server non è configurato. Riprova più tardi.", hash));
   }
-  const ok = await fileTakedownNotice(
-    hash,
-    reason,
-    email ? email.slice(0, 320) : null,
-    detail ? detail.slice(0, 5000) : null,
-  );
-  if (!ok) {
-    return html(502, statusPage("Invio non riuscito", "Si è verificato un problema tecnico. Riprova tra poco."));
+  const id = await fileTakedownNotice(hash, v);
+  if (id === null) {
+    return htmlSegnala(502, paginaSegnalaMessaggio("Invio non riuscito", "C'è stato un problema tecnico e la segnalazione non è arrivata. Riprova fra poco.", hash));
   }
-  return html(
-    200,
-    statusPage(
-      "Grazie, abbiamo ricevuto la tua segnalazione",
-      "Il nostro team la esaminerà al più presto. Se hai lasciato un contatto, potremmo scriverti per aggiornamenti.",
-    ),
-  );
+  // Post/Redirect/Get: the receipt is a GET, so reloading it (or coming back to
+  // it with «Indietro») never re-sends the form. The Location is relative: it
+  // stays on the host and path the form was posted to. The email never goes in
+  // the URL, only whether there is one.
+  return new Response(null, {
+    status: 303,
+    headers: {
+      Location: `?hash=${hash}&numero=${id}${v.email ? "&email=1" : ""}`,
+      "Cache-Control": "no-store",
+    },
+  });
 }
 
 // The anonymous POST touches the DB ONLY through this validated service-role
 // RPC. Mirrors fetchTemplate's raw-REST style (this function deliberately avoids
 // the supabase-js dependency): a POST to /rest/v1/rpc/<fn> IS an rpc() call.
-async function fileTakedownNotice(
-  hash: string,
-  reason: string,
-  email: string | null,
-  detail: string | null,
-): Promise<boolean> {
+// Returns the notice id (the reporter's receipt number), null on failure.
+async function fileTakedownNotice(hash: string, v: ValoriSegnala): Promise<number | null> {
   try {
     const resp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/file_takedown_notice`, {
       method: "POST",
@@ -3521,71 +3586,144 @@ async function fileTakedownNotice(
       body: JSON.stringify({
         p_hash: hash,
         p_channel: "share_page",
-        p_notice_type: reason === "copyright" ? "dmca" : "illegal_content",
-        p_reason: reason,
-        p_reporter_contact: email,
-        p_body: detail,
+        p_notice_type: v.reason === "copyright" ? "dmca" : "illegal_content",
+        p_reason: v.reason,
+        p_reporter_contact: v.email || null,
+        p_body: v.detail || null,
+        p_reporter_name: v.name || null,
+        p_good_faith: v.goodFaith,
+        p_submission_token: v.invio || null,
       }),
     });
-    return resp.ok;
+    if (!resp.ok) {
+      // The body is PostgREST's error (code, message), never the notice.
+      console.error(`file_takedown_notice: HTTP ${resp.status} ${(await resp.text()).slice(0, 300)}`);
+      return null;
+    }
+    const id = await resp.json();
+    return typeof id === "number" && Number.isSafeInteger(id) ? id : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-function reportForm(hash: string, error?: string): string {
-  const options = REPORT_REASONS
-    .map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`)
-    .join("");
+const STILE_SEGNALA = `
+    .modulo{max-width:600px;margin:0 auto;padding:40px 0 8px}
+    .modulo h1{font:400 34px/1.12 var(--serif);color:var(--inchiostro);margin:0 0 10px}
+    .modulo .lead{font:16px/1.55 var(--sans);color:var(--inchiostro-2);margin:0 0 8px}
+    .modulo label{display:block;font:600 15px/1.3 var(--sans);color:var(--inchiostro);margin:22px 0 7px}
+    .modulo .fac{font-weight:400;color:var(--inchiostro-2)}
+    .modulo select,.modulo input[type=text],.modulo input[type=email],.modulo textarea{display:block;width:100%;background:var(--foglio);color:var(--inchiostro);border:1px solid color-mix(in srgb,var(--inchiostro-2) 75%,var(--carta));border-radius:12px;padding:12px 14px;font:16px/1.45 var(--sans)}
+    .modulo textarea{min-height:150px;resize:vertical}
+    .modulo select:focus-visible,.modulo input:focus-visible,.modulo textarea:focus-visible{outline:2px solid var(--accento);outline-offset:1px}
+    .modulo .aiuto{font:13px/1.5 var(--sans);color:var(--inchiostro-2);margin:7px 0 0}
+    .modulo .informativa{margin:22px 0 0;padding:14px 16px;border:1px solid var(--filo-2);border-radius:12px;background:var(--carta-alta);font:13px/1.55 var(--sans);color:var(--inchiostro-2)}
+    .modulo .informativa a,.modulo .nota a{color:var(--accento-t)}
+    .modulo .dichiara{display:flex;gap:12px;align-items:flex-start;margin:22px 0 0;font:15px/1.5 var(--sans);color:var(--inchiostro);font-weight:400}
+    .modulo .dichiara input{flex:none;width:20px;height:20px;margin:2px 0 0;accent-color:var(--accento)}
+    .modulo .errore{margin:18px 0 0;padding:12px 14px;border-radius:12px;background:var(--pal-rose);color:var(--pal-rose-t);font:14px/1.5 var(--sans)}
+    .modulo .invia{width:100%;margin-top:26px;border:0;cursor:pointer}
+    .modulo .nota{margin:22px 0 0;font:13px/1.55 var(--sans);color:var(--inchiostro-2)}
+    .modulo .numero{font:600 15px/1.4 var(--sans);color:var(--inchiostro)}
+    .modulo .azioni{display:flex;flex-wrap:wrap;gap:12px;margin-top:24px}`;
+
+/// Page shell of the report channel, in the catalogue's look (testata, piede).
+/// The piede carries no «Segnala questo contenuto»: here it would point at the
+/// page itself, and from the receipt it would invite a duplicate.
+function paginaSegnala(titolo: string, dentro: string): string {
+  const corpo = `${testata()}
+  <main class="in"><div class="modulo">${dentro}</div></main>
+  ${piede()}`;
   return `<!doctype html>
 <html lang="it">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
   <meta name="robots" content="noindex" />
-  <title>Segnala un contenuto · Fluera</title>
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body { margin:0; background:#0a0a0b; color:#f4f4f5; font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-    .wrap { max-width:560px; margin:0 auto; padding:32px 20px 64px; }
-    .brand { display:flex; align-items:center; gap:8px; font-weight:600; color:#a1a1aa; margin-bottom:20px; }
-    h1 { font-size:24px; line-height:1.25; margin:0 0 8px; }
-    p.lead { color:#a1a1aa; margin:0 0 24px; }
-    label { display:block; font-size:14px; font-weight:600; margin:18px 0 6px; }
-    select, input, textarea { width:100%; background:#18181b; color:#f4f4f5; border:1px solid #ffffff1f; border-radius:12px; padding:12px 13px; font:inherit; }
-    textarea { min-height:120px; resize:vertical; }
-    .hint { color:#71717a; font-size:12px; margin:6px 0 0; }
-    .err { background:#7f1d1d; color:#fecaca; border:1px solid #ffffff1f; border-radius:12px; padding:12px 14px; margin:0 0 18px; font-size:14px; }
-    .btn { display:block; width:100%; margin-top:26px; background:#6366f1; color:#fff; border:none; font-weight:600; padding:15px 18px; border-radius:14px; font:inherit; cursor:pointer; }
-    .foot { color:#71717a; font-size:12px; margin-top:20px; }
-    a { color:#818cf8; }
-  </style>
+  <title>${esc(titolo)} · Fluera</title>${testaWeb(STILE_SEGNALA)}
 </head>
 <body>
-  <div class="wrap">
-    <div class="brand">🌱 Fluera · Segnalazione</div>
-    <h1>Segnala questo contenuto</h1>
-    <p class="lead">Puoi segnalare un template di studio anche senza account. La segnalazione è anonima, salvo che tu non lasci un contatto.</p>
-    ${error ? `<div class="err">${esc(error)}</div>` : ""}
-    <form method="post">
-      <input type="hidden" name="hash" value="${esc(hash)}" />
-      <label for="reason">Motivo</label>
-      <select id="reason" name="reason" required>
-        <option value="" disabled selected>Seleziona un motivo…</option>
-        ${options}
-      </select>
-      <label for="email">Email di contatto (facoltativa)</label>
-      <input id="email" name="email" type="email" maxlength="320" autocomplete="email" placeholder="tu@esempio.com" />
-      <p class="hint">Lasciala se vuoi ricevere aggiornamenti sull'esito. Non è obbligatoria.</p>
-      <label for="detail">Dettagli</label>
-      <textarea id="detail" name="detail" maxlength="5000" placeholder="Descrivi il problema (facoltativo ma utile)."></textarea>
-      <button class="btn" type="submit">Invia segnalazione</button>
-    </form>
-    <p class="foot">Le segnalazioni sono esaminate dal team di moderazione. Per richieste legali (DMCA / 17 U.S.C. §512) o reclami ai sensi del DSA puoi anche scrivere a abuse@fluera.dev.</p>
-  </div>
+  ${spriteIcone(corpo)}${corpo}
 </body>
 </html>`;
+}
+
+/// A short message (errors, limits) with a way back.
+function paginaSegnalaMessaggio(titolo: string, testo: string, hash = ""): string {
+  const indietro = hash
+    ? `<a class="btn ghost" href="?hash=${esc(hash)}">Torna al modulo</a>`
+    : `<a class="btn ghost" href="${esc(urlElenco("it"))}">Tutti i template</a>`;
+  return paginaSegnala(titolo, `<h1>${esc(titolo)}</h1><p class="lead">${esc(testo)}</p><div class="azioni">${indietro}</div>`);
+}
+
+/// /report without a content reference: the form would be a dead end (the
+/// notice needs to know WHICH content), so say where to start instead.
+function reportSenzaContenuto(): string {
+  return paginaSegnala(
+    "Segnala un contenuto",
+    `<h1>Segnala un contenuto</h1>
+    <p class="lead">Per segnalare un template apri la sua pagina e usa «Segnala»: così sappiamo di quale contenuto si tratta.</p>
+    <p class="nota">Puoi anche scrivere a <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a>, l'indirizzo per segnalazioni e richieste di rimozione.</p>
+    <div class="azioni"><a class="btn ghost" href="${esc(urlElenco("it"))}">Tutti i template</a></div>`,
+  );
+}
+
+/// The receipt, reached by the 303 after a POST (GET /report?hash=…&numero=…).
+/// It reads only the URL: a hand-made URL shows a number, nothing else.
+function reportRicevuta(hash: string, numero: string, conEmail: boolean): string {
+  const seguito = conEmail
+    ? `Ti scriviamo all'indirizzo che hai lasciato per confermare che l'abbiamo ricevuta e per comunicarti la decisione.`
+    : `Non hai lasciato un indirizzo email: la esaminiamo lo stesso, ma non potremo comunicarti la decisione.`;
+  return paginaSegnala(
+    "Segnalazione ricevuta",
+    `<h1>Segnalazione ricevuta</h1>
+    <p class="numero">Numero della segnalazione: ${esc(numero)}</p>
+    <p class="lead">La esaminiamo e decidiamo il prima possibile. ${seguito}</p>
+    <p class="nota">Se scrivi a <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a> per questa segnalazione, indica il numero.</p>
+    <div class="azioni"><a class="btn ghost" href="s/${esc(hash)}">Torna al contenuto</a></div>`,
+  );
+}
+
+/// Il modulo non ha `action`: invia all'indirizzo della pagina che lo mostra.
+/// Fino al 2026-09-27 era `https://share.fluera.dev/report…` assoluto, e da
+/// un'anteprima locale il clic su «Invia» ha depositato una segnalazione finta
+/// nel registro di PRODUZIONE. Senza `action` il POST resta dove sta la pagina
+/// (locale, anteprima di Deno Deploy, prefisso di Supabase).
+function reportForm(hash: string, error?: string, v: ValoriSegnala = SEGNALA_VUOTO): string {
+  if (!hash) return reportSenzaContenuto();
+  // One token per form: re-rendered with an error it stays the same (nothing
+  // was filed), a fresh visit gets a new one.
+  const invio = v.invio || crypto.randomUUID();
+  const options = REPORT_REASONS
+    .map(([val, label]) => `<option value="${esc(val)}"${val === v.reason ? " selected" : ""}>${esc(label)}</option>`)
+    .join("");
+  return paginaSegnala(
+    "Segnala un contenuto",
+    `<h1>Segnala questo contenuto</h1>
+    <p class="lead">Puoi segnalare un template anche senza account. Ogni segnalazione viene esaminata da una persona.</p>
+    ${error ? `<p class="errore" role="alert">${esc(error)}</p>` : ""}
+    <form method="post">
+      <input type="hidden" name="hash" value="${esc(hash)}" />
+      <input type="hidden" name="invio" value="${esc(invio)}" />
+      <label for="reason">Motivo</label>
+      <select id="reason" name="reason" required>
+        <option value="" disabled${v.reason ? "" : " selected"}>Scegli un motivo…</option>
+        ${options}
+      </select>
+      <label for="detail">Perché questo contenuto è illecito o viola le regole</label>
+      <textarea id="detail" name="detail" maxlength="5000" aria-describedby="detail-aiuto">${esc(v.detail)}</textarea>
+      <p class="aiuto" id="detail-aiuto">Indica che cosa, e dove nel contenuto; per il diritto d'autore, anche quale opera è protetta. Obbligatoria, tranne per le segnalazioni sulla sicurezza dei minori.</p>
+      <label for="name">Nome e cognome, o ente <span class="fac">(facoltativo, tranne per il diritto d'autore)</span></label>
+      <input id="name" name="name" type="text" maxlength="200" autocomplete="name" value="${esc(v.name)}" />
+      <label for="email">Email <span class="fac">(facoltativa, tranne per il diritto d'autore)</span></label>
+      <input id="email" name="email" type="email" maxlength="320" autocomplete="email" value="${esc(v.email)}" aria-describedby="email-aiuto" />
+      <p class="aiuto" id="email-aiuto">Se la lasci, ti scriviamo per confermare la ricezione e per comunicarti la decisione.</p>
+      <p class="informativa">I dati di questo modulo li tratta il titolare, Lorenco Shametaj, solo per esaminare la segnalazione e risponderti, come chiede il DSA (Regolamento UE 2022/2065; base giuridica: art. 6.1.c GDPR e, per prevenire gli abusi, art. 6.1.f). Restano nel registro delle segnalazioni per il tempo necessario a gestire eventuali reclami o ricorsi. Per accedervi, correggerli, opporti o chiederne la cancellazione scrivi a <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a>. <a href="${SITE}/legal/privacy/">Informativa completa</a>.</p>
+      <label class="dichiara"><input type="checkbox" name="good_faith" value="1" required${v.goodFaith ? " checked" : ""} /><span>Dichiaro in buona fede che le informazioni di questa segnalazione sono esatte e complete e, se segnalo una violazione del diritto d'autore, di esserne il titolare o di essere autorizzato ad agire per suo conto.</span></label>
+      <button class="btn primary invia" type="submit">Invia la segnalazione</button>
+    </form>
+    <p class="nota">Puoi anche scrivere a <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a>, l'indirizzo per segnalazioni e richieste di rimozione.</p>`,
+  );
 }
 
 // ── referral click log ───────────────────────────────────────────────────────
