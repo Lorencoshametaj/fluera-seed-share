@@ -1871,11 +1871,17 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
       : Promise.resolve<EsitoRpc<VetrinaWeb>>({ ok: true, rows: [] }),
   ]);
   if (!h.ok) return rispostaGuasto(`list_web_hubs(${lingua}): ${h.motivo}`);
+  if (!s.ok) return rispostaGuasto(`list_web_seeds(${lingua}): ${s.motivo}`);
   const hubs = hubValidi(h.rows);
-  if (hubs.length === 0 && (lingua !== "it" || pagina > 1)) return nonTrovata();
+  // F4 (29/09): l'indice mostra i pack visibili anche quando nessun elenco di
+  // materia supera la soglia (3 pack di 2 autori): prima un pack di uno
+  // studente, da solo, non compariva in nessun elenco del sito. Resta fuori da
+  // Google (siIndicizza vuole un elenco indicizzabile).
+  const vuoto = hubs.length === 0 && semiValidi(s.rows).length === 0;
+  if (vuoto && (lingua !== "it" || pagina > 1)) return nonTrovata();
   const self = urlElenco(lingua);
   const descrizione = "Pack di appunti divisi per materia, da aprire in Fluera: un canvas per imparare, dove ci scrivi sopra a mano.";
-  if (hubs.length === 0) {
+  if (vuoto) {
     return paginaWeb({
       lingua,
       titolo: "Template di studio e appunti per materia · Fluera",
@@ -1886,7 +1892,6 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
       corpo: statoVuoto("eco", "Ancora nessun template", "I pack di studio arrivano presto. Torna a trovarci!", { testo: "Scopri Fluera", href: SITE }, 1),
     });
   }
-  if (!s.ok) return rispostaGuasto(`list_web_seeds(${lingua}): ${s.motivo}`);
   if (!v.ok) console.error(`vetrine di ${lingua}: ${v.motivo}`);
   const semi = semiValidi(s.rows);
   if (pagina > 1 && semi.length === 0) return nonTrovata();
