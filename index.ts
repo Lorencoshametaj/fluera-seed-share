@@ -85,12 +85,9 @@ export interface SeedRow {
   // in cui quel CHECK cade.
   price_cents?: number | null;
   superseded_by?: string | null;
-  // La regola di Google calcolata dal database (seed_web_indicizzabile, 213;
-  // riscritta dalla F4). Assente su un database prima della 213.
+  // La regola di Google calcolata dal database (seed_web_indicizzabile, 213).
+  // Assente su un database prima della 213.
   web_indicizzabile?: boolean | null;
-  // La regola del SITO (seed_web_visibile, F4, 2026-09-28): il pack sta negli
-  // elenchi di share.fluera.dev. Assente su un database prima della F4.
-  web_visibile?: boolean | null;
 }
 
 /// 🔎 Su Google solo ciò di cui rispondiamo noi. La regola vive in SQL
@@ -100,51 +97,6 @@ export interface SeedRow {
 /// sitemap dicevano due cose diverse. Campo assente = non indicizzabile.
 export function indicizzabile(row: SeedRow): boolean {
   return row.web_indicizzabile === true;
-}
-
-/// 🗂️ Sul SITO (F4, 2026-09-28): i pack degli studenti compaiono negli elenchi
-/// subito, su Google solo oltre la soglia. La regola è del database
-/// (seed_web_visibile) e arriva come `web_visibile`: qui si LEGGE e basta.
-/// Chi è indicizzabile è anche visibile per costruzione (la regola di Google è
-/// quella del sito più la soglia), così un database fra la 213 e la F4 non
-/// toglie gli ufficiali. Campo assente e niente indicizzabile = non visibile.
-export function visibile(row: SeedRow): boolean {
-  return row.web_visibile === true || indicizzabile(row);
-}
-
-/// 🚪 Tolto dal sito (F4): il pack di uno studente che il database dice NON
-/// visibile — autore sospeso o bandito, account cancellato o anonimo, Termini
-/// che non coprono il web (mkt-2026-08, 2.2 (c) e (d)), 18+. La /s/ risponde
-/// 410 come per un pack revocato (zero righe da get_study_seed), og.png il
-/// ripiego generico: la pagina mostra titolo, descrizione e miniatura, e
-/// senza quelle condizioni il sito non li mostra.
-/// Solo un `false` esplicito: un campo assente vuol dire un database prima
-/// della F4, dove la /s/ di uno studente resta quella di prima (noindex, in
-/// nessun elenco) — un 410 lì romperebbe ogni link dell'app. Gli ufficiali
-/// non passano da qui: un curato in attesa o un 18+ restano come oggi.
-export function toltoDalSito(row: SeedRow): boolean {
-  return row.is_official !== true && row.web_visibile === false && !indicizzabile(row);
-}
-
-/// ` rel="nofollow"` sui link interni verso una pagina che il sito mostra ma
-/// Google non prende (F4): un pack sotto soglia o un elenco di soli pack sotto
-/// soglia. Il link resta — l'elenco è del sito — ma i motori non lo seguono.
-/// Campo assente = nofollow: si fallisce chiusi, come per il noindex.
-const relSeNonIndicizzabile = (x: { web_indicizzabile?: boolean | null }) =>
-  x.web_indicizzabile === true ? "" : ` rel="nofollow"`;
-
-/// L'autore da mostrare, come marketplaceAuthorLabel dell'app (MW:179-207):
-/// «Fluera» SOLO dal bit is_official del server, mai dal nome; per gli altri
-/// «@» + i primi 6 caratteri del codice autore pseudonimo (Creator Terms 2.5).
-/// «fluera» (in qualunque maiuscola) è il segnaposto con cui le letture del
-/// web marcano gli ufficiali: su una riga NON ufficiale vale «nessun autore»,
-/// come nell'app — mai il marchio, nemmeno con la chiocciola.
-/// null = la riga non dice di chi è (niente riga «autore» sulla scheda).
-export function autoreMostrato(r: { is_official?: boolean | null; author_code?: string | null }): string | null {
-  if (r.is_official === true) return "Fluera";
-  const codice = (r.author_code ?? "").trim().replace(/^@/, "");
-  if (!codice || codice.toLowerCase() === "fluera") return null;
-  return `@${[...codice].slice(0, 6).join("")}`;
 }
 
 /// I token robots.txt dei crawler di ADDESTRAMENTO, come li scrivono i loro
@@ -700,10 +652,6 @@ export const servi = async (req: Request): Promise<Response> => {
   if (esito.tipo === "guasto") return rispostaGuasto(`get_study_seed per ${hash}: ${esito.motivo}`);
   if (esito.tipo === "assente") return html(410, paginaStato("Non più disponibile", "Questo template è stato rimosso o non è più pubblico."));
   const row = esito.row;
-  // 🚪 F4: uno studente che il database non mette sul sito sparisce come un
-  // pack revocato — anche da un link vecchio della catena (niente 301 verso
-  // una pagina che non c'è).
-  if (toltoDalSito(row)) return html(410, paginaStato("Non più disponibile", "Questo template è stato rimosso o non è più pubblico."));
 
   // C1: attribution is an OPTIONAL "?ref={referralCode}" query param. Read it
   // here and forward it into every store/app-open URL so an install attributes
@@ -741,15 +689,12 @@ export const servi = async (req: Request): Promise<Response> => {
   }
 
   // 📱 Niente user-agent qui: la pagina è la STESSA per ogni telefono (S6).
-  // Link interni e scheda (voto, efficacia, argomenti) solo sui pack che il
-  // sito mostra (F4: anche gli studenti sotto soglia, noindex): la pagina fa
-  // parte del catalogo. Qui un pack non visibile è un ufficiale non ancora
-  // approvato o una riga di un database prima della F4: get_web_scheda
-  // darebbe comunque 0 righe, e i link non si chiedono nemmeno.
+  // Link interni e scheda (voto, efficacia, argomenti) solo dove Google
+  // entra: su una noindex get_web_scheda darebbe comunque 0 righe.
   // Senza miniatura la pagina mostra l'iniziale del titolo come l'app
   // (TD:1945-1965), non più la card og: i pack curati pubblicati senza
   // `--thumb` si sistemano alla pubblicazione, non qui.
-  const [vicini, scheda] = visibile(row)
+  const [vicini, scheda] = indicizzabile(row)
     ? await Promise.all([fetchVicini(row), fetchScheda(row.hash)])
     : [NESSUN_VICINO, null];
   return paginaSeme(renderPage(row, ref, vicini, scheda), indicizzabile(row));
@@ -817,15 +762,12 @@ async function fetchTemplate(hash: string): Promise<EsitoSeme> {
   }
 }
 
-// ── Gli elenchi del web (F2, 2026-09-24; F4, 2026-09-28) ────────────────────
-// Le letture del database restituiscono SOLO semi VISIBILI (list_web_seeds,
-// list_web_vetrine, get_web_scheda: ufficiali e, dalla F4, studenti ammessi),
-// ognuno col suo web_indicizzabile, e SOLO elenchi sopra soglia (list_web_hubs:
-// abbastanza semi visibili, e mai il profilo di una persona sola; Fluera conta
-// come un autore), ognuno col suo web_indicizzabile. La sitemap
-// (list_web_sitemap) solo gli indicizzabili. Qui le soglie non si
-// ricalcolano: un elenco esiste se e solo se list_web_hubs lo restituisce, e
-// va su Google se e solo se il database lo dice.
+// ── Gli elenchi del web (F2, 2026-09-24) ────────────────────────────────────
+// Le tre letture della 213 restituiscono SOLO semi indicizzabili (list_web_seeds)
+// e SOLO elenchi sopra soglia (list_web_hubs: almeno 3 semi, e tutti ufficiali
+// oppure almeno 2 account — un elenco di un solo autore sarebbe il profilo di
+// una persona). Qui la soglia non si ricalcola: un elenco esiste se e solo se
+// list_web_hubs lo restituisce.
 const HASH_INTERO_RE = new RegExp(`^${HASH_RE.source}$`);
 const SHARE = "https://share.fluera.dev";
 const CORRELATI_MAX = 6;
@@ -868,19 +810,14 @@ type SemeWeb = {
   efficacia_pct?: number | null;
   efficacia_studenti?: number | null;
   created_at?: string | null;
-  // F4: l'autore da mostrare (il codice pseudonimo; gli ufficiali «Fluera»
-  // dal bit is_official) e se il pack va su Google. Assente = no (nofollow).
-  author_code?: string | null;
-  web_indicizzabile?: boolean | null;
 };
 /// Una riga di list_web_vetrine (218): la scheda più la vetrina e il posto.
 type VetrinaWeb = SemeWeb & { vetrina: string; posto: number };
-/// Una riga di get_web_scheda (218; F4): 0 righe se il pack non è visibile.
+/// Una riga di get_web_scheda (218): 0 righe se il pack non è indicizzabile.
 type SchedaWeb = Pick<
   SemeWeb,
   | "hash" | "category" | "tags" | "concept_count" | "is_official" | "is_featured" | "ai_generated"
   | "voto_medio" | "voti" | "efficacia_pct" | "efficacia_studenti" | "created_at" | "updated_at"
-  | "author_code" | "web_indicizzabile"
 >;
 type HubWeb = {
   materia_slug: string;
@@ -889,9 +826,6 @@ type HubWeb = {
   corso: string | null;
   n: number | string | null;
   lastmod: string | null;
-  // F4: l'elenco esiste con abbastanza pack visibili e va su Google solo con
-  // abbastanza pack indicizzabili. Assente = noindex: si fallisce chiusi.
-  web_indicizzabile?: boolean | null;
 };
 
 /// Le materie di seed_web_materia_slug (213) con l'etichetta italiana e
@@ -1066,34 +1000,30 @@ const hubValidi = (rows: HubWeb[]) =>
 const titoloSeme = (t: string | null) => (t ?? "").trim() || "Template di studio";
 
 // ── Link interni di una /s/: «Ti potrebbero interessare», briciole, elenchi ──
-/// Un link verso un elenco: `nofollow` quando l'elenco è sul sito ma non su
-/// Google (F4).
-type LinkElenco = { url: string; nofollow: boolean };
 type Vicini = {
   correlati: SemeWeb[];
-  tutti: { href: string; nome: string; nofollow: boolean } | null;
-  /// Solo verso elenchi che esistono E contengono il seme; vuote sui non visibili.
-  briciole: Array<{ nome: string } & LinkElenco>;
+  tutti: { href: string; nome: string } | null;
+  /// Solo verso elenchi che esistono E contengono il seme; vuote sulle noindex.
+  briciole: Array<{ nome: string; url: string }>;
   /// «Tutto il catalogo →»: l'indice della lingua, se ha elenchi.
   catalogo: string;
   /// Il corso del seme come lo scrive list_web_seeds (titolo e JSON-LD).
   corso: string | null;
   /// L'elenco della materia, se contiene il seme (la casella «Materia»).
-  hubMateria: LinkElenco | null;
+  hubMateria: string | null;
 };
 const NESSUN_VICINO: Vicini = { correlati: [], tutti: null, briciole: [], catalogo: urlElenco("it"), corso: null, hubMateria: null };
 
-/// Altri semi della stessa materia e lingua (list_web_seeds: visibili per
-/// costruzione, ognuno col suo web_indicizzabile, mai il seme stesso), prima
-/// quelli dello stesso corso, e, se il seme sta in un elenco sopra soglia, il
-/// link all'elenco: quello del corso se c'è, se no quello della materia. Fino
-/// al 2026-09-24 i link venivano da browse_study_seeds filtrato con la copia
-/// TypeScript della regola.
+/// Altri semi della stessa materia e lingua (list_web_seeds: indicizzabili per
+/// costruzione, mai il seme stesso), prima quelli dello stesso corso, e, se il
+/// seme sta in un elenco sopra soglia, il link all'elenco: quello del corso se
+/// c'è, se no quello della materia. Fino al 2026-09-24 i link venivano da
+/// browse_study_seeds filtrato con la copia TypeScript della regola.
 /// Best-effort: un guasto toglie i link, mai la pagina; per questo il tetto di
 /// tempo.
 async function fetchVicini(row: SeedRow): Promise<Vicini> {
   const materia = materiaDi(row.discipline);
-  const appunti = { nome: "Appunti", url: urlElenco("it"), nofollow: false };
+  const appunti = { nome: "Appunti", url: urlElenco("it") };
   if (!materia) return { ...NESSUN_VICINO, briciole: [appunti] };
   const lingua = linguaDi(row.locale);
   const [s, h] = await Promise.all([
@@ -1116,33 +1046,26 @@ async function fetchVicini(row: SeedRow): Promise<Vicini> {
   const stessoCorso = (r: SemeWeb) => !!io?.corso_slug && r.corso_slug === io.corso_slug;
   const nomeM = (hubM?.materia ?? "").trim() || MATERIE[materia].it;
   const nomeC = (hubCorso?.corso ?? "").trim() || (io?.course ?? "").trim();
-  const nf = (x: HubWeb) => x.web_indicizzabile !== true;
   return {
     correlati: [...altri.filter(stessoCorso), ...altri.filter((r) => !stessoCorso(r))].slice(0, CORRELATI_MAX),
     tutti: hub && lingua
       ? {
         href: urlElenco(lingua, hub.materia_slug, hub.corso_slug),
         nome: (hubCorso ? hub.corso : hub.materia) ?? MATERIE[materia].it,
-        nofollow: nf(hub),
       }
       : null,
     briciole: [
-      { nome: "Appunti", url: indice, nofollow: false },
-      ...(hubM && lingua ? [{ nome: nomeM, url: urlElenco(lingua, hubM.materia_slug), nofollow: nf(hubM) }] : []),
-      ...(hubCorso && lingua && nomeC
-        ? [{ nome: nomeC, url: urlElenco(lingua, hubCorso.materia_slug, hubCorso.corso_slug), nofollow: nf(hubCorso) }]
-        : []),
+      { nome: "Appunti", url: indice },
+      ...(hubM && lingua ? [{ nome: nomeM, url: urlElenco(lingua, hubM.materia_slug) }] : []),
+      ...(hubCorso && lingua && nomeC ? [{ nome: nomeC, url: urlElenco(lingua, hubCorso.materia_slug, hubCorso.corso_slug) }] : []),
     ],
     catalogo: indice,
     corso: (io?.course ?? "").trim() || null,
-    hubMateria: hubM && lingua ? { url: urlElenco(lingua, hubM.materia_slug), nofollow: nf(hubM) } : null,
+    hubMateria: hubM && lingua ? urlElenco(lingua, hubM.materia_slug) : null,
   };
 }
 
-/// ` rel="nofollow"` di un link verso un elenco.
-const relElenco = (l: { nofollow: boolean }) => (l.nofollow ? ` rel="nofollow"` : "");
-
-/// I campi della scheda di UN pack visibile (get_web_scheda, 218; F4).
+/// I campi della scheda di UN pack indicizzabile (get_web_scheda, 218).
 /// Best-effort come i link: 0 righe o un guasto tolgono voto, efficacia,
 /// categoria ed etichette, mai la pagina.
 async function fetchScheda(hash: string): Promise<SchedaWeb | null> {
@@ -1479,14 +1402,13 @@ function schedaSeme(r: SemeWeb, griglia: boolean, subito = false): string {
   const eNuovo = nuovo(r);
   const sopra = (fiducia(r) || (eNuovo ? `<span class="nuovo" aria-hidden="true">Nuovo</span>` : "")) +
     (cat ? `<span class="categoria" aria-hidden="true">${ic(cat[1])}<span>${esc(cat[0])}</span></span>` : "");
-  // F4 (2026-09-28): i pack degli studenti stanno negli elenchi con il loro
-  // autore, come nell'app: il codice pseudonimo (Creator Terms 2.5), mai un
-  // distintivo. «Fluera» e «Ufficiale» solo dal bit is_official.
-  const autore = autoreMostrato(r);
+  // Mai author_code sulle pagine indicizzate (dati_web §1): oggi ci arrivano
+  // solo pack ufficiali, e l'autore degli studenti lo decide la F3.
+  const autore = r.is_official === true ? "Fluera" : null;
   const eff = griglia ? numero(r.efficacia_pct) : null;
   const voto = numero(r.voto_medio);
   const n = numero(r.concept_count);
-  return `<li><a class="scheda" href="${SHARE}/s/${esc(r.hash)}"${relSeNonIndicizzabile(r)}>${anteprima(r, subito, sopra)}<span class="testi"><h3 class="t"${attrLingua(r)}>${esc(t)}</h3>${
+  return `<li><a class="scheda" href="${SHARE}/s/${esc(r.hash)}">${anteprima(r, subito, sopra)}<span class="testi"><h3 class="t"${attrLingua(r)}>${esc(t)}</h3>${
     autore ? `<span class="autore">${pallino(autore)}${esc(autore)}</span>` : ""
   }${eff !== null ? `<span class="pillola">${ic("trending")}+${Math.round(eff)}% ritenzione</span>` : ""}${
     voto !== null ? stelle(voto, numero(r.voti)) : ""
@@ -1499,9 +1421,8 @@ function schedaSeme(r: SemeWeb, griglia: boolean, subito = false): string {
 function schedaEvidenza(r: SemeWeb): string {
   const t = (r.title ?? "").trim() || "Senza titolo";
   const voto = numero(r.voto_medio);
-  const autore = autoreMostrato(r);
-  return `<li><a class="scheda evid" href="${SHARE}/s/${esc(r.hash)}"${relSeNonIndicizzabile(r)}>${anteprima(r, false, fiducia(r))}<span class="testi"><span class="col"><h3 class="t"${attrLingua(r)}>${esc(t)}</h3>${
-    autore ? `<span class="autore">${pallino(autore, "p24")}${esc(autore)}</span>` : ""
+  return `<li><a class="scheda evid" href="${SHARE}/s/${esc(r.hash)}">${anteprima(r, false, fiducia(r))}<span class="testi"><span class="col"><h3 class="t"${attrLingua(r)}>${esc(t)}</h3>${
+    r.is_official === true ? `<span class="autore">${pallino("Fluera", "p24")}Fluera</span>` : ""
   }${voto !== null ? stelle(voto, numero(r.voti)) : ""}${dopoIlTitolo([nomeFiducia(r)])}</span><span class="tondo" aria-hidden="true">${ic("arrow")}</span></span></a></li>`;
 }
 
@@ -1517,13 +1438,8 @@ function bannerEvidenza(r: SemeWeb): string {
     : n !== null && n > 0
     ? `<span class="e-conc">${ic("hub")}${concetti(n)}</span>`
     : "<span></span>";
-  // «Selezionati dal team Fluera» resta anche su un pack di uno studente: è
-  // vero (In evidenza lo sceglie il team), e l'autore sotto dice di chi è.
-  const autore = autoreMostrato(r);
-  return `<div class="eroe"><a class="eroe-a" href="${SHARE}/s/${esc(r.hash)}"${relSeNonIndicizzabile(r)}><span class="e-testi"><span class="occhiello">Selezionati dal team Fluera</span><h3${attrLingua(r)}>${esc(t)}</h3>${
-    autore
-      ? `<span class="e-autore"><span class="e-pal" aria-hidden="true">${esc([...autore.replace(/^@/, "")][0]?.toUpperCase() ?? "?")}</span>${esc(autore)}</span>`
-      : ""
+  return `<div class="eroe"><a class="eroe-a" href="${SHARE}/s/${esc(r.hash)}"><span class="e-testi"><span class="occhiello">Selezionati dal team Fluera</span><h3${attrLingua(r)}>${esc(t)}</h3>${
+    r.is_official === true ? `<span class="e-autore"><span class="e-pal" aria-hidden="true">F</span>Fluera</span>` : ""
   }</span><span class="e-img"><span class="e-foglio">${
     img
       ? `<img src="${esc(img)}" alt="" width="400" height="300" fetchpriority="high" decoding="async" />`
@@ -1555,15 +1471,9 @@ const striscia = (titolo: string, schede: string, classe = "") =>
 const materieDi = (hubs: HubWeb[]) =>
   [...new Set(hubs.filter((x) => x.corso_slug === null).map((x) => x.materia_slug))];
 
-/// ` rel="nofollow"` verso l'elenco di una materia (o di un corso) che il sito
-/// mostra ma Google no (F4) — o che list_web_hubs non restituisce.
-const relHub = (hubs: HubWeb[], materia: string, corso: string | null = null) =>
-  relSeNonIndicizzabile(hubs.find((x) => x.materia_slug === materia && x.corso_slug === corso) ?? {});
-
 /// I chip delle MATERIE al posto dei chip categoria dell'app: sul web oggi
-/// ogni pack è «study», e la materia è il percorso. Link veri verso gli
-/// elenchi (nofollow verso quelli che Google non prende, F4); nella ricerca
-/// portano la ricerca con la materia.
+/// ogni pack è «study», e la materia è il percorso. Link normali verso pagine
+/// indicizzabili; nella ricerca portano la ricerca con la materia.
 function chipMaterie(lingua: string, hubs: HubWeb[], attuale: string | null, q: string | null, ordine: Ordine = "consigliati"): string {
   const href = (k: string | null) => {
     if (q === null) return urlElenco(lingua, k);
@@ -1573,9 +1483,7 @@ function chipMaterie(lingua: string, hubs: HubWeb[], attuale: string | null, q: 
     return `${urlElenco(lingua)}cerca?${p}`;
   };
   const voce = (k: string | null, nome: string) =>
-    `<li><a class="chip" href="${esc(href(k))}"${attuale === k ? ` aria-current="page"` : ""}${
-      k && q === null ? relHub(hubs, k) : ""
-    }>${k ? ic(iconaMateria(k)) : ""}<span${
+    `<li><a class="chip" href="${esc(href(k))}"${attuale === k ? ` aria-current="page"` : ""}>${k ? ic(iconaMateria(k)) : ""}<span${
       k ? langElenco(lingua) : ""
     }>${esc(nome)}</span></a></li>`;
   return `<nav class="chips" aria-label="Materie"><ul>${voce(null, "Tutte")}${
@@ -1592,10 +1500,10 @@ function faccettaCorso(lingua: string, hubs: HubWeb[], materia: string | null, c
   const voce = (h: HubWeb) =>
     `<li><a href="${urlElenco(lingua, h.materia_slug, h.corso_slug)}"${
       h.materia_slug === materia && h.corso_slug === corso ? ` aria-current="page"` : ""
-    }${relSeNonIndicizzabile(h)}${langElenco(lingua)}>${esc(nomeC(h))}<span class="conta">(${Math.max(0, Number(h.n) || 0)})</span></a></li>`;
+    }${langElenco(lingua)}>${esc(nomeC(h))}<span class="conta">(${Math.max(0, Number(h.n) || 0)})</span></a></li>`;
   const attivo = corso ? corsi.find((h) => h.corso_slug === corso) : undefined;
   const menu = materia
-    ? `<li><a href="${urlElenco(lingua, materia)}"${corso ? "" : ` aria-current="page"`}${relHub(hubs, materia)}>Tutti i corsi</a></li><li role="separator"></li>${corsi.map(voce).join("")}`
+    ? `<li><a href="${urlElenco(lingua, materia)}"${corso ? "" : ` aria-current="page"`}>Tutti i corsi</a></li><li role="separator"></li>${corsi.map(voce).join("")}`
     : materieDi(hubs).map((k) => {
       const suoi = corsi.filter((h) => h.materia_slug === k);
       return suoi.length ? `<li class="gruppo"${langElenco(lingua)}>${esc(nomeMateria(hubs, k))}</li>${suoi.map(voce).join("")}` : "";
@@ -1703,11 +1611,9 @@ function mappaCorsi(lingua: string, hubs: HubWeb[]): string {
   const la = langElenco(lingua);
   const voci = materieDi(hubs).map((k) => {
     const corsi = hubs.filter((x) => x.materia_slug === k && x.corso_slug !== null)
-      .map((x) =>
-        `<li><a href="${urlElenco(lingua, k, x.corso_slug)}"${relSeNonIndicizzabile(x)}${la}>${esc((x.corso ?? "").trim() || (x.corso_slug ?? ""))}</a></li>`
-      )
+      .map((x) => `<li><a href="${urlElenco(lingua, k, x.corso_slug)}"${la}>${esc((x.corso ?? "").trim() || (x.corso_slug ?? ""))}</a></li>`)
       .join("");
-    return `<li><a class="m" href="${urlElenco(lingua, k)}"${relHub(hubs, k)}${la}>${esc(nomeMateria(hubs, k))}</a>${corsi ? `<ul>${corsi}</ul>` : ""}</li>`;
+    return `<li><a class="m" href="${urlElenco(lingua, k)}"${la}>${esc(nomeMateria(hubs, k))}</a>${corsi ? `<ul>${corsi}</ul>` : ""}</li>`;
   }).join("");
   return voci ? `<section class="mappa" aria-labelledby="t-mappa"><h2 id="t-mappa">Materie e corsi</h2><ul>${voci}</ul></section>` : "";
 }
@@ -1729,14 +1635,6 @@ function mappaCorsi(lingua: string, hubs: HubWeb[]): string {
 const FOCUS_STRISCIA = `document.addEventListener("focusin",function(e){var t=e.target,s=t.closest(".striscia"),a,b;if(!t.matches(":focus-visible"))return;if(s&&t.tagName==="A"){a=t.getBoundingClientRect();b=s.getBoundingClientRect();t.scrollIntoView({block:"nearest",inline:a.left-5<b.left||a.right+5>b.right?"start":"nearest"})}else t.closest(".chips a")&&t.scrollIntoView({block:"nearest",inline:"nearest"})});`;
 const AIUTO_MENU = `<script>(function(){var D=document,d=D.querySelectorAll("details.menu-a"),o=D.addEventListener.bind(D);function c(e){for(var i=0;i<d.length;i++)if(!e||!d[i].contains(e.target))d[i].removeAttribute("open")}o("click",c);o("keydown",function(e){e.key==="Escape"&&c()});${FOCUS_STRISCIA}})();</script>`;
 const AIUTO_STRISCIA = `<script>${FOCUS_STRISCIA}</script>`;
-
-/// Le voci dell'ItemList di un elenco: SOLO i pack indicizzabili (F4), ognuno
-/// col suo posto nella griglia. Un pack sotto soglia sta nella pagina (con il
-/// link nofollow) ma non nei dati strutturati che la descrivono a Google.
-const vociLd = (semi: SemeWeb[], offset: number) =>
-  semi.flatMap((r, i) =>
-    r.web_indicizzabile === true ? [{ nome: titoloSeme(r.title), url: `${SHARE}/s/${r.hash}`, posizione: offset + i + 1 }] : []
-  );
 
 function jsonLdElenco(
   briciole: Array<{ nome: string; url: string }>,
@@ -1871,17 +1769,11 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
       : Promise.resolve<EsitoRpc<VetrinaWeb>>({ ok: true, rows: [] }),
   ]);
   if (!h.ok) return rispostaGuasto(`list_web_hubs(${lingua}): ${h.motivo}`);
-  if (!s.ok) return rispostaGuasto(`list_web_seeds(${lingua}): ${s.motivo}`);
   const hubs = hubValidi(h.rows);
-  // F4 (29/09): l'indice mostra i pack visibili anche quando nessun elenco di
-  // materia supera la soglia (3 pack di 2 autori): prima un pack di uno
-  // studente, da solo, non compariva in nessun elenco del sito. Resta fuori da
-  // Google (siIndicizza vuole un elenco indicizzabile).
-  const vuoto = hubs.length === 0 && semiValidi(s.rows).length === 0;
-  if (vuoto && (lingua !== "it" || pagina > 1)) return nonTrovata();
+  if (hubs.length === 0 && (lingua !== "it" || pagina > 1)) return nonTrovata();
   const self = urlElenco(lingua);
   const descrizione = "Pack di appunti divisi per materia, da aprire in Fluera: un canvas per imparare, dove ci scrivi sopra a mano.";
-  if (vuoto) {
+  if (hubs.length === 0) {
     return paginaWeb({
       lingua,
       titolo: "Template di studio e appunti per materia · Fluera",
@@ -1892,6 +1784,7 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
       corpo: statoVuoto("eco", "Ancora nessun template", "I pack di studio arrivano presto. Torna a trovarci!", { testo: "Scopri Fluera", href: SITE }, 1),
     });
   }
+  if (!s.ok) return rispostaGuasto(`list_web_seeds(${lingua}): ${s.motivo}`);
   if (!v.ok) console.error(`vetrine di ${lingua}: ${v.motivo}`);
   const semi = semiValidi(s.rows);
   if (pagina > 1 && semi.length === 0) return nonTrovata();
@@ -1899,7 +1792,7 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
   const pagine = Math.max(1, Math.ceil(totale / SEMI_PER_PAGINA));
   const vetrine = v.ok ? vetrineDi(v.rows) : [];
   // Il testo della fascia dice chi c'è davvero: finché ogni scheda è
-  // ufficiale, «dal team Fluera»; dalla F4, con gli studenti, quello dell'app.
+  // ufficiale, «dal team Fluera»; dalla F3, con gli studenti, quello dell'app.
   const soloFluera = [...semi, ...vetrine.flatMap((x) => x.righe)].every((r) => r.is_official !== false);
   const self2 = canonico(self, pagina, ordine);
   return paginaWeb({
@@ -1907,15 +1800,13 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
     titolo: `Template di studio e appunti per materia${pagina > 1 ? ` · pagina ${pagina}` : ""} · Fluera`,
     descrizione,
     self: self2,
-    // F4: l'indice va su Google quando almeno un suo elenco ci va — la stessa
-    // regola con cui la sitemap lo mette (un elenco indicizzabile della lingua).
-    siIndicizza: hubs.some((x) => x.web_indicizzabile === true),
+    siIndicizza: true,
     suIndice: true,
     jsonLd: ordine === "consigliati"
       ? jsonLdElenco(
         [{ nome: "Fluera", url: SITE }, { nome: "Appunti", url: self }],
         { nome: "Template di studio e appunti per materia", descrizione, url: self2, lingua },
-        vociLd(semi, offset),
+        semi.map((r, i) => ({ nome: titoloSeme(r.title), url: `${SHARE}/s/${r.hash}`, posizione: offset + i + 1 })),
       )
       : undefined,
     corpo: `${formCerca(lingua)}
@@ -1977,17 +1868,15 @@ async function paginaElenco(
   const descrizione = `Appunti di ${nomeC ? `${nomeC} (${nomeM})` : nomeM} da aprire in Fluera, un canvas per imparare: ci scrivi sopra a mano e li ripassi a libro chiuso.`;
 
   const briciole = [
-    { nome: "Fluera", url: SITE, rel: "" },
-    { nome: "Appunti", url: urlElenco(lingua), rel: "" },
-    ...(corso && !haMateria ? [] : [{ nome: nomeM, url: urlElenco(lingua, materia), rel: relHub(hubs, materia) }]),
-    ...(corso && nomeC ? [{ nome: nomeC, url: base, rel: "" }] : []),
+    { nome: "Fluera", url: SITE },
+    { nome: "Appunti", url: urlElenco(lingua) },
+    ...(corso && !haMateria ? [] : [{ nome: nomeM, url: urlElenco(lingua, materia) }]),
+    ...(corso && nomeC ? [{ nome: nomeC, url: base }] : []),
   ];
   // Le briciole visibili: «Appunti › Matematica [› Analisi 1]», l'ultima è
   // la pagina stessa.
   const navBriciole = briciole.slice(1)
-    .map((b, i, a) =>
-      i === a.length - 1 ? `<span aria-current="page">${esc(b.nome)}</span>` : `<a href="${esc(b.url)}"${b.rel}>${esc(b.nome)}</a>`
-    )
+    .map((b, i, a) => i === a.length - 1 ? `<span aria-current="page">${esc(b.nome)}</span>` : `<a href="${esc(b.url)}">${esc(b.nome)}</a>`)
     .join(`<span class="sep" aria-hidden="true">›</span>`);
   // L'introduzione scende SOTTO la griglia: la griglia si vede subito, come
   // nell'app, e il testo resta nella pagina per chi arriva da Google.
@@ -2001,14 +1890,12 @@ async function paginaElenco(
     titolo,
     descrizione,
     self,
-    // F4: sul sito con abbastanza pack visibili, su Google solo se il database
-    // dice che ha abbastanza pack indicizzabili.
-    siIndicizza: hub.web_indicizzabile === true, // anche con ?ordine=: il canonical alla base basta
+    siIndicizza: true, // anche con ?ordine=: il canonical alla base basta
     jsonLd: ordine === "consigliati"
       ? jsonLdElenco(
         briciole,
         { nome: h1, descrizione, url: self, lingua },
-        vociLd(semi, offset),
+        semi.map((r, i) => ({ nome: titoloSeme(r.title), url: `${SHARE}/s/${r.hash}`, posizione: offset + i + 1 })),
       )
       : undefined,
     corpo: `${navBriciole ? `<nav class="briciole" aria-label="Percorso">${navBriciole}</nav>` : ""}
@@ -2635,17 +2522,16 @@ async function ogImageResponse(hash: string): Promise<Response> {
     const esito = await fetchTemplate(hash);
     const row = esito.tipo === "trovato" ? esito.row : null;
     // 🔞 Non-general: nessuna miniatura né titolo nemmeno nell'immagine —
-    // solo il ripiego generico, come la pagina. 🚪 Lo stesso per uno studente
-    // tolto dal sito (F4): la sua /s/ è un 410.
-    if (row && row.content_maturity === "general" && !toltoDalSito(row)) {
+    // solo il ripiego generico, come la pagina.
+    if (row && row.content_maturity === "general") {
       baseUrl = row.og_path
         ? publicUrl(row.og_path)
         : row.thumb_path
         ? publicUrl(row.thumb_path)
         : OG_FALLBACK;
-      // Il voto di un pack visibile viene dalla lettura del web, come la
-      // pagina: una sola regola (218; F4), mai una soglia ricopiata qui.
-      const scheda = visibile(row) ? await fetchScheda(row.hash) : null;
+      // Il voto di una indicizzabile viene dalla lettura del web, come la
+      // pagina: una sola regola (218), mai una soglia ricopiata qui.
+      const scheda = indicizzabile(row) ? await fetchScheda(row.hash) : null;
       const png = await buildOgPng(row, baseUrl, scheda);
       return new Response(png, {
         status: 200,
@@ -2678,12 +2564,11 @@ async function ogImageResponse(hash: string): Promise<Response> {
 // niente di tutto questo si vedeva — l'import statico l'ha fatto emergere.
 /// I numeri stampati nell'og.png, fuori da resvg perché il cancello li possa
 /// leggere senza WASM. Niente install_count (gonfiabile, S7). Il voto come la
-/// /s/: solo sui pack visibili (F4: anche gli studenti sotto la soglia di
-/// Google) e solo da get_web_scheda (0 righe = niente voto); sui non visibili
-/// nessun voto.
+/// /s/: solo sulle indicizzabili e solo da get_web_scheda (0 righe = niente
+/// voto); sulle noindex nessun voto.
 export function ogNumeri(row: SeedRow, scheda: SchedaWeb | null = null): { stats: string; showStar: boolean } {
   const concepts = Math.max(0, row.concept_count ?? 0);
-  const rating = visibile(row) ? Math.max(0, numero(scheda?.voto_medio) ?? 0) : 0;
+  const rating = indicizzabile(row) ? Math.max(0, numero(scheda?.voto_medio) ?? 0) : 0;
   const parts: string[] = [];
   if (rating > 0) parts.push(rating.toFixed(1));
   if (concepts > 0) parts.push(`${concepts} concett${concepts === 1 ? "o" : "i"}`);
@@ -2924,7 +2809,7 @@ function jsonLdSeme(
     title: string;
     description: string;
     image: string;
-    briciole: Array<{ nome: string; url: string; nofollow: boolean }>;
+    briciole: Array<{ nome: string; url: string }>;
     materia: string | null;
     corso: string | null;
     scheda: SchedaWeb | null;
@@ -2937,11 +2822,8 @@ function jsonLdSeme(
       {
         "@type": "BreadcrumbList",
         // Le briciole vere: Fluera › Appunti › Materia › Corso › titolo, solo
-        // verso elenchi che esistono. F4: e che Google prende — un elenco sul
-        // sito ma sotto la sua soglia (nofollow) non entra nei dati
-        // strutturati. Un corso indicizzabile ha la materia indicizzabile (i
-        // suoi pack stanno anche lì), quindi resta un percorso senza buchi.
-        itemListElement: [{ nome: "Fluera", url: SITE }, ...d.briciole.filter((b) => !b.nofollow), { nome: d.title, url: d.self }]
+        // verso elenchi che esistono.
+        itemListElement: [{ nome: "Fluera", url: SITE }, ...d.briciole, { nome: d.title, url: d.self }]
           .map((b, i) => ({ "@type": "ListItem", position: i + 1, name: b.nome, item: b.url })),
       },
       {
@@ -2955,11 +2837,6 @@ function jsonLdSeme(
         url: d.self,
         isAccessibleForFree: (row.price_cents ?? 0) === 0,
         publisher: { "@type": "Organization", name: "Fluera", url: SITE },
-        // F4: il pack di uno studente dice di chi è, col codice pseudonimo che
-        // la pagina mostra (Creator Terms 2.5): Fluera lo pubblica, non lo firma.
-        ...(row.is_official !== true && autoreMostrato(row)
-          ? { author: { "@type": "Person", name: autoreMostrato(row) } }
-          : {}),
         ...(d.materia ? { about: { "@type": "Thing", name: d.materia } } : {}),
         ...(tags.length ? { keywords: tags.join(", ") } : {}),
         ...(d.scheda?.created_at ? { dateCreated: d.scheda.created_at } : {}),
@@ -2976,16 +2853,13 @@ const etichette = (s: SchedaWeb | null): string[] =>
   Array.isArray(s?.tags) ? s.tags.filter((t): t is string => typeof t === "string" && t.trim() !== "").slice(0, 8) : [];
 
 /// «Ti potrebbero interessare», «Tutti gli appunti di …» e il catalogo: solo
-/// sui pack visibili (F4: anche noindex). Verso un pack o un elenco che Google
-/// non prende il link è nofollow.
+/// sulle indicizzabili.
 function sezioneCorrelati(v: Vicini): string {
   const schede = v.correlati.map((r) => schedaSeme(r, false)).join("");
   const elenco = schede
     ? `<h2 id="t-correlati">Ti potrebbero interessare</h2>${striscia("Ti potrebbero interessare", schede)}`
     : "";
-  const tutti = v.tutti
-    ? `<p><a href="${esc(v.tutti.href)}"${relElenco(v.tutti)}>Tutti gli appunti di ${esc(v.tutti.nome)} →</a></p>`
-    : "";
+  const tutti = v.tutti ? `<p><a href="${esc(v.tutti.href)}">Tutti gli appunti di ${esc(v.tutti.nome)} →</a></p>` : "";
   return `<nav class="correlati" aria-label="Altri template">${elenco}<div class="link-el">${tutti}<p><a href="${
     esc(v.catalogo)
   }">Tutto il catalogo →</a></p></div></nav>`;
@@ -3003,25 +2877,21 @@ function renderPage(
   const hash = row.hash;
   const self = `https://share.fluera.dev/s/${hash}`;
   const siIndicizza = indicizzabile(row);
-  // F4: un pack VISIBILE è nel catalogo del sito (link interni, scheda, voto)
-  // anche se Google non lo prende; indicizzabile ⇒ visibile.
-  const siVede = visibile(row);
   const og = ogImmagine(row);
   const l = collegamentiSeme(hash, ref);
   const title = (row.title ?? "Template di studio").trim() || "Template di studio";
-  // Come l'app: «@» + 6 caratteri del codice (MW:179-207); «Fluera» solo dal
-  // bit is_official. Dalla F4 l'autore di uno studente sta anche sulle /s/
-  // indicizzate (Creator Terms 2.5: il codice pseudonimo).
-  const author = autoreMostrato(row) ?? "@anonimo";
+  // Come l'app: «@» + 6 caratteri del codice (MW:179-207). Un autore non
+  // ufficiale arriva solo su una /s/ noindex.
+  const author = row.is_official ? "Fluera" : row.author_code ? `@${row.author_code.slice(0, 6)}` : "@anonimo";
   const concepts = Math.max(0, row.concept_count ?? 0);
-  // S7: install_count MAI (si gonfia con chiamate anonime, 047). Sui pack
-  // visibili voto ed efficacia arrivano da get_web_scheda, già sotto le
-  // soglie della 218/220: 0 righe o un guasto = nessun numero, mai un ripiego
-  // su get_study_seed. Sui non visibili nessun voto (25/09/2026): la regola
-  // «da 5 voti di account veri» vive solo nel database (220), e
-  // get_study_seed conta anche gli anonimi.
-  const voto = siVede ? numero(scheda?.voto_medio) : null;
-  const voti = siVede ? numero(scheda?.voti) : null;
+  // S7: install_count MAI (si gonfia con chiamate anonime, 047). Sulle
+  // indicizzabili voto ed efficacia arrivano da get_web_scheda, già sotto le
+  // soglie della 218: 0 righe o un guasto = nessun numero, mai un ripiego su
+  // get_study_seed. Sulle noindex nessun voto (25/09/2026): la regola «da 5
+  // voti di account veri» vive solo nel database (220), e get_study_seed
+  // conta anche gli anonimi.
+  const voto = siIndicizza ? numero(scheda?.voto_medio) : null;
+  const voti = siIndicizza ? numero(scheda?.voti) : null;
   const nConcetti = numero(scheda?.concept_count) ?? (concepts > 0 ? concepts : null);
   const eff = numero(scheda?.efficacia_pct);
   const effN = numero(scheda?.efficacia_studenti);
@@ -3057,7 +2927,7 @@ function renderPage(
   const descrizione = (row.description ?? "").trim();
   const dove = vicini.corso ?? disciplina;
 
-  const distintivo = row.is_official === true
+  const distintivo = row.is_official
     ? `<span class="distintivo uff">${ic("verified")}Ufficiale</span>`
     : scheda?.is_featured === true
     ? `<span class="distintivo evid">${ic("auto_awesome")}In evidenza</span>`
@@ -3067,23 +2937,23 @@ function renderPage(
   const stileMateria = disciplina ? ` style="--em:${larghezzaEm(disciplina)}"` : "";
   const materiaV = disciplina
     ? vicini.hubMateria
-      ? `<a class="v materia" href="${esc(vicini.hubMateria.url)}"${relElenco(vicini.hubMateria)}${stileMateria}>${esc(disciplina)}</a>`
+      ? `<a class="v materia" href="${esc(vicini.hubMateria)}"${stileMateria}>${esc(disciplina)}</a>`
       : `<span class="v materia"${stileMateria}>${esc(disciplina)}</span>`
     : `<span class="v">—</span>`;
   // Il riquadro a tre caselle (TD:1139-1197) senza installazioni: il loro
   // posto va ai concetti veri (nell'app «1» fisso) e alla materia. Il numero
   // dei voti non è nell'etichetta, come nell'app: resta per il lettore di
   // schermo e al passaggio del mouse. «Compare da 5 voti» solo dove può
-  // comparire: su un pack non visibile sarebbe una promessa falsa.
+  // comparire: su una noindex sarebbe una promessa falsa.
   const nVoti = voti !== null ? `${voti} vot${voti === 1 ? "o" : "i"}` : null;
   const riquadro = `<div class="riquadro">
-          <div class="cella"${nVoti ? ` title="${nVoti}"` : ""}>${ic("star")}<span class="v"${voto === null && siVede ? ` title="Il voto compare da 5 voti"` : ""}>${
+          <div class="cella"${nVoti ? ` title="${nVoti}"` : ""}>${ic("star")}<span class="v"${voto === null && siIndicizza ? ` title="Il voto compare da 5 voti"` : ""}>${
     voto !== null ? votoIt(voto) : "—"
   }</span><span class="e">Valutazione</span>${nVoti ? `<span class="vh">, ${nVoti}</span>` : ""}</div>
           <div class="cella">${ic("hub")}<span class="v">${nConcetti !== null ? esc(numeroIt(nConcetti)) : "—"}</span><span class="e">Concetti</span></div>
           <div class="cella">${ic(iconaMateria(materiaDi(row.discipline)))}${materiaV}<span class="e">Materia</span></div>
         </div>`;
-  const briciole = vicini.briciole.map((b) => `<a href="${esc(b.url)}"${relElenco(b)}>${esc(b.nome)}</a>`).join(`<span class="sep" aria-hidden="true">›</span>`);
+  const briciole = vicini.briciole.map((b) => `<a href="${esc(b.url)}">${esc(b.nome)}</a>`).join(`<span class="sep" aria-hidden="true">›</span>`);
 
   const dentro = `${testata(vicini.catalogo)}
   <main class="in">
@@ -3123,7 +2993,7 @@ function renderPage(
     descrizione ? `<p class="desc"${lingua}>${esc(descrizione)}</p>` : `<p class="desc-vuota">Nessuna descrizione disponibile.</p>`
   }</section>
         <div class="nota">${ic("psychology_o")}<p>Aprendolo in Fluera, i concetti di questo template entrano nel tuo modello di studio, con un primo ripasso programmato per domani.</p></div>
-      </div>${siVede ? `\n      ${sezioneCorrelati(vicini)}` : ""}
+      </div>${siIndicizza ? `\n      ${sezioneCorrelati(vicini)}` : ""}
     </div>
   </main>
   ${piede(hash)}`;
@@ -3163,7 +3033,7 @@ function renderPage(
 </head>
 <body>
   ${spriteIcone(dentro)}${dentro}
-  ${l.script}${siVede && vicini.correlati.length ? `\n  ${AIUTO_STRISCIA}` : ""}
+  ${l.script}${siIndicizza && vicini.correlati.length ? `\n  ${AIUTO_STRISCIA}` : ""}
 </body>
 </html>`;
 }
