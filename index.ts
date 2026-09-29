@@ -1076,12 +1076,25 @@ type Vicini = {
   briciole: Array<{ nome: string } & LinkElenco>;
   /// «Tutto il catalogo →»: l'indice della lingua, se ha elenchi.
   catalogo: string;
+  /// L'indice va su Google solo con un elenco indicizzabile della sua lingua
+  /// (paginaIndice.siIndicizza): altrimenti ogni link verso di lui è nofollow
+  /// e le briciole JSON-LD lo saltano. Non si sa (lingua senza elenchi,
+  /// materia sconosciuta) = nofollow: si fallisce chiusi.
+  catalogoNofollow: boolean;
   /// Il corso del seme come lo scrive list_web_seeds (titolo e JSON-LD).
   corso: string | null;
   /// L'elenco della materia, se contiene il seme (la casella «Materia»).
   hubMateria: LinkElenco | null;
 };
-const NESSUN_VICINO: Vicini = { correlati: [], tutti: null, briciole: [], catalogo: urlElenco("it"), corso: null, hubMateria: null };
+const NESSUN_VICINO: Vicini = {
+  correlati: [],
+  tutti: null,
+  briciole: [],
+  catalogo: urlElenco("it"),
+  catalogoNofollow: true,
+  corso: null,
+  hubMateria: null,
+};
 
 /// Altri semi della stessa materia e lingua (list_web_seeds: visibili per
 /// costruzione, ognuno col suo web_indicizzabile, mai il seme stesso), prima
@@ -1093,7 +1106,7 @@ const NESSUN_VICINO: Vicini = { correlati: [], tutti: null, briciole: [], catalo
 /// tempo.
 async function fetchVicini(row: SeedRow): Promise<Vicini> {
   const materia = materiaDi(row.discipline);
-  const appunti = { nome: "Appunti", url: urlElenco("it"), nofollow: false };
+  const appunti = { nome: "Appunti", url: urlElenco("it"), nofollow: true };
   if (!materia) return { ...NESSUN_VICINO, briciole: [appunti] };
   const lingua = linguaDi(row.locale);
   const [s, h] = await Promise.all([
@@ -1112,6 +1125,7 @@ async function fetchVicini(row: SeedRow): Promise<Vicini> {
   const hub = hubCorso ?? hubM;
   // L'indice italiano esiste sempre; quello di un'altra lingua col suo primo elenco.
   const indice = lingua && (lingua === "it" || hubs.length > 0) ? urlElenco(lingua) : urlElenco("it");
+  const indiceNf = !(lingua && indice === urlElenco(lingua) && hubs.some((x) => x.web_indicizzabile === true));
   const altri = semi.filter((r) => r.hash !== row.hash);
   const stessoCorso = (r: SemeWeb) => !!io?.corso_slug && r.corso_slug === io.corso_slug;
   const nomeM = (hubM?.materia ?? "").trim() || MATERIE[materia].it;
@@ -1127,13 +1141,14 @@ async function fetchVicini(row: SeedRow): Promise<Vicini> {
       }
       : null,
     briciole: [
-      { nome: "Appunti", url: indice, nofollow: false },
+      { nome: "Appunti", url: indice, nofollow: indiceNf },
       ...(hubM && lingua ? [{ nome: nomeM, url: urlElenco(lingua, hubM.materia_slug), nofollow: nf(hubM) }] : []),
       ...(hubCorso && lingua && nomeC
         ? [{ nome: nomeC, url: urlElenco(lingua, hubCorso.materia_slug, hubCorso.corso_slug), nofollow: nf(hubCorso) }]
         : []),
     ],
     catalogo: indice,
+    catalogoNofollow: indiceNf,
     corso: (io?.course ?? "").trim() || null,
     hubMateria: hubM && lingua ? { url: urlElenco(lingua, hubM.materia_slug), nofollow: nf(hubM) } : null,
   };
@@ -1574,7 +1589,7 @@ function chipMaterie(lingua: string, hubs: HubWeb[], attuale: string | null, q: 
   };
   const voce = (k: string | null, nome: string) =>
     `<li><a class="chip" href="${esc(href(k))}"${attuale === k ? ` aria-current="page"` : ""}${
-      k && q === null ? relHub(hubs, k) : ""
+      q !== null ? "" : k ? relHub(hubs, k) : relElenco({ nofollow: !hubs.some((x) => x.web_indicizzabile === true) })
     }>${k ? ic(iconaMateria(k)) : ""}<span${
       k ? langElenco(lingua) : ""
     }>${esc(nome)}</span></a></li>`;
@@ -1777,8 +1792,12 @@ function paginaWeb(p: {
   jsonLd?: unknown;
   corpo: string;
   suIndice?: boolean;
+  /// Gli elenchi della lingua: l'indice va su Google solo con uno indicizzabile
+  /// (la regola di paginaIndice), e allora il link «Catalogo» si segue.
+  hubs: HubWeb[];
 }): Response {
-  const dentro = `${testata(urlElenco(p.lingua), p.suIndice)}
+  const catalogoNf = !p.hubs.some((x) => x.web_indicizzabile === true);
+  const dentro = `${testata(urlElenco(p.lingua), p.suIndice, catalogoNf)}
   <main class="in cat">
     ${p.corpo}
   </main>
@@ -1884,6 +1903,7 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
   if (vuoto) {
     return paginaWeb({
       lingua,
+      hubs,
       titolo: "Template di studio e appunti per materia · Fluera",
       descrizione,
       self,
@@ -1904,6 +1924,7 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
   const self2 = canonico(self, pagina, ordine);
   return paginaWeb({
     lingua,
+    hubs,
     titolo: `Template di studio e appunti per materia${pagina > 1 ? ` · pagina ${pagina}` : ""} · Fluera`,
     descrizione,
     self: self2,
@@ -1978,7 +1999,8 @@ async function paginaElenco(
 
   const briciole = [
     { nome: "Fluera", url: SITE, rel: "" },
-    { nome: "Appunti", url: urlElenco(lingua), rel: "" },
+    // L'indice va su Google solo con un elenco indicizzabile (paginaIndice).
+    { nome: "Appunti", url: urlElenco(lingua), rel: relElenco({ nofollow: !hubs.some((x) => x.web_indicizzabile === true) }) },
     ...(corso && !haMateria ? [] : [{ nome: nomeM, url: urlElenco(lingua, materia), rel: relHub(hubs, materia) }]),
     ...(corso && nomeC ? [{ nome: nomeC, url: base, rel: "" }] : []),
   ];
@@ -1998,6 +2020,7 @@ async function paginaElenco(
 
   return paginaWeb({
     lingua,
+    hubs,
     titolo,
     descrizione,
     self,
@@ -2084,6 +2107,7 @@ async function paginaCerca(lingua: string, qRaw: string | null, materia: string 
   }
   return paginaWeb({
     lingua,
+    hubs,
     titolo: `${n ? `«${q}» · ` : ""}Cerca template di studio · Fluera`,
     descrizione: "Cerca fra i template di studio da aprire in Fluera.",
     self: null,
@@ -3005,7 +3029,7 @@ function sezioneCorrelati(v: Vicini): string {
     : "";
   return `<nav class="correlati" aria-label="Altri template">${elenco}<div class="link-el">${tutti}<p><a href="${
     esc(v.catalogo)
-  }">Tutto il catalogo →</a></p></div></nav>`;
+  }"${relElenco({ nofollow: v.catalogoNofollow })}>Tutto il catalogo →</a></p></div></nav>`;
 }
 
 function renderPage(
@@ -3102,7 +3126,7 @@ function renderPage(
         </div>`;
   const briciole = vicini.briciole.map((b) => `<a href="${esc(b.url)}"${relElenco(b)}>${esc(b.nome)}</a>`).join(`<span class="sep" aria-hidden="true">›</span>`);
 
-  const dentro = `${testata(vicini.catalogo)}
+  const dentro = `${testata(vicini.catalogo, false, vicini.catalogoNofollow)}
   <main class="in">
     ${briciole ? `<nav class="briciole" aria-label="Percorso">${briciole}</nav>` : ""}
     <div class="pack">
@@ -3506,10 +3530,12 @@ function testaWeb(css: string): string {
 
 /// La testata: il marchio come su fluera.dev («Flu» Sora, «era» Playfair) e,
 /// al posto della AppBar «Catalogo» dell'app, il link all'indice e la beta.
-function testata(indice = urlElenco("it"), suIndice = false): string {
+/// [catalogoNofollow]: l'indice non va su Google (nessun elenco indicizzabile),
+/// quindi il link «Catalogo» non va seguito — lo sa chi ha letto gli elenchi.
+function testata(indice = urlElenco("it"), suIndice = false, catalogoNofollow = false): string {
   return `<header class="testata"><div class="in"><a class="marchio" href="${SITE}" aria-label="Fluera"><b aria-hidden="true">Flu</b><i aria-hidden="true">era</i></a><nav class="testata-nav" aria-label="Sezioni"><a class="sez" href="${
     esc(indice)
-  }"${suIndice ? ` aria-current="page"` : ""}>Catalogo</a><a class="btn-beta" href="${SITE}/beta">Entra nella beta</a></nav></div></header>`;
+  }"${suIndice ? ` aria-current="page"` : ""}${relElenco({ nofollow: catalogoNofollow })}>Catalogo</a><a class="btn-beta" href="${SITE}/beta">Entra nella beta</a></nav></div></header>`;
 }
 
 /// Il piede di ogni pagina del catalogo, delle pagine di stato e del pack
