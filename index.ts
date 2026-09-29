@@ -674,10 +674,11 @@ export const servi = async (req: Request): Promise<Response> => {
     if (req.method === "POST") return await handleReportPost(req);
     const qHash = (reqUrl.searchParams.get("hash") ?? "").trim().toLowerCase();
     const qNumero = reqUrl.searchParams.get("numero") ?? "";
+    const ui = uiSegnala(reqUrl.searchParams.get("lingua"));
     if (REPORT_HASH_RE.test(qHash) && REPORT_NUMERO_RE.test(qNumero)) {
-      return htmlSegnala(200, reportRicevuta(qHash, qNumero, reqUrl.searchParams.get("email") === "1"));
+      return htmlSegnala(200, reportRicevuta(ui, qHash, qNumero, reqUrl.searchParams.get("email") === "1"));
     }
-    return htmlSegnala(200, reportForm(REPORT_HASH_RE.test(qHash) ? qHash : ""));
+    return htmlSegnala(200, reportForm(ui, REPORT_HASH_RE.test(qHash) ? qHash : ""));
   }
 
   // ── /s/{hash}/og.png → social card with the LIVE numbers baked into the
@@ -691,19 +692,24 @@ export const servi = async (req: Request): Promise<Response> => {
   const hash = m[1];
 
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-    return html(500, paginaStato("Errore", "Server non configurato."));
+    return html(500, paginaStato(TESTI_IT, TESTI_IT.errore[0], TESTI_IT.errore[1]));
   }
   const esito = await fetchTemplate(hash);
   // ⚠️ Guasto ≠ assente. Fino al 2026-09-24 un 5xx o una rete muta
   // rispondevano 410 «rimosso», che per Google è DEFINITIVO: un guasto di un
   // minuto poteva deindicizzare il catalogo. Il 503 dice «riprova».
-  if (esito.tipo === "guasto") return rispostaGuasto(`get_study_seed per ${hash}: ${esito.motivo}`);
-  if (esito.tipo === "assente") return html(410, paginaStato("Non più disponibile", "Questo template è stato rimosso o non è più pubblico."));
+  // Senza una riga la lingua del pack non si sa: italiano, la lingua di
+  // sempre del sito.
+  if (esito.tipo === "guasto") return rispostaGuasto(TESTI_IT, `get_study_seed per ${hash}: ${esito.motivo}`);
+  if (esito.tipo === "assente") return html(410, paginaStato(TESTI_IT, TESTI_IT.rimosso[0], TESTI_IT.rimosso[1]));
   const row = esito.row;
   // 🚪 F4: uno studente che il database non mette sul sito sparisce come un
   // pack revocato — anche da un link vecchio della catena (niente 301 verso
   // una pagina che non c'è).
-  if (toltoDalSito(row)) return html(410, paginaStato("Non più disponibile", "Questo template è stato rimosso o non è più pubblico."));
+  if (toltoDalSito(row)) {
+    const u = testiDi(linguaDi(row.locale));
+    return html(410, paginaStato(u, u.rimosso[0], u.rimosso[1]));
+  }
 
   // C1: attribution is an OPTIONAL "?ref={referralCode}" query param. Read it
   // here and forward it into every store/app-open URL so an install attributes
@@ -768,12 +774,12 @@ function paginaSeme(body: string, siIndicizza: boolean): Response {
 
 /// Un guasto del database: 503 che dice «riprova», mai 404/410 (per Google
 /// sono una rimozione) e mai in cache.
-function rispostaGuasto(motivo: string): Response {
+function rispostaGuasto(u: Testi, motivo: string): Response {
   console.error(`guasto: ${motivo}`);
   // «Riprova» = href vuoto, cioè lo stesso indirizzo.
-  const r = html(503, paginaStato("Catalogo non raggiungibile", "Non riusciamo a caricare il catalogo in questo momento. Riprova tra poco.", {
+  const r = html(503, paginaStato(u, u.guasto[0], u.guasto[1], {
     icona: "cloud_off",
-    azione: { testo: "Riprova", href: "" },
+    azione: { testo: u.riprova, href: "" },
   }));
   r.headers.set("Retry-After", "120");
   r.headers.set("Cache-Control", "no-store");
@@ -898,61 +904,94 @@ type HubWeb = {
 /// l'introduzione della pagina materia. Solo parole: quali elenchi esistono
 /// lo dice il database. Chiavi ed etichette sono tenute uguali alla 213 da
 /// seo_contract (test 18).
-export const MATERIE: Record<string, { it: string; intro: string }> = {
+export const MATERIE: Record<string, { it: string; intro: string; en: string; introEn: string }> = {
   math: {
     it: "Matematica",
     intro:
       "La matematica si capisce con la penna in mano. Leggere un ragionamento già scritto dà l'impressione di averlo capito; rifarlo da soli, un passaggio alla volta, dice se è vero. Gli appunti di questa pagina servono a questo. Si aprono in Fluera su un canvas senza bordi, e accanto a ogni passaggio c'è spazio per riscriverlo con la tua calligrafia, per disegnare un grafico storto ma tuo, per segnare il punto in cui ti sei bloccato. Non sono schede da imparare a memoria: sono un punto di partenza da riempire. Quando torni a ripassare, prova prima a ricostruire il ragionamento a libro chiuso, poi confrontalo con quello che avevi scritto.",
+    en: "Mathematics",
+    introEn:
+      "Mathematics makes sense with a pen in your hand. Reading an argument someone else wrote gives you the impression you understood it; redoing it yourself, one step at a time, tells you whether that's true. The notes on this page are for exactly that. They open in Fluera on a borderless canvas, and next to every step there's room to rewrite it in your own handwriting, to draw a graph that's crooked but yours, to mark the point where you got stuck. They aren't cards to memorise: they're a starting point to fill in. When you come back to review, first try to rebuild the argument with the book closed, then compare it with what you'd written.",
   },
   physics: {
     it: "Fisica",
     intro:
       "In fisica le formule arrivano alla fine. Prima c'è una situazione da immaginare: un oggetto che cade, una corda che vibra, l'acqua che scorre in un tubo. Chi studia bene la disegna, ci mette le frecce, si chiede che cosa succederebbe cambiando una cosa sola. Gli appunti di questa pagina si aprono in Fluera su un canvas dove puoi fare proprio questo: schizzare la scena a mano accanto alla spiegazione, scrivere con parole tue perché il risultato ha senso, lasciare a margine una domanda per la volta dopo. Quando ripassi, prova a rifare il disegno senza guardare. Quello che riesci a ridisegnare da solo è quello che hai capito.",
+    en: "Physics",
+    introEn:
+      "In physics the formulas come at the end. First there's a situation to picture: an object falling, a string vibrating, water running through a pipe. People who study well draw it, add the arrows, and ask what would happen if just one thing changed. The notes on this page open in Fluera on a canvas where you can do exactly that: sketch the scene by hand next to the explanation, write in your own words why the result makes sense, leave a question in the margin for next time. When you review, try to redraw the picture without looking. What you can redraw on your own is what you've understood.",
   },
   chemistry: {
     it: "Chimica",
     intro:
       "La chimica è piena di cose che non si vedono: atomi, legami, sostanze che si separano e si ricompongono. Per questo aiuta così tanto disegnarle. Uno schema fatto a mano, anche impreciso, ti costringe a decidere dove va ogni pezzo e perché. Gli appunti di questa pagina si aprono in Fluera su un canvas libero: puoi ricopiare una reazione con la tua scrittura, colorare quello che cambia fra prima e dopo, aggiungere un esempio che ti viene in mente. Un nome si dimentica in fretta; il disegno che ci hai fatto sopra resta più a lungo. Al ripasso, prova a ridisegnare lo schema senza guardarlo, poi confronta.",
+    en: "Chemistry",
+    introEn:
+      "Chemistry is full of things you can't see: atoms, bonds, substances that come apart and recombine. That's why drawing them helps so much. A diagram made by hand, even an imprecise one, forces you to decide where each piece goes and why. The notes on this page open in Fluera on a free canvas: you can copy out a reaction in your own handwriting, colour what changes between before and after, add an example that comes to mind. A name is quickly forgotten; the drawing you made on top of it stays longer. When you review, try to redraw the diagram without looking at it, then compare.",
   },
   biology: {
     it: "Biologia",
     intro:
       "La biologia chiede di ricordare i nomi delle parti, ma soprattutto di capire come lavorano insieme. Una cellula, un organo, il ciclo di vita di una pianta diventano chiari quando li disegni e colleghi i pezzi con le frecce, non quando rileggi un elenco. Gli appunti di questa pagina si aprono in Fluera su un canvas dove c'è spazio per farlo: puoi rifare uno schema a mano, scrivere accanto a ogni parte a che cosa serve con parole tue, aggiungere collegamenti che nel testo non c'erano. Quando torni a studiare, copri le etichette e prova a rimetterle da solo. Quello che non ricordi ti dice dove tornare.",
+    en: "Biology",
+    introEn:
+      "Biology asks you to remember the names of the parts, but above all to understand how they work together. A cell, an organ, the life cycle of a plant become clear when you draw them and link the pieces with arrows, not when you reread a list. The notes on this page open in Fluera on a canvas with room to do that: you can redo a diagram by hand, write next to each part what it's for in your own words, add links that weren't in the text. When you come back to study, cover the labels and try to put them back yourself. What you don't remember tells you where to go back to.",
   },
   medicine: {
     it: "Medicina",
     intro:
       "Studiare medicina vuol dire ricordare molto e, soprattutto, collegare: un sintomo a ciò che lo provoca, una causa a una cura. Rileggere e sottolineare dà la sensazione di sapere, ma il collegamento si costruisce solo quando lo scrivi tu. Gli appunti di questa pagina si aprono in Fluera su un canvas libero, dove puoi fare mappe a mano, disegnare un organo e annotarlo, spiegare un passaggio con le tue parole come se dovessi raccontarlo a un compagno. Sono materiale per studiare, non indicazioni sulla salute di nessuno. Al ripasso, prova a ricostruire il percorso a libro chiuso e guarda dove si interrompe: è lì che vale la pena tornare.",
+    en: "Medicine",
+    introEn:
+      "Studying medicine means remembering a lot and, above all, connecting: a symptom to what causes it, a cause to a treatment. Rereading and underlining gives you the feeling of knowing, but the connection is only built when you write it yourself. The notes on this page open in Fluera on a free canvas, where you can make maps by hand, draw an organ and annotate it, explain a step in your own words as if you were telling a classmate. They are study material, not advice about anyone's health. When you review, try to rebuild the pathway with the book closed and see where it breaks off: that's where it's worth going back.",
   },
   law: {
     it: "Diritto",
     intro:
       "Nel diritto le parole contano una per una, e proprio per questo imparare a memoria non basta. Serve capire perché una regola esiste, a quali casi si applica e dove si ferma. Scriverlo a mano, con parole tue, è il modo più onesto per scoprire se l'hai capito davvero. Gli appunti di questa pagina si aprono in Fluera su un canvas dove puoi riassumere una regola accanto al testo, disegnare lo schema di chi fa che cosa, annotare un esempio concreto che ti aiuta a ricordarla. Sono materiale di studio, non consulenza. Al ripasso, prova a spiegare la regola a libro chiuso, poi confronta con quello che avevi scritto.",
+    en: "Law",
+    introEn:
+      "In law every word counts, and that's exactly why memorising isn't enough. You need to understand why a rule exists, which cases it applies to and where it stops. Writing it by hand, in your own words, is the most honest way to find out whether you've really understood it. The notes on this page open in Fluera on a canvas where you can summarise a rule next to the text, draw a diagram of who does what, and note down a concrete example that helps you remember it. They are study material, not legal advice. When you review, try to explain the rule with the book closed, then compare it with what you'd written.",
   },
   economics: {
     it: "Economia",
     intro:
       "L'economia parla di scelte: che cosa fanno le persone, le imprese e gli stati quando le risorse non bastano per tutto. Molte idee si capiscono meglio con un disegno: curve che si incontrano, una freccia che mostra chi paga e chi riceve. Gli appunti di questa pagina si aprono in Fluera su un canvas libero, dove puoi ridisegnare un grafico a mano, scrivere accanto che cosa succede se cambia una cosa sola, aggiungere un esempio preso dalla vita di tutti i giorni. Quando ripassi, prova a rifare il ragionamento senza guardare: se sai spiegarlo con parole semplici, l'hai fatto tuo.",
+    en: "Economics",
+    introEn:
+      "Economics is about choices: what people, businesses and governments do when resources aren't enough for everything. Many ideas are easier to grasp with a drawing: curves that meet, an arrow showing who pays and who receives. The notes on this page open in Fluera on a free canvas, where you can redraw a graph by hand, write next to it what happens if just one thing changes, add an example from everyday life. When you review, try to redo the reasoning without looking: if you can explain it in simple words, you've made it yours.",
   },
   philosophy: {
     it: "Filosofia",
     intro:
       "In filosofia non si studia un elenco di risposte, ma il modo in cui qualcuno ha provato a ragionare su una domanda. Per seguirlo bisogna rallentare: riscrivere un argomento con parole tue, chiederti se sei d'accordo, cercare il punto in cui potrebbe non reggere. Gli appunti di questa pagina si aprono in Fluera su un canvas dove puoi farlo a mano, accanto al testo: mettere in fila i passaggi di un ragionamento, collegare pensatori diversi con una freccia, scrivere a margine un'obiezione tua. Quando ripassi, prova a raccontare l'idea a libro chiuso, come se la spiegassi a qualcuno che non l'ha mai sentita.",
+    en: "Philosophy",
+    introEn:
+      "In philosophy you don't study a list of answers, but the way someone tried to reason about a question. To follow it you have to slow down: rewrite an argument in your own words, ask yourself whether you agree, look for the point where it might not hold. The notes on this page open in Fluera on a canvas where you can do it by hand, next to the text: line up the steps of an argument, connect different thinkers with an arrow, write an objection of your own in the margin. When you review, try to tell the idea with the book closed, as if you were explaining it to someone who has never heard it.",
   },
   history: {
     it: "Storia",
     intro:
       "La storia si ricorda meglio quando diventa un racconto e non una lista di date. Chi ha deciso che cosa, perché, e che cosa è cambiato dopo: sono queste le domande che tengono insieme i fatti. Gli appunti di questa pagina si aprono in Fluera su un canvas libero, dove puoi tracciare a mano una linea del tempo, collegare una causa alle sue conseguenze con una freccia, disegnare una cartina approssimativa per capire dove succedono le cose. Scrivere il racconto con le tue parole è già un modo di studiarlo. Al ripasso, prova a rimettere in ordine gli eventi senza guardare, poi controlla.",
+    en: "History",
+    introEn:
+      "History is easier to remember when it becomes a story rather than a list of dates. Who decided what, why, and what changed afterwards: these are the questions that hold the facts together. The notes on this page open in Fluera on a free canvas, where you can draw a timeline by hand, link a cause to its consequences with an arrow, sketch a rough map to understand where things happen. Writing the story in your own words is already a way of studying it. When you review, try to put the events back in order without looking, then check.",
   },
   language: {
     it: "Lingue",
     intro:
       "Una lingua si impara usandola, e scrivere a mano è un modo di usarla. Ricopiare una frase, cambiarla, sbagliare e correggerti lascia una traccia che la sola lettura non lascia. Gli appunti di questa pagina si aprono in Fluera su un canvas libero, dove puoi scrivere parole ed esempi con la tua calligrafia, annotare accanto una frase tua che le usa, disegnare un piccolo schema quando una regola ti confonde. Per le lingue con un altro alfabeto, tracciare i caratteri con la penna aiuta a riconoscerli. Al ripasso, copri la traduzione e prova a ricordare prima di guardare.",
+    en: "Languages",
+    introEn:
+      "You learn a language by using it, and writing by hand is a way of using it. Copying a sentence, changing it, making mistakes and correcting yourself leaves a trace that reading alone doesn't. The notes on this page open in Fluera on a free canvas, where you can write words and examples in your own handwriting, note down a sentence of your own that uses them, draw a small diagram when a rule confuses you. For languages with a different alphabet, tracing the characters with a pen helps you recognise them. When you review, cover the translation and try to remember before you look.",
   },
   cs: {
     it: "Informatica",
     intro:
       "In informatica capire un'idea viene prima di scrivere il codice. Come si muovono i dati, in che ordine avvengono i passaggi, che cosa succede quando qualcosa va storto: spesso lo vedi davvero solo quando lo disegni. Gli appunti di questa pagina si aprono in Fluera su un canvas libero, dove puoi schizzare a mano uno schema a blocchi, seguire con le frecce il percorso di un'informazione, scrivere accanto a un esempio che cosa fa ogni pezzo, con parole tue. Quando ripassi, prova a rifare lo schema senza guardare e a spiegarlo ad alta voce. Il punto in cui ti fermi è quello da ristudiare.",
+    en: "Computer science",
+    introEn:
+      "In computer science, understanding an idea comes before writing the code. How data moves, in what order the steps happen, what happens when something goes wrong: often you only really see it when you draw it. The notes on this page open in Fluera on a free canvas, where you can sketch a block diagram by hand, follow the path of a piece of information with arrows, write next to an example what each part does, in your own words. When you review, try to redo the diagram without looking and to explain it out loud. The point where you stop is the one to study again.",
   },
 };
 const ALIAS_MATERIA: Record<string, string> = {
@@ -975,13 +1014,276 @@ function linguaDi(locale: string | null): string | null {
   return m ? m[1] : null;
 }
 
-/// La materia di un seme col nome della pagina (italiano): «Matematica», non
-/// «math». Una disciplina fuori elenco resta com'è.
-export function nomeDisciplina(discipline: string | null): string | null {
+// ── L'interfaccia in italiano e in inglese (I18N-01, 2026-09-29) ─────────────
+// Fino a questa data share parlava solo italiano, anche sulle pagine dei pack
+// in altre lingue e sugli elenchi /{lingua}/appunti/. Ora la lingua
+// dell'interfaccia viene dalla lingua della pagina: il prefisso degli elenchi,
+// la lingua del pack sulle /s/. Italiano per l'italiano, inglese per tutte le
+// altre: le altre 14 lingue dell'app avranno la loro quando ci saranno testi
+// rivisti da chi le parla, e fino ad allora l'inglese si legge più
+// dell'italiano. Mai da Accept-Language: una pagina esce uguale per ogni
+// browser e per Google. Le etichette che l'app ha già vengono dai suoi ARB
+// (app_it / app_en), così sito e app dicono la stessa cosa.
+type Ui = "it" | "en";
+/// Senza una lingua (un pack con un locale non valido) resta l'italiano, la
+/// lingua di sempre del sito, come ogni pagina di cui non si sa la lingua.
+export function uiDi(lingua: string | null): Ui {
+  return lingua === "it" || lingua === null ? "it" : "en";
+}
+
+const TESTI_IT = {
+  lingua: "it" as Ui,
+  formato: "it-IT",
+  // fluera.dev nella stessa lingua (I18N-03): la home e la beta italiane
+  // stanno sotto /it/, i testi legali italiani sotto /legal/ senza prefisso.
+  sito: `${SITE}/it/`,
+  beta: `${SITE}/it/beta/`,
+  privacy: `${SITE}/legal/privacy/`,
+  termini: `${SITE}/legal/terms/`,
+  catalogo: "Catalogo",
+  entraBeta: "Entra nella beta",
+  sezioni: "Sezioni",
+  cheCos: "Che cos'è Fluera →",
+  segnalaContenuto: "Segnala questo contenuto",
+  infoLegali: "Informazioni legali",
+  privacyNome: "Privacy",
+  terminiNome: "Termini",
+  contatti: "Contatti",
+  titolare: "Titolare: Lorenco Shametaj, Via Boccaccio 44, 35128 Padova (PD)",
+  errore: ["Errore", "Server non configurato."],
+  rimosso: ["Non più disponibile", "Questo template è stato rimosso o non è più pubblico."],
+  guasto: ["Catalogo non raggiungibile", "Non riusciamo a caricare il catalogo in questo momento. Riprova tra poco."],
+  riprova: "Riprova",
+  elencoNo: ["Elenco non trovato", "Questo elenco non c'è, o non c'è ancora."],
+  tuttiTemplate: "Tutti i template",
+  vaiAFluera: "Vai a Fluera",
+  appunti: "Appunti",
+  percorso: "Percorso",
+  materie: "Materie",
+  tutte: "Tutte",
+  tuttiCorsi: "Tutti i corsi",
+  ordina: "Ordina",
+  ordini: { consigliati: "Consigliati", efficaci: "Più efficaci", votati: "Più votati", recenti: "Più recenti" },
+  notaEfficaci: "Ordinato per guadagni di memoria misurati",
+  pagine: "Pagine",
+  pagina: (n: number) => `Pagina ${n}`,
+  paginaPrec: "Pagina precedente",
+  paginaSucc: "Pagina successiva",
+  cercaSegnaposto: "Cerca template di studio…",
+  cercaTemplate: "Cerca template di studio",
+  cerca: "Cerca",
+  materieECorsi: "Materie e corsi",
+  vediTutti: "Vedi tutti",
+  vetrine: {
+    in_evidenza: ["In evidenza", "Selezionati dal team Fluera"],
+    piu_efficaci: ["Provati efficaci", "Template che aumentano davvero la ritenzione"],
+    di_tendenza: ["Di tendenza", "Popolari tra chi studia questa settimana"],
+    novita: ["Novità", "Appena pubblicati"],
+  } as Record<string, [string, string]>,
+  selezionati: "Selezionati dal team Fluera",
+  senzaTitolo: "Senza titolo",
+  nuovo: "Nuovo",
+  ufficiale: "Ufficiale",
+  inEvidenza: "In evidenza",
+  ritenzione: (pct: number) => `+${pct}% ritenzione`,
+  concetti: (n: string, uno: boolean) => `${n} concett${uno ? "o" : "i"}`,
+  voti: (n: number) => `${n} vot${n === 1 ? "o" : "i"}`,
+  votoAria: (v: string) => `Valutazione ${v} su 5`,
+  titoloIndice: "Template di studio e appunti per materia",
+  descIndice: "Pack di appunti divisi per materia, da aprire in Fluera: un canvas per imparare, dove ci scrivi sopra a mano.",
+  paginaN: (n: number) => ` · pagina ${n}`,
+  vuoto: ["Ancora nessun template", "I pack di studio arrivano presto. Torna a trovarci!"],
+  scopri: "Scopri Fluera",
+  fasciaTeam: ["Template di studio dal team Fluera", "Appunti scritti a mano, gratis da installare in Fluera."],
+  fasciaCommunity: ["Template di studio dalla community", "Appunti scritti a mano da chi studia, gratis da installare."],
+  appuntiDi: (m: string) => `Appunti di ${m}`,
+  descElenco: (cosa: string) =>
+    `Appunti di ${cosa} da aprire in Fluera, un canvas per imparare: ci scrivi sopra a mano e li ripassi a libro chiuso.`,
+  quantiTemplate: (n: number) => `${n} template di studio da aprire in Fluera.`,
+  studiareAMano: (m: string) => `Studiare ${m} a mano`,
+  cercaSotto: "Cerca per titolo, corso o materia.",
+  cercaLunghezza: "Scrivi da due a ottanta caratteri.",
+  trovati: (n: number) => (n === 1 ? "1 template trovato." : `${n} template trovati.`),
+  nessunRisultato: (q: string) => `Nessun risultato per "${q}"`,
+  nessunRisultatoB: "Prova con un'altra materia, o azzera i filtri per vedere tutto.",
+  azzera: "Azzera filtri",
+  altriRisultati: "Ci sono altri risultati: prova con una parola in più.",
+  risultati: "Risultati",
+  risultatiPer: (q: string) => `Risultati per «${q}»`,
+  cercaTitolo: (q: string) => `«${q}» · `,
+  cercaDesc: "Cerca fra i template di studio da aprire in Fluera.",
+  templateDiStudio: "Template di studio",
+  anonimo: "@anonimo",
+  descPack: (materia: string | null, n: number) =>
+    `Un template di studio${materia ? ` di ${materia}` : ""} con ${n} concett${n === 1 ? "o" : "i"}. Installalo in Fluera e parte un ripasso programmato — il trapianto cognitivo nel tuo modello di studio.`,
+  /// Il nome della materia dentro una frase: minuscolo in italiano («di fisica»).
+  materiaInFrase: (m: string) => m.toLowerCase(),
+  votoDa5: "Il voto compare da 5 voti",
+  valutazione: "Valutazione",
+  concettiNome: "Concetti",
+  materia: "Materia",
+  generatoIa: "Generato dall'IA",
+  di: (a: string) => `di ${a}`,
+  misuratoSu: (n: string, uno: boolean) => `misurato su ${n} student${uno ? "e" : "i"}`,
+  apri: "Apri in Fluera",
+  notaApri: "Si apre Fluera sul tuo computer, se è installata. Non ce l'hai? Entra nella beta.",
+  segnala: "Segnala",
+  argomenti: "Argomenti",
+  descrizione: "Descrizione",
+  nessunaDesc: "Nessuna descrizione disponibile.",
+  notaModello:
+    "Aprendolo in Fluera, i concetti di questo template entrano nel tuo modello di studio, con un primo ripasso programmato per domani.",
+  potrebbero: "Ti potrebbero interessare",
+  altriTemplate: "Altri template",
+  tuttiGliAppuntiDi: (m: string) => `Tutti gli appunti di ${m} →`,
+  tuttoCatalogo: "Tutto il catalogo →",
+  riservata: ["Contenuto disponibile nell'app", "Questo contenuto è disponibile nell'app Fluera.", "Per vederlo apri il link in Fluera."],
+  categorie: {
+    study: "Studio",
+    planner: "Agenda",
+    journal: "Diario",
+    calligraphy: "Calligrafia",
+    music: "Musica",
+    storyboard: "Storyboard",
+    business: "Business",
+    mindMap: "Mappa mentale",
+    science: "Scienze",
+    language: "Lingue",
+    custom: "Personalizzato",
+  } as Record<string, string>,
+};
+type Testi = typeof TESTI_IT;
+
+const TESTI_EN: Testi = {
+  lingua: "en",
+  formato: "en-US",
+  sito: `${SITE}/`,
+  beta: `${SITE}/beta/`,
+  privacy: `${SITE}/legal/privacy/en/`,
+  termini: `${SITE}/legal/terms/en/`,
+  catalogo: "Catalogue",
+  entraBeta: "Join the beta",
+  sezioni: "Sections",
+  cheCos: "What is Fluera →",
+  segnalaContenuto: "Report this content",
+  infoLegali: "Legal information",
+  privacyNome: "Privacy",
+  terminiNome: "Terms",
+  contatti: "Contact",
+  titolare: "Data controller: Lorenco Shametaj, Via Boccaccio 44, 35128 Padova (PD), Italy",
+  errore: ["Error", "The server is not configured."],
+  rimosso: ["No longer available", "This template has been removed or is no longer public."],
+  guasto: ["Catalogue unavailable", "We can't load the catalogue right now. Please try again shortly."],
+  riprova: "Try again",
+  elencoNo: ["List not found", "This list doesn't exist, or doesn't exist yet."],
+  tuttiTemplate: "All templates",
+  vaiAFluera: "Go to Fluera",
+  appunti: "Notes",
+  percorso: "Breadcrumb",
+  materie: "Subjects",
+  tutte: "All",
+  tuttiCorsi: "All courses",
+  ordina: "Sort",
+  ordini: { consigliati: "Recommended", efficaci: "Most effective", votati: "Top rated", recenti: "Newest" },
+  notaEfficaci: "Ranked by measured retention gains",
+  pagine: "Pages",
+  pagina: (n: number) => `Page ${n}`,
+  paginaPrec: "Previous page",
+  paginaSucc: "Next page",
+  cercaSegnaposto: "Search study templates…",
+  cercaTemplate: "Search study templates",
+  cerca: "Search",
+  materieECorsi: "Subjects and courses",
+  vediTutti: "See all",
+  vetrine: {
+    in_evidenza: ["Featured", "Hand-picked by the Fluera team"],
+    piu_efficaci: ["Proven effective", "Templates that measurably lift retention"],
+    di_tendenza: ["Trending", "Popular with learners this week"],
+    novita: ["New", "Just published"],
+  },
+  selezionati: "Hand-picked by the Fluera team",
+  senzaTitolo: "Untitled",
+  nuovo: "New",
+  ufficiale: "Official",
+  inEvidenza: "Featured",
+  ritenzione: (pct: number) => `+${pct}% retention`,
+  concetti: (n: string, uno: boolean) => `${n} concept${uno ? "" : "s"}`,
+  voti: (n: number) => `${n} rating${n === 1 ? "" : "s"}`,
+  votoAria: (v: string) => `Rated ${v} out of 5`,
+  titoloIndice: "Study templates and notes by subject",
+  descIndice: "Study notes sorted by subject, to open in Fluera: a canvas for learning, where you write on them by hand.",
+  paginaN: (n: number) => ` · page ${n}`,
+  vuoto: ["No templates yet", "Study packs are on their way. Come back soon!"],
+  scopri: "Discover Fluera",
+  fasciaTeam: ["Study templates from the Fluera team", "Handwritten notes, free to install in Fluera."],
+  fasciaCommunity: ["Study templates from the community", "Handwritten notes by learners, free to install."],
+  appuntiDi: (m: string) => `${m} notes`,
+  descElenco: (cosa: string) =>
+    `${cosa} notes to open in Fluera, a canvas for learning: you write on them by hand and review them with the book closed.`,
+  quantiTemplate: (n: number) => `${n} study template${n === 1 ? "" : "s"} to open in Fluera.`,
+  studiareAMano: (m: string) => `Studying ${m} by hand`,
+  cercaSotto: "Search by title, course or subject.",
+  cercaLunghezza: "Type between two and eighty characters.",
+  trovati: (n: number) => (n === 1 ? "1 template found." : `${n} templates found.`),
+  nessunRisultato: (q: string) => `No results for "${q}"`,
+  nessunRisultatoB: "Try another subject, or clear the filters to see everything.",
+  azzera: "Clear filters",
+  altriRisultati: "There are more results: try adding a word.",
+  risultati: "Results",
+  risultatiPer: (q: string) => `Results for “${q}”`,
+  cercaTitolo: (q: string) => `“${q}” · `,
+  cercaDesc: "Search the study templates you can open in Fluera.",
+  templateDiStudio: "Study template",
+  anonimo: "@anonymous",
+  descPack: (materia: string | null, n: number) =>
+    `A ${materia ? `${materia} ` : ""}study template with ${n} concept${n === 1 ? "" : "s"}. Install it in Fluera and a scheduled review begins — the concepts move into your own study model.`,
+  materiaInFrase: (m: string) => m,
+  votoDa5: "The rating appears from 5 ratings",
+  valutazione: "Rating",
+  concettiNome: "Concepts",
+  materia: "Subject",
+  generatoIa: "AI-generated",
+  di: (a: string) => `by ${a}`,
+  misuratoSu: (n: string, uno: boolean) => `measured on ${n} student${uno ? "" : "s"}`,
+  apri: "Open in Fluera",
+  notaApri: "Fluera opens on your computer, if it's installed. Don't have it? Join the beta.",
+  segnala: "Report",
+  argomenti: "Topics",
+  descrizione: "Description",
+  nessunaDesc: "No description available.",
+  notaModello:
+    "When you open it in Fluera, the concepts in this template join your study model, with a first review scheduled for tomorrow.",
+  potrebbero: "You might also like",
+  altriTemplate: "More templates",
+  tuttiGliAppuntiDi: (m: string) => `All ${m} notes →`,
+  tuttoCatalogo: "The whole catalogue →",
+  riservata: ["Content available in the app", "This content is available in the Fluera app.", "To see it, open the link in Fluera."],
+  categorie: {
+    study: "Study",
+    planner: "Planner",
+    journal: "Journal",
+    calligraphy: "Calligraphy",
+    music: "Music",
+    storyboard: "Storyboard",
+    business: "Business",
+    mindMap: "Mind map",
+    science: "Science",
+    language: "Languages",
+    custom: "Custom",
+  },
+};
+
+const TESTI: Record<Ui, Testi> = { it: TESTI_IT, en: TESTI_EN };
+/// Le parole dell'interfaccia per la lingua di una pagina («it», «ja»…).
+export const testiDi = (lingua: string | null): Testi => TESTI[uiDi(lingua)];
+
+/// La materia di un seme col nome nella lingua dell'interfaccia: «Matematica»
+/// o «Mathematics», non «math». Una disciplina fuori elenco resta com'è.
+export function nomeDisciplina(discipline: string | null, u: Testi): string | null {
   const t = (discipline ?? "").trim();
   if (!t) return null;
   const k = materiaDi(t);
-  return k ? MATERIE[k].it : t;
+  return k ? MATERIE[k][u.lingua] : t;
 }
 
 /// Lo slug della materia negli INDIRIZZI, per lingua: su Google in italiano
@@ -1106,7 +1408,8 @@ const NESSUN_VICINO: Vicini = {
 /// tempo.
 async function fetchVicini(row: SeedRow): Promise<Vicini> {
   const materia = materiaDi(row.discipline);
-  const appunti = { nome: "Appunti", url: urlElenco("it"), nofollow: true };
+  const u = testiDi(linguaDi(row.locale));
+  const appunti = { nome: u.appunti, url: urlElenco("it"), nofollow: true };
   if (!materia) return { ...NESSUN_VICINO, briciole: [appunti] };
   const lingua = linguaDi(row.locale);
   const [s, h] = await Promise.all([
@@ -1128,7 +1431,7 @@ async function fetchVicini(row: SeedRow): Promise<Vicini> {
   const indiceNf = !(lingua && indice === urlElenco(lingua) && hubs.some((x) => x.web_indicizzabile === true));
   const altri = semi.filter((r) => r.hash !== row.hash);
   const stessoCorso = (r: SemeWeb) => !!io?.corso_slug && r.corso_slug === io.corso_slug;
-  const nomeM = (hubM?.materia ?? "").trim() || MATERIE[materia].it;
+  const nomeM = (hubM?.materia ?? "").trim() || MATERIE[materia][u.lingua];
   const nomeC = (hubCorso?.corso ?? "").trim() || (io?.course ?? "").trim();
   const nf = (x: HubWeb) => x.web_indicizzabile !== true;
   return {
@@ -1136,12 +1439,12 @@ async function fetchVicini(row: SeedRow): Promise<Vicini> {
     tutti: hub && lingua
       ? {
         href: urlElenco(lingua, hub.materia_slug, hub.corso_slug),
-        nome: (hubCorso ? hub.corso : hub.materia) ?? MATERIE[materia].it,
+        nome: (hubCorso ? hub.corso : hub.materia) ?? MATERIE[materia][u.lingua],
         nofollow: nf(hub),
       }
       : null,
     briciole: [
-      { nome: "Appunti", url: indice, nofollow: indiceNf },
+      { nome: u.appunti, url: indice, nofollow: indiceNf },
       ...(hubM && lingua ? [{ nome: nomeM, url: urlElenco(lingua, hubM.materia_slug), nofollow: nf(hubM) }] : []),
       ...(hubCorso && lingua && nomeC
         ? [{ nome: nomeC, url: urlElenco(lingua, hubCorso.materia_slug, hubCorso.corso_slug), nofollow: nf(hubCorso) }]
@@ -1171,10 +1474,10 @@ async function fetchScheda(hash: string): Promise<SchedaWeb | null> {
 }
 
 // ── Le rotte /{lingua}/appunti/… ────────────────────────────────────────────
-function nonTrovata(): Response {
-  const r = html(404, paginaStato("Elenco non trovato", "Questo elenco non c'è, o non c'è ancora.", {
+function nonTrovata(u: Testi): Response {
+  const r = html(404, paginaStato(u, u.elencoNo[0], u.elencoNo[1], {
     icona: "eco",
-    azione: { testo: "Tutti i template", href: urlElenco("it") },
+    azione: { testo: u.tuttiTemplate, href: urlElenco("it") },
   }));
   r.headers.set("X-Robots-Tag", "noindex");
   return r;
@@ -1184,13 +1487,10 @@ function nonTrovata(): Response {
 /// (coincide con «Consigliati») e «A–Z» (esclusa anche lì). «Consigliati» è
 /// la pagina base, senza parametro.
 type Ordine = "consigliati" | "efficaci" | "votati" | "recenti";
-const ORDINI: ReadonlyArray<[Ordine, string, string | null]> = [
-  ["consigliati", "Consigliati", null],
-  ["efficaci", "Più efficaci", "Ordinato per guadagni di memoria misurati"],
-  ["votati", "Più votati", null],
-  ["recenti", "Più recenti", null],
-];
-const ordineDi = (s: string | null): Ordine => ORDINI.find(([o]) => o === s)?.[0] ?? "consigliati";
+/// Le etichette stanno in TESTI (ordini, notaEfficaci): qui i valori del
+/// parametro, nell'ordine del menu.
+const ORDINI: ReadonlyArray<Ordine> = ["consigliati", "efficaci", "votati", "recenti"];
+const ordineDi = (s: string | null): Ordine => ORDINI.find((o) => o === s) ?? "consigliati";
 
 /// Due query con gli stessi parametri NELLO STESSO ORDINE, decodificati: «%20»
 /// e «+» sono la stessa cosa, «?pagina=2&ordine=x» e «?ordine=x&pagina=2» no.
@@ -1207,12 +1507,13 @@ function sposta301(location: string): Response {
 
 async function rottaAppunti(m: RegExpMatchArray, reqUrl: URL): Promise<Response> {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-    return html(500, paginaStato("Errore", "Server non configurato."));
+    const u = testiDi(m[2]);
+    return html(500, paginaStato(u, u.errore[0], u.errore[1]));
   }
   const base = m[1] ?? "";
   const lingua = m[2];
   const coda = (m[3] ?? "").match(/^(?:\/([a-z]{2,20})(?:\/([a-z0-9-]{1,60}))?)?(\/?)$/);
-  if (!coda) return nonTrovata();
+  if (!coda) return nonTrovata(testiDi(lingua));
   const [, slug, corso, barra] = coda;
   // UN indirizzo per pagina: il server ricompone la query nel suo ordine
   // (elenchi: ordine, pagina, ref; ricerca: q, materia, ordine, ref) e toglie il
@@ -1222,7 +1523,7 @@ async function rottaAppunti(m: RegExpMatchArray, reqUrl: URL): Promise<Response>
   const ref = sanitizeRef(par.get("ref"));
   const giusti = new URLSearchParams();
   if (slug === "cerca") {
-    if (corso) return nonTrovata();
+    if (corso) return nonTrovata(testiDi(lingua));
     const q = par.get("q");
     const mRaw = par.get("materia");
     const materia = mRaw !== null && RE_SLUG_MATERIA.test(mRaw) ? chiaveMateria(lingua, mRaw).chiave : null;
@@ -1236,9 +1537,9 @@ async function rottaAppunti(m: RegExpMatchArray, reqUrl: URL): Promise<Response>
     }
     return await paginaCerca(lingua, q, materia, ordineC);
   }
-  if (corso && !RE_SLUG_CORSO.test(corso)) return nonTrovata();
+  if (corso && !RE_SLUG_CORSO.test(corso)) return nonTrovata(testiDi(lingua));
   const pRaw = par.get("pagina");
-  if (pRaw !== null && !/^[1-9][0-9]{0,3}$/.test(pRaw)) return nonTrovata();
+  if (pRaw !== null && !/^[1-9][0-9]{0,3}$/.test(pRaw)) return nonTrovata(testiDi(lingua));
   const pagina = pRaw === null ? 1 : Number(pRaw);
   const ordine = ordineDi(par.get("ordine"));
   const { chiave: materia, sposta } = slug ? chiaveMateria(lingua, slug) : { chiave: null, sposta: false };
@@ -1254,16 +1555,18 @@ async function rottaAppunti(m: RegExpMatchArray, reqUrl: URL): Promise<Response>
   return await paginaElenco(lingua, materia, corso ?? null, pagina, ordine);
 }
 
-/// Il nome di una materia nella lingua dell'elenco (list_web_hubs), con
-/// l'italiano come ripiego.
-function nomeMateria(hubs: HubWeb[], slug: string): string {
+/// Il nome di una materia nella lingua dell'elenco (list_web_hubs), con la
+/// lingua dell'interfaccia come ripiego.
+function nomeMateria(hubs: HubWeb[], slug: string, u: Testi): string {
   const h = hubs.find((x) => x.materia_slug === slug && x.corso_slug === null) ??
     hubs.find((x) => x.materia_slug === slug);
-  return (h?.materia ?? "").trim() || MATERIE[slug]?.it || slug;
+  return (h?.materia ?? "").trim() || MATERIE[slug]?.[u.lingua] || slug;
 }
 
-/// ` lang="…"` sui nomi che il database dà nella lingua dell'elenco.
-const langElenco = (lingua: string) => (lingua === "it" ? "" : ` lang="${esc(lingua)}"`);
+/// ` lang="…" dir="auto"` sui nomi che il database dà nella lingua
+/// dell'elenco, quando non è quella dell'interfaccia (un elenco /ja/ ha
+/// l'interfaccia inglese). dir="auto": un nome in arabo va da destra (I18N-04).
+const langElenco = (lingua: string) => (lingua === uiDi(lingua) ? "" : ` lang="${esc(lingua)}" dir="auto"`);
 
 // ── Il catalogo come l'app (catalogo 218, 2026-09-24) ───────────────────────
 // Le schede, le strisce e i filtri copiano marketplace_widgets.dart (MW) e
@@ -1364,24 +1667,25 @@ function spriteIcone(html: string): string {
     : "";
 }
 
-/// Le categorie dell'enum dell'app (template_models.dart) con l'etichetta di
-/// app_it.arb e l'icona di marketplaceCategoryIcon. Fuori elenco = niente
-/// pillola: la 218 lo manda già NULL, e NULL non diventa «Personalizzato».
-const CATEGORIE: Record<string, [string, string]> = {
-  study: ["Studio", "menu_book"],
-  planner: ["Agenda", "event"],
-  journal: ["Diario", "auto_stories"],
-  calligraphy: ["Calligrafia", "draw"],
-  music: ["Musica", "music"],
-  storyboard: ["Storyboard", "movie"],
-  business: ["Business", "work"],
-  mindMap: ["Mappa mentale", "hub"],
-  science: ["Scienze", "science"],
-  language: ["Lingue", "translate"],
-  custom: ["Personalizzato", "palette"],
+/// Le categorie dell'enum dell'app (template_models.dart) con l'icona di
+/// marketplaceCategoryIcon; l'etichetta è quella di app_it / app_en.arb, in
+/// TESTI. Fuori elenco = niente pillola: la 218 lo manda già NULL, e NULL non
+/// diventa «Personalizzato».
+const ICONA_CATEGORIA: Record<string, string> = {
+  study: "menu_book",
+  planner: "event",
+  journal: "auto_stories",
+  calligraphy: "draw",
+  music: "music",
+  storyboard: "movie",
+  business: "work",
+  mindMap: "hub",
+  science: "science",
+  language: "translate",
+  custom: "palette",
 };
-const categoriaDi = (c: unknown): [string, string] | null =>
-  typeof c === "string" && Object.hasOwn(CATEGORIE, c) ? CATEGORIE[c] : null;
+const categoriaDi = (c: unknown, u: Testi): [string, string] | null =>
+  typeof c === "string" && Object.hasOwn(ICONA_CATEGORIA, c) ? [u.categorie[c] ?? c, ICONA_CATEGORIA[c]] : null;
 
 const ICONA_MATERIA: Record<string, string> = {
   math: "menu_book",
@@ -1404,15 +1708,17 @@ function numero(v: unknown): number | null {
   const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
   return Number.isFinite(n) ? n : null;
 }
-/// 1234 → «1234», 1 200 000 → «1,2 Mln»: come NumberFormat.compact dell'app.
-function numeroIt(n: number): string {
+/// 1234 → «1234», 1 200 000 → «1,2 Mln» (in inglese «1.2M»): come
+/// NumberFormat.compact dell'app.
+function numeroUi(n: number, u: Testi): string {
   try {
-    return new Intl.NumberFormat("it-IT", { notation: "compact", maximumFractionDigits: 1 }).format(n);
+    return new Intl.NumberFormat(u.formato, { notation: "compact", maximumFractionDigits: 1 }).format(n);
   } catch {
     return String(n);
   }
 }
-const votoIt = (v: number) => v.toFixed(1).replace(".", ",");
+/// Il voto con una cifra: «4,6» in italiano, «4.6» in inglese.
+const votoUi = (v: number, u: Testi) => (u.lingua === "it" ? v.toFixed(1).replace(".", ",") : v.toFixed(1));
 
 /// La parola più lunga di un testo in em, a peso 600, per eccesso: tarata su
 /// Noto Sans (il sans più largo fra quelli di sistema che il catalogo usa;
@@ -1424,15 +1730,15 @@ export function larghezzaEm(testo: string): number {
   const max = Math.max(0, ...testo.split(/\s+/).map((p) => [...p].reduce((s, c) => s + em(c), 0)));
   return Math.round(max * 100) / 100;
 }
-const concetti = (n: number) => `${n} concett${n === 1 ? "o" : "i"}`;
+const concetti = (n: number, u: Testi) => u.concetti(String(n), n === 1);
 
 /// Cinque stelle come MW: piena se ≥ i, mezza se ≥ i − 0,5, vuota altrimenti.
-function stelle(voto: number, voti: number | null, classe = ""): string {
+function stelle(u: Testi, voto: number, voti: number | null, classe = ""): string {
   const s = [1, 2, 3, 4, 5]
     .map((i) => (voto >= i ? ic("star") : voto >= i - 0.5 ? ic("star_half") : ic("star_border", "vuota")))
     .join("");
-  const n = voti !== null ? `<span class="n" aria-hidden="true">(${esc(numeroIt(voti))})</span>` : "";
-  const detto = `Valutazione ${votoIt(voto)} su 5${voti !== null ? `, ${voti} vot${voti === 1 ? "o" : "i"}` : ""}`;
+  const n = voti !== null ? `<span class="n" aria-hidden="true">(${esc(numeroUi(voti, u))})</span>` : "";
+  const detto = `${u.votoAria(votoUi(voto, u))}${voti !== null ? `, ${u.voti(voti)}` : ""}`;
   return `<span class="stelle${classe ? ` ${classe}` : ""}" role="img" aria-label="${detto}">${s}${n}</span>`;
 }
 
@@ -1455,13 +1761,13 @@ function nuovo(r: SemeWeb): boolean {
 }
 
 /// Il distintivo di fiducia piccolo: Ufficiale vince su In evidenza.
-const nomeFiducia = (r: { is_official?: boolean | null; is_featured?: boolean | null }) =>
-  r.is_official === true ? "Ufficiale" : r.is_featured === true ? "In evidenza" : null;
+const nomeFiducia = (r: { is_official?: boolean | null; is_featured?: boolean | null }, u: Testi) =>
+  r.is_official === true ? u.ufficiale : r.is_featured === true ? u.inEvidenza : null;
 /// Sopra l'anteprima è solo per gli occhi (aria-hidden): il lettore di schermo
 /// lo sente in `dopoIlTitolo`, perché il nome della scheda cominci dal titolo
 /// come nell'app («titolo. autore. voto», MW:1246-1262).
-function fiducia(r: { is_official?: boolean | null; is_featured?: boolean | null }): string {
-  const n = nomeFiducia(r);
+function fiducia(r: { is_official?: boolean | null; is_featured?: boolean | null }, u: Testi): string {
+  const n = nomeFiducia(r, u);
   return n
     ? `<span class="fiducia${r.is_official === true ? "" : " evid"}" title="${n}" aria-hidden="true">${ic(r.is_official === true ? "verified" : "auto_awesome")}</span>`
     : "";
@@ -1475,11 +1781,19 @@ function dopoIlTitolo(voci: Array<string | null | undefined>): string {
   return v.length ? `<span class="vh">${esc(v.join(", "))}</span>` : "";
 }
 
+/// L'immagine di un pack negli elenchi: la miniatura degli appunti, o in
+/// mancanza una card ufficiale scelta a mano. Mai `<hash>-og.png`, la vecchia
+/// card dell'app con il logo finto (VIS-03): senza miniatura, la rigatura.
+function immagineElenco(r: { thumb_path: string | null; og_path: string | null }): string | null {
+  if (r.thumb_path) return publicUrl(r.thumb_path);
+  return r.og_path?.startsWith("official/") ? publicUrl(r.og_path) : null;
+}
+
 /// L'anteprima «foglio appuntato sulla carta»: cornice a righe da quaderno e
 /// foglio a proporzione fissa, così le miniature di una riga sono alte uguali.
-function anteprima(r: SemeWeb, subito: boolean, sopra: string): string {
-  const img = r.thumb_path ? publicUrl(r.thumb_path) : r.og_path ? publicUrl(r.og_path) : null;
-  const cat = categoriaDi(r.category);
+function anteprima(r: SemeWeb, subito: boolean, sopra: string, u: Testi): string {
+  const img = immagineElenco(r);
+  const cat = categoriaDi(r.category, u);
   const dentro = img
     ? `<img src="${esc(img)}" alt="" width="400" height="300"${subito ? "" : ` loading="lazy"`} decoding="async" />`
     : `<span class="rigatura">${ic(cat?.[1] ?? "menu_book", "cat")}</span>`;
@@ -1488,11 +1802,11 @@ function anteprima(r: SemeWeb, subito: boolean, sopra: string): string {
 
 /// La scheda della griglia e delle strisce (TemplateCard, MW:1073-1463). Tutta
 /// la scheda è UN link. La pillola dell'efficacia solo nella griglia.
-function schedaSeme(r: SemeWeb, griglia: boolean, subito = false): string {
-  const t = (r.title ?? "").trim() || "Senza titolo";
-  const cat = categoriaDi(r.category);
+function schedaSeme(u: Testi, r: SemeWeb, griglia: boolean, subito = false): string {
+  const t = (r.title ?? "").trim() || u.senzaTitolo;
+  const cat = categoriaDi(r.category, u);
   const eNuovo = nuovo(r);
-  const sopra = (fiducia(r) || (eNuovo ? `<span class="nuovo" aria-hidden="true">Nuovo</span>` : "")) +
+  const sopra = (fiducia(r, u) || (eNuovo ? `<span class="nuovo" aria-hidden="true">${u.nuovo}</span>` : "")) +
     (cat ? `<span class="categoria" aria-hidden="true">${ic(cat[1])}<span>${esc(cat[0])}</span></span>` : "");
   // F4 (2026-09-28): i pack degli studenti stanno negli elenchi con il loro
   // autore, come nell'app: il codice pseudonimo (Creator Terms 2.5), mai un
@@ -1501,48 +1815,48 @@ function schedaSeme(r: SemeWeb, griglia: boolean, subito = false): string {
   const eff = griglia ? numero(r.efficacia_pct) : null;
   const voto = numero(r.voto_medio);
   const n = numero(r.concept_count);
-  return `<li><a class="scheda" href="${SHARE}/s/${esc(r.hash)}"${relSeNonIndicizzabile(r)}>${anteprima(r, subito, sopra)}<span class="testi"><h3 class="t"${attrLingua(r)}>${esc(t)}</h3>${
+  return `<li><a class="scheda" href="${SHARE}/s/${esc(r.hash)}"${relSeNonIndicizzabile(r)}>${anteprima(r, subito, sopra, u)}<span class="testi"><h3 class="t"${attrContenuto(r, u)}>${esc(t)}</h3>${
     autore ? `<span class="autore">${pallino(autore)}${esc(autore)}</span>` : ""
-  }${eff !== null ? `<span class="pillola">${ic("trending")}+${Math.round(eff)}% ritenzione</span>` : ""}${
-    voto !== null ? stelle(voto, numero(r.voti)) : ""
-  }<span class="piede-s"><span>${n !== null && n > 0 ? `${ic("hub")}${concetti(n)}` : ""}</span>${ic("chevron", "vai")}</span>${
-    dopoIlTitolo([nomeFiducia(r) ?? (eNuovo ? "Nuovo" : null), cat?.[0]])
+  }${eff !== null ? `<span class="pillola">${ic("trending")}${u.ritenzione(Math.round(eff))}</span>` : ""}${
+    voto !== null ? stelle(u, voto, numero(r.voti)) : ""
+  }<span class="piede-s"><span>${n !== null && n > 0 ? `${ic("hub")}${concetti(n, u)}` : ""}</span>${ic("chevron", "vai")}</span>${
+    dopoIlTitolo([nomeFiducia(r, u) ?? (eNuovo ? u.nuovo : null), cat?.[0]])
   }</span></a></li>`;
 }
 
 /// La scheda della striscia «In evidenza» (FeaturedTemplateCard, MW:2367-2626).
-function schedaEvidenza(r: SemeWeb): string {
-  const t = (r.title ?? "").trim() || "Senza titolo";
+function schedaEvidenza(u: Testi, r: SemeWeb): string {
+  const t = (r.title ?? "").trim() || u.senzaTitolo;
   const voto = numero(r.voto_medio);
   const autore = autoreMostrato(r);
-  return `<li><a class="scheda evid" href="${SHARE}/s/${esc(r.hash)}"${relSeNonIndicizzabile(r)}>${anteprima(r, false, fiducia(r))}<span class="testi"><span class="col"><h3 class="t"${attrLingua(r)}>${esc(t)}</h3>${
+  return `<li><a class="scheda evid" href="${SHARE}/s/${esc(r.hash)}"${relSeNonIndicizzabile(r)}>${anteprima(r, false, fiducia(r, u), u)}<span class="testi"><span class="col"><h3 class="t"${attrContenuto(r, u)}>${esc(t)}</h3>${
     autore ? `<span class="autore">${pallino(autore, "p24")}${esc(autore)}</span>` : ""
-  }${voto !== null ? stelle(voto, numero(r.voti)) : ""}${dopoIlTitolo([nomeFiducia(r)])}</span><span class="tondo" aria-hidden="true">${ic("arrow")}</span></span></a></li>`;
+  }${voto !== null ? stelle(u, voto, numero(r.voti)) : ""}${dopoIlTitolo([nomeFiducia(r, u)])}</span><span class="tondo" aria-hidden="true">${ic("arrow")}</span></span></a></li>`;
 }
 
 /// Il banner (_InkfolioFeaturedHero, MS:2358-2810): il primo In evidenza, con
 /// la palette OPPOSTA a quella della pagina. È il LCP dell'indice.
-function bannerEvidenza(r: SemeWeb): string {
-  const t = (r.title ?? "").trim() || "Senza titolo";
-  const img = r.thumb_path ? publicUrl(r.thumb_path) : r.og_path ? publicUrl(r.og_path) : null;
+function bannerEvidenza(u: Testi, r: SemeWeb): string {
+  const t = (r.title ?? "").trim() || u.senzaTitolo;
+  const img = immagineElenco(r);
   const voto = numero(r.voto_medio);
   const n = numero(r.concept_count);
   const riga = voto !== null
-    ? stelle(voto, numero(r.voti), "grandi")
+    ? stelle(u, voto, numero(r.voti), "grandi")
     : n !== null && n > 0
-    ? `<span class="e-conc">${ic("hub")}${concetti(n)}</span>`
+    ? `<span class="e-conc">${ic("hub")}${concetti(n, u)}</span>`
     : "<span></span>";
   // «Selezionati dal team Fluera» resta anche su un pack di uno studente: è
   // vero (In evidenza lo sceglie il team), e l'autore sotto dice di chi è.
   const autore = autoreMostrato(r);
-  return `<div class="eroe"><a class="eroe-a" href="${SHARE}/s/${esc(r.hash)}"${relSeNonIndicizzabile(r)}><span class="e-testi"><span class="occhiello">Selezionati dal team Fluera</span><h3${attrLingua(r)}>${esc(t)}</h3>${
+  return `<div class="eroe"><a class="eroe-a" href="${SHARE}/s/${esc(r.hash)}"${relSeNonIndicizzabile(r)}><span class="e-testi"><span class="occhiello">${u.selezionati}</span><h3${attrContenuto(r, u)}>${esc(t)}</h3>${
     autore
       ? `<span class="e-autore"><span class="e-pal" aria-hidden="true">${esc([...autore.replace(/^@/, "")][0]?.toUpperCase() ?? "?")}</span>${esc(autore)}</span>`
       : ""
   }</span><span class="e-img"><span class="e-foglio">${
     img
       ? `<img src="${esc(img)}" alt="" width="400" height="300" fetchpriority="high" decoding="async" />`
-      : `<span class="rigatura">${ic(categoriaDi(r.category)?.[1] ?? "menu_book", "cat")}</span>`
+      : `<span class="rigatura">${ic(categoriaDi(r.category, u)?.[1] ?? "menu_book", "cat")}</span>`
   }</span></span><span class="e-voto">${riga}<span class="tondo grande" aria-hidden="true">${ic("arrow")}</span></span></a></div>`;
 }
 
@@ -1551,6 +1865,7 @@ function bannerEvidenza(r: SemeWeb): string {
 /// titolo stanno in una riga e il sottotitolo sotto, dal margine: rientrato
 /// sotto il titolo andava a capo sul telefono.
 function intestazione(
+  u: Testi,
   id: string,
   icona: string,
   titolo: string,
@@ -1558,7 +1873,7 @@ function intestazione(
   vedi?: { href: string; nofollow: boolean },
 ): string {
   return `<div class="sez-testa"><div><div class="riga">${ic(icona)}<h2 id="${id}">${esc(titolo)}</h2></div>${sotto ? `<p>${esc(sotto)}</p>` : ""}</div>${
-    vedi ? `<a class="vedi" href="${esc(vedi.href)}"${vedi.nofollow ? ` rel="nofollow"` : ""}>Vedi tutti${ic("chevron")}</a>` : ""
+    vedi ? `<a class="vedi" href="${esc(vedi.href)}"${vedi.nofollow ? ` rel="nofollow"` : ""}>${u.vediTutti}${ic("chevron")}</a>` : ""
   }</div>`;
 }
 
@@ -1580,6 +1895,7 @@ const relHub = (hubs: HubWeb[], materia: string, corso: string | null = null) =>
 /// elenchi (nofollow verso quelli che Google non prende, F4); nella ricerca
 /// portano la ricerca con la materia.
 function chipMaterie(lingua: string, hubs: HubWeb[], attuale: string | null, q: string | null, ordine: Ordine = "consigliati"): string {
+  const u = testiDi(lingua);
   const href = (k: string | null) => {
     if (q === null) return urlElenco(lingua, k);
     const p = new URLSearchParams({ q });
@@ -1593,14 +1909,15 @@ function chipMaterie(lingua: string, hubs: HubWeb[], attuale: string | null, q: 
     }>${k ? ic(iconaMateria(k)) : ""}<span${
       k ? langElenco(lingua) : ""
     }>${esc(nome)}</span></a></li>`;
-  return `<nav class="chips" aria-label="Materie"><ul>${voce(null, "Tutte")}${
-    materieDi(hubs).map((k) => voce(k, nomeMateria(hubs, k))).join("")
+  return `<nav class="chips" aria-label="${u.materie}"><ul>${voce(null, u.tutte)}${
+    materieDi(hubs).map((k) => voce(k, nomeMateria(hubs, k, u))).join("")
   }</ul></nav>`;
 }
 
 /// La faccetta «Tutti i corsi ▾» (MS:1791-1829): un <details> con link veri.
 /// Nell'indice i corsi stanno sotto il nome della loro materia.
 function faccettaCorso(lingua: string, hubs: HubWeb[], materia: string | null, corso: string | null): string {
+  const u = testiDi(lingua);
   const corsi = hubs.filter((h) => h.corso_slug !== null && (materia === null || h.materia_slug === materia));
   if (corsi.length === 0) return "";
   const nomeC = (h: HubWeb) => (h.corso ?? "").trim() || (h.corso_slug ?? "");
@@ -1610,31 +1927,31 @@ function faccettaCorso(lingua: string, hubs: HubWeb[], materia: string | null, c
     }${relSeNonIndicizzabile(h)}${langElenco(lingua)}>${esc(nomeC(h))}<span class="conta">(${Math.max(0, Number(h.n) || 0)})</span></a></li>`;
   const attivo = corso ? corsi.find((h) => h.corso_slug === corso) : undefined;
   const menu = materia
-    ? `<li><a href="${urlElenco(lingua, materia)}"${corso ? "" : ` aria-current="page"`}${relHub(hubs, materia)}>Tutti i corsi</a></li><li role="separator"></li>${corsi.map(voce).join("")}`
+    ? `<li><a href="${urlElenco(lingua, materia)}"${corso ? "" : ` aria-current="page"`}${relHub(hubs, materia)}>${u.tuttiCorsi}</a></li><li role="separator"></li>${corsi.map(voce).join("")}`
     : materieDi(hubs).map((k) => {
       const suoi = corsi.filter((h) => h.materia_slug === k);
-      return suoi.length ? `<li class="gruppo"${langElenco(lingua)}>${esc(nomeMateria(hubs, k))}</li>${suoi.map(voce).join("")}` : "";
+      return suoi.length ? `<li class="gruppo"${langElenco(lingua)}>${esc(nomeMateria(hubs, k, u))}</li>${suoi.map(voce).join("")}` : "";
     }).join("");
-  return `<details class="menu-a faccetta${attivo ? " attiva" : ""}"><summary>${ic("school")}<span>${esc(attivo ? nomeC(attivo) : "Tutti i corsi")}</span>${
+  return `<details class="menu-a faccetta${attivo ? " attiva" : ""}"><summary>${ic("school")}<span>${esc(attivo ? nomeC(attivo) : u.tuttiCorsi)}</span>${
     ic("drop")
   }</summary><ul class="menu" role="list">${menu}</ul></details>`;
 }
 
 /// «Ordina»: quattro link, e solo la griglia si riordina. Nella ricerca `resto`
 /// porta q e materia, come nell'app dove l'ordine vale anche cercando.
-function menuOrdina(base: string, ordine: Ordine, resto?: URLSearchParams): string {
+function menuOrdina(u: Testi, base: string, ordine: Ordine, resto?: URLSearchParams): string {
   const href = (o: Ordine) => {
     const q = new URLSearchParams(resto);
     if (o !== "consigliati") q.set("ordine", o);
     return `${base}${q.size ? `?${q}` : ""}`;
   };
-  const voci = ORDINI.map(([o, nome, nota]) =>
+  const voci = ORDINI.map((o) =>
     `<li><a href="${esc(href(o))}#tutti"${o === ordine ? ` aria-current="true"` : ""}${
       o === "consigliati" ? "" : ` rel="nofollow"`
-    }>${nome}${nota ? `<small>${nota}</small>` : ""}</a></li>`
+    }>${u.ordini[o]}${o === "efficaci" ? `<small>${u.notaEfficaci}</small>` : ""}</a></li>`
   ).join("");
-  const attuale = ORDINI.find(([o]) => o === ordine)?.[1] ?? "Consigliati";
-  return `<details class="menu-a ordina"><summary aria-label="Ordina: ${attuale}">${ic("sort")}<span>${attuale}</span>${
+  const attuale = u.ordini[ordine];
+  return `<details class="menu-a ordina"><summary aria-label="${u.ordina}: ${attuale}">${ic("sort")}<span>${attuale}</span>${
     ic("drop")
   }</summary><ul class="menu" role="list">${voci}</ul></details>`;
 }
@@ -1649,7 +1966,7 @@ function canonico(base: string, pagina: number, ordine: Ordine): string {
 
 /// Pagine vere al posto dello scroll infinito. Dentro un ordine i link sono
 /// nofollow; la pagina 1 non porta ?pagina=1.
-function navPagine(base: string, pagina: number, pagine: number, ordine: Ordine): string {
+function navPagine(u: Testi, base: string, pagina: number, pagine: number, ordine: Ordine): string {
   if (pagine <= 1) return "";
   const url = (n: number) => {
     const q = new URLSearchParams();
@@ -1665,23 +1982,24 @@ function navPagine(base: string, pagina: number, pagine: number, ordine: Ordine)
     voci.push(
       n === pagina
         ? `<span aria-current="page">${n}</span>`
-        : `<a href="${esc(url(n))}"${nf ? ` rel="nofollow"` : ""} aria-label="Pagina ${n}">${n}</a>`,
+        : `<a href="${esc(url(n))}"${nf ? ` rel="nofollow"` : ""} aria-label="${u.pagina(n)}">${n}</a>`,
     );
   });
-  return `<nav class="pagine" aria-label="Pagine">${
-    pagina > 1 ? `<a class="lato" href="${esc(url(pagina - 1))}" rel="prev${nf}">${ic("chevron_l")}Pagina precedente</a>` : ""
+  return `<nav class="pagine" aria-label="${u.pagine}">${
+    pagina > 1 ? `<a class="lato" href="${esc(url(pagina - 1))}" rel="prev${nf}">${ic("chevron_l")}${u.paginaPrec}</a>` : ""
   }${voci.join("")}${
-    pagina < pagine ? `<a class="lato" href="${esc(url(pagina + 1))}" rel="next${nf}">Pagina successiva${ic("chevron")}</a>` : ""
+    pagina < pagine ? `<a class="lato" href="${esc(url(pagina + 1))}" rel="next${nf}">${u.paginaSucc}${ic("chevron")}</a>` : ""
   }</nav>`;
 }
 
 /// La ricerca in cima (ARB:3500). Con una materia, si cerca dentro la materia.
 function formCerca(lingua: string, q = "", materia: string | null = null, ordine: Ordine = "consigliati"): string {
+  const u = testiDi(lingua);
   return `<form class="cerca" action="${urlElenco(lingua)}cerca" method="get" role="search">${ic("search", "lente")}<input type="search" name="q" value="${
     esc(q)
-  }" minlength="2" maxlength="80" placeholder="Cerca template di studio…" aria-label="Cerca template di studio" enterkeyhint="search" />${
+  }" minlength="2" maxlength="80" placeholder="${u.cercaSegnaposto}" aria-label="${u.cercaTemplate}" enterkeyhint="search" />${
     materia ? `<input type="hidden" name="materia" value="${esc(slugMateria(lingua, materia))}" />` : ""
-  }${ordine !== "consigliati" ? `<input type="hidden" name="ordine" value="${ordine}" />` : ""}<button type="submit" aria-label="Cerca">${ic("arrow")}</button></form>`;
+  }${ordine !== "consigliati" ? `<input type="hidden" name="ordine" value="${ordine}" />` : ""}<button type="submit" aria-label="${u.cerca}">${ic("arrow")}</button></form>`;
 }
 
 /// La fascia d'apertura (§ + titolo + stanghetta gialla + sottotitolo).
@@ -1706,15 +2024,16 @@ function statoVuoto(
 /// «Tutti i template»: la griglia e le pagine. Le prime 5 immagini senza lazy
 /// solo dove la griglia sta in cima (`inCima`): nell'indice con le vetrine sta
 /// sotto quattro strisce, e scaricarle subito rubava banda al banner.
-function sezioneTutti(semi: SemeWeb[], nav: string, titolo = "Tutti i template", inCima = true): string {
-  return `<section class="sez" id="tutti" aria-labelledby="t-tutti">${intestazione("t-tutti", "grid", titolo, null)}<ul class="griglia">${
-    semi.map((r, i) => schedaSeme(r, true, inCima && i < 5)).join("")
+function sezioneTutti(u: Testi, semi: SemeWeb[], nav: string, titolo = u.tuttiTemplate, inCima = true): string {
+  return `<section class="sez" id="tutti" aria-labelledby="t-tutti">${intestazione(u, "t-tutti", "grid", titolo, null)}<ul class="griglia">${
+    semi.map((r, i) => schedaSeme(u, r, true, inCima && i < 5)).join("")
   }</ul>${nav}</section>`;
 }
 
 /// «Materie e corsi»: ogni elenco con un link, senza aprire un menu. Dopo la
 /// griglia, in piccolo, così non pesa sull'aspetto dell'app.
 function mappaCorsi(lingua: string, hubs: HubWeb[]): string {
+  const u = testiDi(lingua);
   const la = langElenco(lingua);
   const voci = materieDi(hubs).map((k) => {
     const corsi = hubs.filter((x) => x.materia_slug === k && x.corso_slug !== null)
@@ -1722,9 +2041,9 @@ function mappaCorsi(lingua: string, hubs: HubWeb[]): string {
         `<li><a href="${urlElenco(lingua, k, x.corso_slug)}"${relSeNonIndicizzabile(x)}${la}>${esc((x.corso ?? "").trim() || (x.corso_slug ?? ""))}</a></li>`
       )
       .join("");
-    return `<li><a class="m" href="${urlElenco(lingua, k)}"${relHub(hubs, k)}${la}>${esc(nomeMateria(hubs, k))}</a>${corsi ? `<ul>${corsi}</ul>` : ""}</li>`;
+    return `<li><a class="m" href="${urlElenco(lingua, k)}"${relHub(hubs, k)}${la}>${esc(nomeMateria(hubs, k, u))}</a>${corsi ? `<ul>${corsi}</ul>` : ""}</li>`;
   }).join("");
-  return voci ? `<section class="mappa" aria-labelledby="t-mappa"><h2 id="t-mappa">Materie e corsi</h2><ul>${voci}</ul></section>` : "";
+  return voci ? `<section class="mappa" aria-labelledby="t-mappa"><h2 id="t-mappa">${u.materieECorsi}</h2><ul>${voci}</ul></section>` : "";
 }
 
 /// I menu <details> funzionano da soli; questo li chiude con Esc o con un
@@ -1796,14 +2115,15 @@ function paginaWeb(p: {
   /// (la regola di paginaIndice), e allora il link «Catalogo» si segue.
   hubs: HubWeb[];
 }): Response {
+  const u = testiDi(p.lingua);
   const catalogoNf = !p.hubs.some((x) => x.web_indicizzabile === true);
-  const dentro = `${testata(urlElenco(p.lingua), p.suIndice, catalogoNf)}
+  const dentro = `${testata(u, urlElenco(p.lingua), p.suIndice, catalogoNf)}
   <main class="in cat">
     ${p.corpo}
   </main>
-  ${piede()}`;
+  ${piede(u)}`;
   const body = `<!doctype html>
-<html lang="it">
+<html lang="${u.lingua}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}${p.siIndicizza ? "" : `\n  <meta name="robots" content="noindex" />`}
@@ -1832,11 +2152,12 @@ const conOrdine = (o: Ordine) => (o === "consigliati" ? {} : { p_ordine: o });
 
 /// Le vetrine dell'indice, con i testi dell'app. «Vedi tutti» porta alla
 /// griglia della stessa pagina con l'ordine giusto; In evidenza non ce l'ha.
-const VETRINE: Record<string, { titolo: string; sotto: string; icona: string; vedi: Ordine | null }> = {
-  in_evidenza: { titolo: "In evidenza", sotto: "Selezionati dal team Fluera", icona: "auto_awesome", vedi: null },
-  piu_efficaci: { titolo: "Provati efficaci", sotto: "Template che aumentano davvero la ritenzione", icona: "premium", vedi: "efficaci" },
-  di_tendenza: { titolo: "Di tendenza", sotto: "Popolari tra chi studia questa settimana", icona: "trending", vedi: "consigliati" },
-  novita: { titolo: "Novità", sotto: "Appena pubblicati", icona: "schedule", vedi: "recenti" },
+/// Titoli e sottotitoli in TESTI.vetrine, con le stesse chiavi.
+const VETRINE: Record<string, { icona: string; vedi: Ordine | null }> = {
+  in_evidenza: { icona: "auto_awesome", vedi: null },
+  piu_efficaci: { icona: "premium", vedi: "efficaci" },
+  di_tendenza: { icona: "trending", vedi: "consigliati" },
+  novita: { icona: "schedule", vedi: "recenti" },
 };
 type Vetrina = { nome: string; righe: VetrinaWeb[] };
 
@@ -1852,23 +2173,24 @@ function vetrineDi(rows: VetrinaWeb[]): Vetrina[] {
     }));
 }
 
-function sezioneVetrina(self: string, v: Vetrina): string {
+function sezioneVetrina(u: Testi, self: string, v: Vetrina): string {
   const d = VETRINE[v.nome];
+  const [titolo, sotto] = u.vetrine[v.nome];
   const id = `t-${v.nome.replace(/_/g, "-")}`;
   const vedi = d.vedi === null
     ? undefined
     : d.vedi === "consigliati"
     ? { href: `${self}#tutti`, nofollow: false }
     : { href: `${self}?ordine=${d.vedi}#tutti`, nofollow: true };
-  const testa = intestazione(id, d.icona, d.titolo, d.sotto, vedi);
+  const testa = intestazione(u, id, d.icona, titolo, sotto, vedi);
   if (v.nome === "in_evidenza") {
     const [primo, ...altri] = v.righe;
-    return `<section class="sez vetrina" data-vetrina="in_evidenza" aria-labelledby="${id}">${testa}${bannerEvidenza(primo)}${
-      altri.length ? striscia(d.titolo, altri.map(schedaEvidenza).join(""), "evid") : ""
+    return `<section class="sez vetrina" data-vetrina="in_evidenza" aria-labelledby="${id}">${testa}${bannerEvidenza(u, primo)}${
+      altri.length ? striscia(titolo, altri.map((r) => schedaEvidenza(u, r)).join(""), "evid") : ""
     }</section>`;
   }
   return `<section class="sez vetrina" data-vetrina="${esc(v.nome)}" aria-labelledby="${id}">${testa}${
-    striscia(d.titolo, v.righe.map((r) => schedaSeme(r, false)).join(""))
+    striscia(titolo, v.righe.map((r) => schedaSeme(u, r, false)).join(""))
   }</section>`;
 }
 
@@ -1878,8 +2200,9 @@ function sezioneVetrina(self: string, v: Vetrina): string {
 /// verità: i primi pack arrivano), ma resta fuori da Google finché non c'è un
 /// elenco. Le altre lingue nascono col loro primo elenco.
 async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Promise<Response> {
+  const u = testiDi(lingua);
   const offset = (pagina - 1) * SEMI_PER_PAGINA;
-  if (offset > OFFSET_MAX) return nonTrovata();
+  if (offset > OFFSET_MAX) return nonTrovata(testiDi(lingua));
   const [h, s, v] = await Promise.all([
     rpcWeb<HubWeb>("list_web_hubs", { p_lingua: lingua }),
     rpcWeb<SemeWeb>("list_web_seeds", { p_lingua: lingua, p_limit: SEMI_PER_PAGINA, p_offset: offset, ...conOrdine(ordine) }),
@@ -1889,32 +2212,32 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
       ? rpcWeb<VetrinaWeb>("list_web_vetrine", { p_lingua: lingua, p_per_vetrina: 12 }, 1500)
       : Promise.resolve<EsitoRpc<VetrinaWeb>>({ ok: true, rows: [] }),
   ]);
-  if (!h.ok) return rispostaGuasto(`list_web_hubs(${lingua}): ${h.motivo}`);
-  if (!s.ok) return rispostaGuasto(`list_web_seeds(${lingua}): ${s.motivo}`);
+  if (!h.ok) return rispostaGuasto(u, `list_web_hubs(${lingua}): ${h.motivo}`);
+  if (!s.ok) return rispostaGuasto(u, `list_web_seeds(${lingua}): ${s.motivo}`);
   const hubs = hubValidi(h.rows);
   // F4 (29/09): l'indice mostra i pack visibili anche quando nessun elenco di
   // materia supera la soglia (3 pack di 2 autori): prima un pack di uno
   // studente, da solo, non compariva in nessun elenco del sito. Resta fuori da
   // Google (siIndicizza vuole un elenco indicizzabile).
   const vuoto = hubs.length === 0 && semiValidi(s.rows).length === 0;
-  if (vuoto && (lingua !== "it" || pagina > 1)) return nonTrovata();
+  if (vuoto && (lingua !== "it" || pagina > 1)) return nonTrovata(testiDi(lingua));
   const self = urlElenco(lingua);
-  const descrizione = "Pack di appunti divisi per materia, da aprire in Fluera: un canvas per imparare, dove ci scrivi sopra a mano.";
+  const descrizione = u.descIndice;
   if (vuoto) {
     return paginaWeb({
       lingua,
       hubs,
-      titolo: "Template di studio e appunti per materia · Fluera",
+      titolo: `${u.titoloIndice} · Fluera`,
       descrizione,
       self,
       siIndicizza: false,
       suIndice: true,
-      corpo: statoVuoto("eco", "Ancora nessun template", "I pack di studio arrivano presto. Torna a trovarci!", { testo: "Scopri Fluera", href: SITE }, 1),
+      corpo: statoVuoto("eco", u.vuoto[0], u.vuoto[1], { testo: u.scopri, href: u.sito }, 1),
     });
   }
   if (!v.ok) console.error(`vetrine di ${lingua}: ${v.motivo}`);
   const semi = semiValidi(s.rows);
-  if (pagina > 1 && semi.length === 0) return nonTrovata();
+  if (pagina > 1 && semi.length === 0) return nonTrovata(testiDi(lingua));
   const totale = Math.max(Number(s.rows[0]?.totale ?? 0) || 0, offset + semi.length);
   const pagine = Math.max(1, Math.ceil(totale / SEMI_PER_PAGINA));
   const vetrine = v.ok ? vetrineDi(v.rows) : [];
@@ -1925,7 +2248,7 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
   return paginaWeb({
     lingua,
     hubs,
-    titolo: `Template di studio e appunti per materia${pagina > 1 ? ` · pagina ${pagina}` : ""} · Fluera`,
+    titolo: `${u.titoloIndice}${pagina > 1 ? u.paginaN(pagina) : ""} · Fluera`,
     descrizione,
     self: self2,
     // F4: l'indice va su Google quando almeno un suo elenco ci va — la stessa
@@ -1934,21 +2257,18 @@ async function paginaIndice(lingua: string, pagina: number, ordine: Ordine): Pro
     suIndice: true,
     jsonLd: ordine === "consigliati"
       ? jsonLdElenco(
-        [{ nome: "Fluera", url: SITE }, { nome: "Appunti", url: self }],
-        { nome: "Template di studio e appunti per materia", descrizione, url: self2, lingua },
+        [{ nome: "Fluera", url: SITE }, { nome: u.appunti, url: self }],
+        { nome: u.titoloIndice, descrizione, url: self2, lingua },
         vociLd(semi, offset),
       )
       : undefined,
     corpo: `${formCerca(lingua)}
-    <div class="filtri">${chipMaterie(lingua, hubs, null, null)}${faccettaCorso(lingua, hubs, null, null)}${menuOrdina(self, ordine)}</div>
+    <div class="filtri">${chipMaterie(lingua, hubs, null, null)}${faccettaCorso(lingua, hubs, null, null)}${menuOrdina(u, self, ordine)}</div>
     ${
-      fascia(
-        soloFluera ? "Template di studio dal team Fluera" : "Template di studio dalla community",
-        soloFluera ? "Appunti scritti a mano, gratis da installare in Fluera." : "Appunti scritti a mano da chi studia, gratis da installare.",
-      )
+      fascia(...(soloFluera ? u.fasciaTeam : u.fasciaCommunity) as [string, string])
     }
-    ${vetrine.map((x) => sezioneVetrina(self, x)).join("\n    ")}
-    ${sezioneTutti(semi, navPagine(self, pagina, pagine, ordine), undefined, vetrine.length === 0)}
+    ${vetrine.map((x) => sezioneVetrina(u, self, x)).join("\n    ")}
+    ${sezioneTutti(u, semi, navPagine(u, self, pagina, pagine, ordine), undefined, vetrine.length === 0)}
     ${mappaCorsi(lingua, hubs)}`,
   });
 }
@@ -1963,8 +2283,9 @@ async function paginaElenco(
   pagina: number,
   ordine: Ordine,
 ): Promise<Response> {
+  const u = testiDi(lingua);
   const offset = (pagina - 1) * SEMI_PER_PAGINA;
-  if (offset > OFFSET_MAX) return nonTrovata();
+  if (offset > OFFSET_MAX) return nonTrovata(testiDi(lingua));
   const [h, s] = await Promise.all([
     rpcWeb<HubWeb>("list_web_hubs", { p_lingua: lingua }),
     rpcWeb<SemeWeb>("list_web_seeds", {
@@ -1976,31 +2297,31 @@ async function paginaElenco(
       ...conOrdine(ordine),
     }),
   ]);
-  if (!h.ok) return rispostaGuasto(`list_web_hubs(${lingua}): ${h.motivo}`);
-  if (!s.ok) return rispostaGuasto(`list_web_seeds(${lingua}/${materia}/${corso ?? ""}): ${s.motivo}`);
+  if (!h.ok) return rispostaGuasto(u, `list_web_hubs(${lingua}): ${h.motivo}`);
+  if (!s.ok) return rispostaGuasto(u, `list_web_seeds(${lingua}/${materia}/${corso ?? ""}): ${s.motivo}`);
   const hubs = hubValidi(h.rows);
   const semi = semiValidi(s.rows);
   // Sotto soglia = 404, non 410: l'elenco può nascere domani.
   const hub = hubs.find((x) => x.materia_slug === materia && x.corso_slug === corso);
-  if (!hub) return nonTrovata();
-  if (pagina > 1 && semi.length === 0) return nonTrovata();
+  if (!hub) return nonTrovata(testiDi(lingua));
+  if (pagina > 1 && semi.length === 0) return nonTrovata(testiDi(lingua));
 
   const totale = Math.max(Number(s.rows[0]?.totale ?? 0) || 0, offset + semi.length);
   const pagine = Math.max(1, Math.ceil(totale / SEMI_PER_PAGINA));
   const la = langElenco(lingua);
-  const nomeM = nomeMateria(hubs, materia);
+  const nomeM = nomeMateria(hubs, materia, u);
   const nomeC = corso ? (hub.corso ?? "").trim() || corso : null;
   const haMateria = hubs.some((x) => x.materia_slug === materia && x.corso_slug === null);
   const base = urlElenco(lingua, materia, corso);
   const self = canonico(base, pagina, ordine);
   const h1 = nomeC ?? nomeM;
-  const titolo = `${nomeC ? `${nomeC} · Appunti di ${nomeM}` : `Appunti di ${nomeM}`}${pagina > 1 ? ` · pagina ${pagina}` : ""} · Fluera`;
-  const descrizione = `Appunti di ${nomeC ? `${nomeC} (${nomeM})` : nomeM} da aprire in Fluera, un canvas per imparare: ci scrivi sopra a mano e li ripassi a libro chiuso.`;
+  const titolo = `${nomeC ? `${nomeC} · ${u.appuntiDi(nomeM)}` : u.appuntiDi(nomeM)}${pagina > 1 ? u.paginaN(pagina) : ""} · Fluera`;
+  const descrizione = u.descElenco(nomeC ? `${nomeC} (${nomeM})` : nomeM);
 
   const briciole = [
     { nome: "Fluera", url: SITE, rel: "" },
     // L'indice va su Google solo con un elenco indicizzabile (paginaIndice).
-    { nome: "Appunti", url: urlElenco(lingua), rel: relElenco({ nofollow: !hubs.some((x) => x.web_indicizzabile === true) }) },
+    { nome: u.appunti, url: urlElenco(lingua), rel: relElenco({ nofollow: !hubs.some((x) => x.web_indicizzabile === true) }) },
     ...(corso && !haMateria ? [] : [{ nome: nomeM, url: urlElenco(lingua, materia), rel: relHub(hubs, materia) }]),
     ...(corso && nomeC ? [{ nome: nomeC, url: base, rel: "" }] : []),
   ];
@@ -2012,9 +2333,12 @@ async function paginaElenco(
     )
     .join(`<span class="sep" aria-hidden="true">›</span>`);
   // L'introduzione scende SOTTO la griglia: la griglia si vede subito, come
-  // nell'app, e il testo resta nella pagina per chi arriva da Google.
-  const intro = !corso && pagina === 1 && lingua === "it" && MATERIE[materia]
-    ? `<section class="lettura" aria-labelledby="t-lettura"><h2 id="t-lettura">Studiare ${esc(nomeM)} a mano</h2><p>${esc(MATERIE[materia].intro)}</p></section>`
+  // nell'app, e il testo resta nella pagina per chi arriva da Google. Nella
+  // lingua dell'interfaccia: un elenco /ja/ ha l'introduzione inglese.
+  const intro = !corso && pagina === 1 && MATERIE[materia]
+    ? `<section class="lettura" aria-labelledby="t-lettura"><h2 id="t-lettura">${
+      esc(u.studiareAMano(u.lingua === "it" ? nomeM : MATERIE[materia].en))
+    }</h2><p>${esc(u.lingua === "it" ? MATERIE[materia].intro : MATERIE[materia].introEn)}</p></section>`
     : "";
   const nomeH1 = corso || !la ? esc(h1) : `<span${la}>${esc(h1)}</span>`;
 
@@ -2034,11 +2358,11 @@ async function paginaElenco(
         vociLd(semi, offset),
       )
       : undefined,
-    corpo: `${navBriciole ? `<nav class="briciole" aria-label="Percorso">${navBriciole}</nav>` : ""}
+    corpo: `${navBriciole ? `<nav class="briciole" aria-label="${u.percorso}">${navBriciole}</nav>` : ""}
     ${formCerca(lingua, "", materia)}
-    <div class="filtri">${chipMaterie(lingua, hubs, materia, null)}${faccettaCorso(lingua, hubs, materia, corso)}${menuOrdina(base, ordine)}</div>
-    ${fascia(`Appunti di ${nomeH1}`, `${totale} template di studio da aprire in Fluera.`)}
-    ${sezioneTutti(semi, navPagine(base, pagina, pagine, ordine))}
+    <div class="filtri">${chipMaterie(lingua, hubs, materia, null)}${faccettaCorso(lingua, hubs, materia, corso)}${menuOrdina(u, base, ordine)}</div>
+    ${fascia(u.appuntiDi(nomeH1), u.quantiTemplate(totale))}
+    ${sezioneTutti(u, semi, navPagine(u, base, pagina, pagine, ordine))}
     ${intro}`,
   });
 }
@@ -2069,55 +2393,58 @@ async function semiDellaLingua(lingua: string, ordine: Ordine): Promise<EsitoRpc
 /// indicizzabili (list_web_seeds), nel titolo, nella descrizione, nel corso e
 /// nel nome della materia.
 async function paginaCerca(lingua: string, qRaw: string | null, materia: string | null, ordine: Ordine): Promise<Response> {
+  const u = testiDi(lingua);
   // Gli elenchi servono ai chip delle materie, e dicono se la lingua (o la
   // materia chiesta) ha un catalogo.
   const h = await rpcWeb<HubWeb>("list_web_hubs", { p_lingua: lingua });
-  if (!h.ok) return rispostaGuasto(`list_web_hubs(${lingua}): ${h.motivo}`);
+  if (!h.ok) return rispostaGuasto(u, `list_web_hubs(${lingua}): ${h.motivo}`);
   const hubs = hubValidi(h.rows);
-  if (hubs.length === 0 && lingua !== "it") return nonTrovata();
-  if (materia && !hubs.some((x) => x.materia_slug === materia && x.corso_slug === null)) return nonTrovata();
+  if (hubs.length === 0 && lingua !== "it") return nonTrovata(testiDi(lingua));
+  if (materia && !hubs.some((x) => x.materia_slug === materia && x.corso_slug === null)) return nonTrovata(testiDi(lingua));
   const q = (qRaw ?? "").trim();
   const n = [...q].length;
   let esito = "";
-  let sotto = "Cerca per titolo, corso o materia.";
+  let sotto = u.cercaSotto;
   if (n > 0 && (n < 2 || n > 80)) {
-    esito = statoVuoto("search", "Cerca template di studio", "Scrivi da due a ottanta caratteri.", null);
+    esito = statoVuoto("search", u.cercaTemplate, u.cercaLunghezza, null);
   } else if (n > 0) {
     const e = await semiDellaLingua(lingua, ordine);
-    if (!e.ok) return rispostaGuasto(`ricerca (${lingua}): ${e.motivo}`);
+    if (!e.ok) return rispostaGuasto(u, `ricerca (${lingua}): ${e.motivo}`);
     const parole = perCercare(q).split(/\s+/).filter(Boolean);
     const trovati = e.rows.filter((r) => {
       if (materia && r.materia_slug !== materia) return false;
       const testo = perCercare(
-        [r.title, r.description, r.course, r.materia_slug ? MATERIE[r.materia_slug]?.it : null].filter(Boolean).join(" "),
+        [r.title, r.description, r.course, ...(r.materia_slug ? [MATERIE[r.materia_slug]?.it, MATERIE[r.materia_slug]?.en] : [])]
+          .filter(Boolean).join(" "),
       );
       return parole.every((p) => testo.includes(p));
     });
-    sotto = trovati.length === 1 ? "1 template trovato." : `${trovati.length} template trovati.`;
+    sotto = u.trovati(trovati.length);
     esito = trovati.length === 0
-      ? statoVuoto("eco", `Nessun risultato per "${q}"`, "Prova con un'altra materia, o azzera i filtri per vedere tutto.", {
-        testo: "Azzera filtri",
+      ? statoVuoto("eco", u.nessunRisultato(q), u.nessunRisultatoB, {
+        testo: u.azzera,
         href: urlElenco(lingua),
       })
       : sezioneTutti(
+        u,
         trovati.slice(0, SEMI_PER_PAGINA),
-        trovati.length > SEMI_PER_PAGINA ? `<p class="altri">Ci sono altri risultati: prova con una parola in più.</p>` : "",
-        "Risultati",
+        trovati.length > SEMI_PER_PAGINA ? `<p class="altri">${u.altriRisultati}</p>` : "",
+        u.risultati,
       );
   }
   return paginaWeb({
     lingua,
     hubs,
-    titolo: `${n ? `«${q}» · ` : ""}Cerca template di studio · Fluera`,
-    descrizione: "Cerca fra i template di studio da aprire in Fluera.",
+    titolo: `${n ? u.cercaTitolo(q) : ""}${u.cercaTemplate} · Fluera`,
+    descrizione: u.cercaDesc,
     self: null,
     siIndicizza: false, // la ricerca: mai su Google
-    corpo: `<nav class="briciole" aria-label="Percorso"><a href="${urlElenco(lingua)}">Appunti</a><span class="sep" aria-hidden="true">›</span><span aria-current="page">Cerca</span></nav>
+    corpo: `<nav class="briciole" aria-label="${u.percorso}"><a href="${urlElenco(lingua)}">${u.appunti}</a><span class="sep" aria-hidden="true">›</span><span aria-current="page">${u.cerca}</span></nav>
     ${formCerca(lingua, q, materia, ordine)}
     <div class="filtri">${chipMaterie(lingua, hubs, materia, q, ordine)}${
-      menuOrdina(`${urlElenco(lingua)}cerca`, ordine, new URLSearchParams([["q", q], ...(materia ? [["materia", slugMateria(lingua, materia)]] : [])]))
+      menuOrdina(u, `${urlElenco(lingua)}cerca`, ordine, new URLSearchParams([["q", q], ...(materia ? [["materia", slugMateria(lingua, materia)]] : [])]))
     }</div>
-    ${fascia(n ? `Risultati per «${esc(q)}»` : "Cerca template di studio", sotto)}
+    ${fascia(n ? u.risultatiPer(esc(q)) : u.cercaTemplate, sotto)}
     ${esito}`,
   });
 }
@@ -2259,6 +2586,29 @@ function renderGhostPage(row: GhostShareRow, hash: string): string {
 </html>`;
 }
 
+/// La card della scheda privata, nello stile del catalogo come quella dei
+/// pack: carta crema, il lucchetto in un cerchio come le pagine di stato, il
+/// titolo in Instrument Serif, il marchio in basso. Fino al 2026-09-29 era
+/// nera, con un indaco che il marchio non usa da nessuna parte.
+export function svgOgPrivato(): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">` +
+    `<rect width="1200" height="630" fill="${OG_CARTA}"/>` +
+    `<circle cx="600" cy="190" r="78" fill="${OG_RIALZO}"/>` +
+    // Lucchetto disegnato a PATH, non come emoji: resvg non ha un font a
+    // colori, e una emoji uscirebbe come rettangolo vuoto.
+    `<g transform="translate(564,142) scale(0.6)">` +
+    `<path d="M30 62 V44 a30 30 0 0 1 60 0 V62" fill="none" stroke="${OG_INCHIOSTRO_2}" stroke-width="13" stroke-linecap="round"/>` +
+    `<rect x="8" y="62" width="104" height="84" rx="16" fill="${OG_INCHIOSTRO_2}"/>` +
+    `<circle cx="60" cy="98" r="10" fill="${OG_RIALZO}"/>` +
+    `<rect x="55" y="102" width="10" height="24" rx="5" fill="${OG_RIALZO}"/>` +
+    `</g>` +
+    `<text x="600" y="358" text-anchor="middle" font-family="Instrument Serif" font-size="76" fill="${OG_INCHIOSTRO}">Scheda privata</text>` +
+    `<text x="600" y="420" text-anchor="middle" font-family="Noto Sans" font-size="30" fill="${OG_INCHIOSTRO_2}">Qualcuno ti ha condiviso i suoi appunti</text>` +
+    `<text x="600" y="462" text-anchor="middle" font-family="Noto Sans" font-size="30" fill="${OG_INCHIOSTRO_2}">Solo chi ha il link può vederla</text>` +
+    marchioOg(600, 560, 36, "middle") +
+    `</svg>`;
+}
+
 // ── Card d'anteprima di una scheda privata ───────────────────────────────────
 //
 // 1200x630 interamente SINTETICA: nessuna immagine di base, solo forme e testo.
@@ -2274,32 +2624,7 @@ function renderGhostPage(row: GhostShareRow, hash: string): string {
 async function privateOgResponse(): Promise<Response> {
   try {
     const { Resvg, font } = await loadResvg();
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">` +
-      `<rect width="1200" height="630" fill="#0a0a0b"/>` +
-      `<rect x="0" y="0" width="1200" height="6" fill="#6366f1"/>` +
-      // Lucchetto disegnato a PATH, non come emoji: resvg non ha un font a
-      // colori, e una emoji uscirebbe come rettangolo vuoto.
-      `<g transform="translate(540,138)">` +
-      `<path d="M30 62 V44 a30 30 0 0 1 60 0 V62" fill="none" stroke="#a5b4fc" stroke-width="13" stroke-linecap="round"/>` +
-      `<rect x="8" y="62" width="104" height="84" rx="16" fill="#a5b4fc"/>` +
-      `<circle cx="60" cy="98" r="10" fill="#0a0a0b"/>` +
-      `<rect x="55" y="102" width="10" height="24" rx="5" fill="#0a0a0b"/>` +
-      `</g>` +
-      `<text x="600" y="386" text-anchor="middle" font-family="Noto Sans" font-size="62" font-weight="700" fill="#f4f4f5">Scheda privata</text>` +
-      `<text x="600" y="446" text-anchor="middle" font-family="Noto Sans" font-size="32" fill="#a1a1aa">Qualcuno ti ha condiviso i suoi appunti</text>` +
-      `<text x="600" y="492" text-anchor="middle" font-family="Noto Sans" font-size="32" fill="#a1a1aa">Solo chi ha il link può vederla</text>` +
-      `<text x="600" y="576" text-anchor="middle" font-family="Noto Sans" font-size="28" font-weight="700" fill="#6366f1">Fluera</text>` +
-      `</svg>`;
-
-    const resvg = new Resvg(svg, {
-      fitTo: { mode: "width", value: 1200 },
-      background: "rgba(0,0,0,0)",
-      font: {
-        fontBuffers: [font],
-        loadSystemFonts: false,
-        defaultFontFamily: "Noto Sans",
-      },
-    });
+    const resvg = new Resvg(svgOgPrivato(), opzioniResvg(font));
     return new Response(new Uint8Array(resvg.render().asPng()), {
       status: 200,
       headers: {
@@ -2603,23 +2928,301 @@ async function sitemapResponse(): Promise<Response> {
 }
 
 // ── OG card image: /s/{hash}/og.png ─────────────────────────────────────────
-// A 1200×630 PNG = the seed's notes thumbnail with the LIVE numbers baked INTO
-// the pixels, so the social proof travels with the image even where the caption
-// is dropped. Rendered at REQUEST time → always-fresh counts. Every heavy dep
-// is DYNAMICALLY imported + memoized INSIDE the handler, so a CDN/runtime
-// failure can only degrade THIS route (it 302-falls back to the raw thumbnail) —
-// never the HTML / deep-link routes, which never touch any of this. resvg (pure
-// WASM, the one verified-deploy-safe choice on Deno Deploy) rasterizes a
-// hand-built SVG; the base PNG is inlined as a data URI (resvg won't fetch
-// remote hrefs); the star is an SVG <path> (resvg has no colour-emoji font).
+// La card social di un pack, 1200×630, nello stile del catalogo: carta crema,
+// il marchio della testata («Flu» in Sora + «era» in Playfair corsivo), il
+// titolo in Instrument Serif e a destra la miniatura degli appunti, come un
+// foglio. I numeri vivi (voto, concetti) sono cotti nei pixel, così viaggiano
+// con l'immagine anche dove la didascalia si perde. Si compone a ogni
+// richiesta con resvg (WASM puro, l'unica scelta verificata su Deno Deploy)
+// su un SVG scritto a mano: la miniatura entra come data URI (resvg non
+// scarica gli href remoti), la stella è un <path> (resvg non ha font a colori).
+//
+// È l'UNICA card social dei pack (2026-09-29). Prima l'app ne disegnava una
+// sua (`renderOgImage`: gradiente blu scuro, «🌱 FLUERA» in maiuscolo), la
+// caricava come `<hash>-og.png` e la /s/ la dava come og:image. Ogni anteprima
+// condivisa portava un logo finto e colori estranei al marchio (VIS-03), e
+// ridisegnarla chiedeva una versione nuova dell'app più una ripubblicazione di
+// ogni pack. Ora `<hash>-og.png` non si legge più: la card la compone questo
+// file, per tutti i pack, anche per quelli pubblicati prima.
 const RESVG_WASM_URL = "https://esm.sh/@resvg/resvg-wasm@2.6.2/index_bg.wasm";
 const OG_FONT_URL =
   "https://cdn.jsdelivr.net/npm/@vercel/og@0.6.2/dist/noto-sans-v27-latin-regular.ttf";
+// I caratteri del marchio e dei titoli, dagli stessi file che fluera.dev serve
+// alle sue pagine. resvg legge TTF/OTF, non woff2: per questo
+// InstrumentSerif-Regular.ttf è sul sito accanto al suo woff2.
+export const OG_FONT_MARCHIO = [
+  `${SITE}/fonts/Sora-Bold.ttf`,
+  `${SITE}/fonts/PlayfairDisplay-SemiBoldItalic.ttf`,
+  `${SITE}/fonts/InstrumentSerif-Regular.ttf`,
+];
+const OG_CARTA = "#FAF8F2";
+const OG_RIALZO = "#F1EBDD";
+const OG_INCHIOSTRO = "#23211B";
+const OG_INCHIOSTRO_2 = "#6E6656";
+const OG_FILO = "#E5DECE";
+const OG_ACCENTO = "#2563EB";
+
+/// Le metriche di un TTF che servono alla card: quale glifo ha un carattere
+/// (0 = nessuno) e quanto avanza. Bastano per andare a capo senza sforare la
+/// colonna e per sapere se il font sa scrivere un titolo. resvg non espone
+/// misure del testo, e un a capo stimato «a occhio» sfora con i titoli larghi.
+/// La crenatura non si conta: resvg la applica e il testo esce appena più
+/// stretto della misura, mai più largo.
+export interface MetricheFont {
+  unita: number;
+  glifo(cp: number): number;
+  avanzo(g: number): number;
+}
+
+export function leggiMetriche(b: Uint8Array): MetricheFont {
+  const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const tabelle: Record<string, number> = {};
+  for (let i = 0; i < v.getUint16(4); i++) {
+    const r = 12 + i * 16;
+    tabelle[String.fromCharCode(b[r], b[r + 1], b[r + 2], b[r + 3])] = v.getUint32(r + 8);
+  }
+  for (const t of ["cmap", "hmtx", "hhea", "head"]) {
+    if (tabelle[t] === undefined) throw new Error(`font senza la tabella ${t}`);
+  }
+  const unita = v.getUint16(tabelle.head + 18);
+  const nMetriche = v.getUint16(tabelle.hhea + 34);
+  // La sottotabella Unicode: il formato 12 (tutto Unicode) se c'è, se no il 4.
+  let sotto = -1;
+  let formato = 0;
+  for (let i = 0; i < v.getUint16(tabelle.cmap + 2); i++) {
+    const r = tabelle.cmap + 4 + i * 8;
+    const piattaforma = v.getUint16(r);
+    const codifica = v.getUint16(r + 2);
+    const off = tabelle.cmap + v.getUint32(r + 4);
+    const f = v.getUint16(off);
+    const unicode = piattaforma === 0 || (piattaforma === 3 && (codifica === 1 || codifica === 10));
+    if (!unicode) continue;
+    if (f === 12) {
+      sotto = off;
+      formato = 12;
+      break;
+    }
+    if (f === 4 && formato !== 4) {
+      sotto = off;
+      formato = 4;
+    }
+  }
+  if (sotto < 0) throw new Error("font senza una cmap Unicode");
+  const glifo = (cp: number): number => {
+    if (formato === 12) {
+      for (let i = 0; i < v.getUint32(sotto + 12); i++) {
+        const r = sotto + 16 + i * 12;
+        const da = v.getUint32(r);
+        if (cp >= da && cp <= v.getUint32(r + 4)) return v.getUint32(r + 8) + (cp - da);
+      }
+      return 0;
+    }
+    if (cp > 0xffff) return 0;
+    const segmenti = v.getUint16(sotto + 6) / 2;
+    const fini = sotto + 14;
+    const inizi = fini + segmenti * 2 + 2;
+    const delte = inizi + segmenti * 2;
+    const scarti = delte + segmenti * 2;
+    for (let i = 0; i < segmenti; i++) {
+      if (cp > v.getUint16(fini + i * 2)) continue;
+      const da = v.getUint16(inizi + i * 2);
+      if (cp < da) return 0;
+      const delta = v.getInt16(delte + i * 2);
+      const scarto = v.getUint16(scarti + i * 2);
+      if (scarto === 0) return (cp + delta) & 0xffff;
+      const g = v.getUint16(scarti + i * 2 + scarto + (cp - da) * 2);
+      return g === 0 ? 0 : (g + delta) & 0xffff;
+    }
+    return 0;
+  };
+  const avanzo = (g: number) => v.getUint16(tabelle.hmtx + Math.min(g, nMetriche - 1) * 4);
+  return { unita, glifo, avanzo };
+}
+
+/// Il font sa scrivere tutto il testo? Un titolo in giapponese, arabo o hindi
+/// con Instrument Serif uscirebbe a pezzi (i glifi mancanti non si vedono):
+/// meglio non stamparlo che stamparne metà.
+export function fontCopre(m: MetricheFont, s: string): boolean {
+  for (const ch of s) {
+    if (!/\s/.test(ch) && m.glifo(ch.codePointAt(0)!) === 0) return false;
+  }
+  return true;
+}
+
+function larghezzaTesto(m: MetricheFont, s: string, px: number): number {
+  let u = 0;
+  for (const ch of s) u += m.avanzo(m.glifo(ch.codePointAt(0)!));
+  return (u / m.unita) * px;
+}
+
+/// A capo per parole, al massimo `righe` righe: se il testo non ci sta,
+/// l'ultima si chiude con «…». Una parola più larga della colonna si spezza
+/// per lettere, invece di uscire dal bordo.
+export function aCapo(
+  m: MetricheFont,
+  testo: string,
+  px: number,
+  max: number,
+  righe: number,
+): { righe: string[]; tagliato: boolean } {
+  const coda = testo.trim().split(/\s+/).filter(Boolean);
+  const out: string[] = [];
+  let riga = "";
+  while (coda.length) {
+    const parola = coda.shift()!;
+    const prova = riga ? `${riga} ${parola}` : parola;
+    if (larghezzaTesto(m, prova, px) <= max) {
+      riga = prova;
+    } else if (riga) {
+      out.push(riga);
+      riga = "";
+      coda.unshift(parola);
+    } else {
+      // Da sola non sta: righe piene di lettere, il resto apre la riga dopo.
+      let pezzo = "";
+      for (const ch of parola) {
+        if (pezzo && larghezzaTesto(m, pezzo + ch, px) > max) {
+          out.push(pezzo);
+          pezzo = ch;
+        } else {
+          pezzo += ch;
+        }
+      }
+      riga = pezzo;
+    }
+  }
+  if (riga) out.push(riga);
+  if (out.length <= righe) return { righe: out, tagliato: false };
+  const tenute = out.slice(0, righe);
+  let ultima = tenute[righe - 1];
+  while (ultima && larghezzaTesto(m, `${ultima}…`, px) > max) ultima = ultima.slice(0, -1);
+  tenute[righe - 1] = `${ultima.replace(/[\s,.;:–—-]+$/, "")}…`;
+  return { righe: tenute, tagliato: true };
+}
+
+/// Cosa va nella card. `foglio` è la miniatura degli appunti (null = card
+/// solo testo); `w`/`h` null se il formato dell'immagine non si è letto.
+export interface CartaOg {
+  titolo: string;
+  voto: string | null;
+  concetti: string | null;
+  tipo: string;
+  foglio: { uri: string; w: number | null; h: number | null } | null;
+}
+
+/// Ombra morbida a strati: otto rettangoli arrotondati, ognuno un po' più
+/// largo e più basso, quasi trasparenti. Una sfocatura gaussiana
+/// (feDropShadow) dà lo stesso effetto, ma in resvg costava ~420 ms su un
+/// foglio di questa misura, più di tutto il resto della card.
+function ombraOg(x: number, y: number, w: number, h: number, r: number): string {
+  let s = "";
+  for (let i = 1; i <= 8; i++) {
+    const e = i * 2.5;
+    s += `<rect x="${x - e}" y="${y - e + 4 + i * 1.5}" width="${w + e * 2}" height="${h + e * 2}" rx="${r + e}" fill="${OG_INCHIOSTRO}" fill-opacity="0.018"/>`;
+  }
+  return s;
+}
+
+/// Il marchio della testata in SVG: «Flu» in Sora Bold, «era» in Playfair
+/// Display SemiBold corsivo (il nome di famiglia di quel file è «Playfair
+/// Display SemiBold»: con «Playfair Display» resvg ripiega sul sans).
+function marchioOg(x: number, y: number, px: number, ancora: "start" | "middle" = "start"): string {
+  return `<text x="${x}" y="${y}" font-size="${px}" fill="${OG_INCHIOSTRO}" text-anchor="${ancora}">` +
+    `<tspan font-family="Sora" font-weight="700" letter-spacing="${(px * 0.052).toFixed(2)}">Flu</tspan>` +
+    `<tspan font-family="Playfair Display SemiBold" font-style="italic" font-weight="600" letter-spacing="${(px * 0.026).toFixed(2)}">era</tspan></text>`;
+}
+
+/// L'SVG della card, fuori da resvg perché il cancello lo possa leggere senza
+/// WASM. `serif` misura il titolo, `sans` la riga dei numeri.
+export function svgOg(c: CartaOg, serif: MetricheFont, sans: MetricheFont): string {
+  const W = 1200;
+  const H = 630;
+  const x0 = 80;
+  let foglio = "";
+  let colonna = W - x0 * 2;
+  if (c.foglio) {
+    // Il foglio a destra, largo 456. Se è alto esce dal bordo in basso: si
+    // vede la parte alta degli appunti a una grandezza leggibile, invece di
+    // un foglio intero rimpicciolito. Proporzioni ignote = 3:4, come le
+    // miniature dell'app.
+    const fw = 456;
+    const fx = W - 72 - fw;
+    const fh = Math.round(fw * ((c.foglio.h ?? 4) / (c.foglio.w ?? 3)));
+    const fy = fh >= H - 72 ? 72 : Math.round((H - fh) / 2);
+    const r = 18;
+    // Il rettangolo del foglio scende oltre il bordo quando esce: così gli
+    // angoli arrotondati in basso restano fuori dall'immagine.
+    const hr = fy + fh > H ? fh + r : fh;
+    foglio = `<defs><clipPath id="foglio"><rect x="${fx}" y="${fy}" width="${fw}" height="${hr}" rx="${r}"/></clipPath></defs>` +
+      ombraOg(fx, fy, fw, hr, r) +
+      `<rect x="${fx}" y="${fy}" width="${fw}" height="${hr}" rx="${r}" fill="#FFFFFF"/>` +
+      `<image x="${fx}" y="${fy}" width="${fw}" height="${fh}" preserveAspectRatio="xMidYMin slice" clip-path="url(#foglio)" href="${c.foglio.uri}" xlink:href="${c.foglio.uri}"/>` +
+      `<rect x="${fx + 0.75}" y="${fy + 0.75}" width="${fw - 1.5}" height="${hr - 1.5}" rx="${r - 0.75}" fill="none" stroke="${OG_FILO}" stroke-width="1.5"/>`;
+    colonna = fx - 64 - x0;
+  }
+
+  // Il titolo, il più grande che sta in tre righe. Se il font non lo sa
+  // scrivere, al suo posto il tipo («Template di studio»): il titolo vero è
+  // comunque nel testo dell'anteprima (og:title).
+  const titolo = c.titolo.trim();
+  const conTitolo = titolo !== "" && fontCopre(serif, titolo);
+  const testo = conTitolo ? titolo : c.tipo;
+  let px = 80;
+  let disp = aCapo(serif, testo, px, colonna, 3);
+  for (const p of [72, 64, 56]) {
+    if (!disp.tagliato) break;
+    px = p;
+    disp = aCapo(serif, testo, px, colonna, 3);
+  }
+  const passo = Math.round(px * 1.08);
+  const conNumeri = c.voto !== null || c.concetti !== null;
+  // Titolo e numeri, centrati nella fascia fra il marchio e la riga del tipo.
+  const altezza = passo * (disp.righe.length - 1) + px * 0.72 + (conNumeri ? 60 : 0);
+  const base = Math.round(172 + Math.max(0, (348 - altezza) / 2) + px * 0.72);
+  const righe = disp.righe.map((r, i) =>
+    `<text x="${x0}" y="${base + i * passo}" font-family="Instrument Serif" font-size="${px}" fill="${OG_INCHIOSTRO}">${esc(r)}</text>`
+  ).join("");
+
+  let numeri = "";
+  const yn = base + (disp.righe.length - 1) * passo + 60;
+  let xn = x0;
+  if (c.voto !== null) {
+    const stella = "M0,-13 L3.8,-4 L13,-4 L5.5,2.1 L8.1,11.3 L0,6 L-8.1,11.3 L-5.5,2.1 L-13,-4 L-3.8,-4 Z";
+    numeri += `<path transform="translate(${xn + 13},${yn - 10})" d="${stella}" fill="${OG_ACCENTO}"/>` +
+      `<text x="${xn + 34}" y="${yn}" font-family="Noto Sans" font-size="28" fill="${OG_INCHIOSTRO}">${esc(c.voto)}</text>`;
+    xn += 34 + larghezzaTesto(sans, c.voto, 28);
+  }
+  if (c.concetti !== null) {
+    const t = c.voto !== null ? `  ·  ${c.concetti}` : c.concetti;
+    numeri += `<text x="${Math.round(xn)}" y="${yn}" font-family="Noto Sans" font-size="28" fill="${OG_INCHIOSTRO_2}" xml:space="preserve">${esc(t)}</text>`;
+  }
+  const tipo = conTitolo
+    ? `<text x="${x0}" y="554" font-family="Noto Sans" font-size="24" fill="${OG_INCHIOSTRO_2}">${esc(c.tipo)}</text>`
+    : "";
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">` +
+    `<rect width="${W}" height="${H}" fill="${OG_CARTA}"/>` +
+    foglio + marchioOg(x0, 124, 40) + righe + numeri + tipo + `</svg>`;
+}
+
+interface CaratteriOg {
+  buffers: Uint8Array[];
+  serif: MetricheFont;
+  sans: MetricheFont;
+}
 
 let _wasmReady: Promise<unknown> | null = null;
-let _ogFont: Promise<Uint8Array> | null = null;
+let _ogFonts: Promise<CaratteriOg> | null = null;
 
-// Load (once per isolate) the WASM + a Latin TTF. Memoized and RESET on failure
+async function scaricaFont(url: string): Promise<Uint8Array> {
+  const r = await fetch(url);
+  // Senza questo controllo una 404 diventava un «font» fatto di HTML: resvg
+  // non scriveva niente e la card usciva senza testo, a 200.
+  if (!r.ok) throw new Error(`${url}: ${r.status}`);
+  return new Uint8Array(await r.arrayBuffer());
+}
+
+// Load (once per isolate) the WASM + the fonts. Memoized and RESET on failure
 // so a transient CDN blip can retry; initWasm is idempotent-once, so a
 // double-init across retries is tolerated.
 //
@@ -2633,7 +3236,7 @@ let _ogFont: Promise<Uint8Array> | null = null;
 // Import statico = se il CDN è giù il DEPLOY fallisce, forte e subito, invece
 // di degradare per mesi senza che nessuno lo sappia.
 // WASM e font restano `fetch` a runtime: sono dati, non moduli.
-async function loadResvg(): Promise<{ Resvg: typeof Resvg; font: Uint8Array }> {
+async function loadResvg(): Promise<{ Resvg: typeof Resvg; font: CaratteriOg }> {
   _wasmReady ??= Promise.resolve(initWasm(fetch(RESVG_WASM_URL))).catch(
     (e: unknown) => {
       if (String(e).includes("Already initialized")) return;
@@ -2642,19 +3245,35 @@ async function loadResvg(): Promise<{ Resvg: typeof Resvg; font: Uint8Array }> {
     },
   );
   await _wasmReady;
-  const font = await (_ogFont ??= fetch(OG_FONT_URL)
-    .then((r) => r.arrayBuffer())
-    .then((b) => new Uint8Array(b))
+  const font = await (_ogFonts ??= Promise.all([OG_FONT_URL, ...OG_FONT_MARCHIO].map(scaricaFont))
+    .then(([noto, sora, playfair, serif]) => ({
+      buffers: [noto, sora, playfair, serif],
+      sans: leggiMetriche(noto),
+      serif: leggiMetriche(serif),
+    }))
     .catch((e) => {
-      _ogFont = null;
+      _ogFonts = null;
       throw e;
     }));
   return { Resvg, font };
 }
 
+function opzioniResvg(font: CaratteriOg) {
+  return {
+    fitTo: { mode: "width" as const, value: 1200 },
+    background: "rgba(0,0,0,0)",
+    font: {
+      fontBuffers: font.buffers,
+      loadSystemFonts: false,
+      defaultFontFamily: "Noto Sans",
+    },
+  };
+}
+
 async function ogImageResponse(hash: string): Promise<Response> {
-  // Resolve the base image first — it doubles as the graceful-fallback target.
-  let baseUrl = OG_FALLBACK;
+  // Il ripiego, se la composizione fallisce: la miniatura (gli appunti veri),
+  // o la card generica del sito se il pack non ne ha.
+  let ripiego = OG_FALLBACK;
   try {
     const esito = await fetchTemplate(hash);
     const row = esito.tipo === "trovato" ? esito.row : null;
@@ -2662,15 +3281,11 @@ async function ogImageResponse(hash: string): Promise<Response> {
     // solo il ripiego generico, come la pagina. 🚪 Lo stesso per uno studente
     // tolto dal sito (F4): la sua /s/ è un 410.
     if (row && row.content_maturity === "general" && !toltoDalSito(row)) {
-      baseUrl = row.og_path
-        ? publicUrl(row.og_path)
-        : row.thumb_path
-        ? publicUrl(row.thumb_path)
-        : OG_FALLBACK;
+      if (row.thumb_path) ripiego = publicUrl(row.thumb_path);
       // Il voto di un pack visibile viene dalla lettura del web, come la
       // pagina: una sola regola (218; F4), mai una soglia ricopiata qui.
       const scheda = visibile(row) ? await fetchScheda(row.hash) : null;
-      const png = await buildOgPng(row, baseUrl, scheda);
+      const png = await buildOgPng(row, scheda);
       return new Response(png, {
         status: 200,
         headers: {
@@ -2686,77 +3301,91 @@ async function ogImageResponse(hash: string): Promise<Response> {
     // che nessuno lo sapesse. Ora un fallback lascia una traccia.
     console.error(`og.png compositing failed for ${hash}: ${e}`);
   }
-  // Graceful degradation: crawlers follow the 302 to the raw thumbnail, so the
-  // unfurl always has a valid image even when compositing fails. Short cache so
-  // a transient failure is not pinned.
+  // Short cache so a transient failure is not pinned.
   return new Response(null, {
     status: 302,
-    headers: { Location: baseUrl, "Cache-Control": "public, max-age=60" },
+    headers: { Location: ripiego, "Cache-Control": "public, max-age=60" },
   });
 }
 
-// `asPng()` di resvg dichiara `Uint8Array<ArrayBufferLike>`, che NON è un
-// `BodyInit` valido per `Response` (potrebbe essere su SharedArrayBuffer). Si
-// ricopia in un Uint8Array su ArrayBuffer: una copia da poche centinaia di KB,
-// irrilevante. Finché il modulo era importato dinamicamente il tipo era `any` e
-// niente di tutto questo si vedeva — l'import statico l'ha fatto emergere.
 /// I numeri stampati nell'og.png, fuori da resvg perché il cancello li possa
 /// leggere senza WASM. Niente install_count (gonfiabile, S7). Il voto come la
 /// /s/: solo sui pack visibili (F4: anche gli studenti sotto la soglia di
 /// Google) e solo da get_web_scheda (0 righe = niente voto); sui non visibili
-/// nessun voto.
-export function ogNumeri(row: SeedRow, scheda: SchedaWeb | null = null): { stats: string; showStar: boolean } {
+/// nessun voto. Scritti nella lingua del pack: «4,6» e «12 concetti» in
+/// italiano, «4.6» e «12 concepts» per gli altri.
+export function ogNumeri(
+  row: SeedRow,
+  scheda: SchedaWeb | null = null,
+): { voto: string | null; concetti: string | null; stats: string; showStar: boolean } {
+  const u = testiDi(linguaDi(row.locale));
   const concepts = Math.max(0, row.concept_count ?? 0);
   const rating = visibile(row) ? Math.max(0, numero(scheda?.voto_medio) ?? 0) : 0;
-  const parts: string[] = [];
-  if (rating > 0) parts.push(rating.toFixed(1));
-  if (concepts > 0) parts.push(`${concepts} concett${concepts === 1 ? "o" : "i"}`);
-  return { stats: parts.join("     ·     "), showStar: rating > 0 };
+  const voto = rating > 0 ? votoUi(rating, u) : null;
+  const concetti = concepts > 0 ? u.concetti(new Intl.NumberFormat(u.formato).format(concepts), concepts === 1) : null;
+  return {
+    voto,
+    concetti,
+    stats: [voto, concetti].filter((p) => p !== null).join(" · "),
+    showStar: voto !== null,
+  };
+}
+
+/// Larghezza e altezza di una PNG o di una JPEG, lette dall'intestazione;
+/// null per ogni altro formato.
+export function dimensioniImmagine(b: Uint8Array): { w: number; h: number } | null {
+  const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  if (b.length >= 24 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) {
+    return { w: v.getUint32(16), h: v.getUint32(20) };
+  }
+  if (b.length >= 4 && b[0] === 0xff && b[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < b.length && b[i] === 0xff) {
+      const m = b[i + 1];
+      // SOF0..SOF15, tranne DHT (C4), JPG (C8) e DAC (CC).
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+        return { w: v.getUint16(i + 7), h: v.getUint16(i + 5) };
+      }
+      i += 2 + v.getUint16(i + 2);
+    }
+  }
+  return null;
 }
 
 async function buildOgPng(
   row: SeedRow,
-  baseUrl: string,
   scheda: SchedaWeb | null,
 ): Promise<Uint8Array<ArrayBuffer>> {
   const { Resvg, font } = await loadResvg();
-  const imgBytes = new Uint8Array(await (await fetch(baseUrl)).arrayBuffer());
-  const dataUri = `data:${mimeOf(imgBytes)};base64,${toBase64(imgBytes)}`;
-
-  const title = truncate(
-    (row.title ?? "Template di studio").trim() || "Template di studio",
-    30,
-  );
-  const { stats, showStar } = ogNumeri(row, scheda);
-  const statsX = showStar ? 110 : 64;
-  // hand-coded 5-point star (resvg renders only fontBuffers glyphs → no emoji).
-  const star =
-    "M0,-15 L4.4,-4.6 L15,-4.6 L6.3,2.4 L9.3,13 L0,6.9 L-9.3,13 L-6.3,2.4 L-15,-4.6 L-4.4,-4.6 Z";
-
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="630" viewBox="0 0 1200 630">` +
-    `<defs><linearGradient id="sh" x1="0" y1="0" x2="0" y2="1">` +
-    `<stop offset="0" stop-color="#000" stop-opacity="0.5"/><stop offset="0.28" stop-color="#000" stop-opacity="0"/>` +
-    `<stop offset="0.62" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.82"/>` +
-    `</linearGradient></defs>` +
-    `<image x="0" y="0" width="1200" height="630" preserveAspectRatio="xMidYMid slice" href="${dataUri}" xlink:href="${dataUri}"/>` +
-    `<rect width="1200" height="630" fill="url(#sh)"/>` +
-    `<text x="64" y="104" font-family="Noto Sans" font-size="58" font-weight="700" fill="#ffffff">${esc(title)}</text>` +
-    (showStar
-      ? `<g transform="translate(82,556)"><path d="${star}" fill="#FBBF24"/></g>`
-      : "") +
-    `<text x="${statsX}" y="568" font-family="Noto Sans" font-size="36" fill="#ffffff">${esc(stats)}</text>` +
-    `</svg>`;
-
-  const resvg = new Resvg(svg, {
-    fitTo: { mode: "width", value: 1200 },
-    background: "rgba(0,0,0,0)",
-    font: {
-      fontBuffers: [font],
-      loadSystemFonts: false,
-      defaultFontFamily: "Noto Sans",
+  let foglio: CartaOg["foglio"] = null;
+  if (row.thumb_path) {
+    const r = await fetch(publicUrl(row.thumb_path));
+    if (r.ok) {
+      const b = new Uint8Array(await r.arrayBuffer());
+      const d = dimensioniImmagine(b);
+      foglio = { uri: `data:${mimeOf(b)};base64,${toBase64(b)}`, w: d?.w ?? null, h: d?.h ?? null };
+    } else {
+      // Una riga che punta a una miniatura che non c'è: la card esce lo
+      // stesso, solo testo, ma resta la traccia.
+      console.warn(`og.png: miniatura ${row.thumb_path} → ${r.status}`);
+    }
+  }
+  const { voto, concetti } = ogNumeri(row, scheda);
+  const svg = svgOg(
+    {
+      titolo: row.title ?? "",
+      voto,
+      concetti,
+      tipo: testiDi(linguaDi(row.locale)).templateDiStudio,
+      foglio,
     },
-  });
-  return new Uint8Array(resvg.render().asPng());
+    font.serif,
+    font.sans,
+  );
+  // `asPng()` di resvg dichiara `Uint8Array<ArrayBufferLike>`, che NON è un
+  // `BodyInit` valido per `Response` (potrebbe essere su SharedArrayBuffer):
+  // si ricopia in un Uint8Array su ArrayBuffer, poche centinaia di KB.
+  return new Uint8Array(new Resvg(svg, opzioniResvg(font)).render().asPng());
 }
 
 // Base64 a byte array WITHOUT spreading (String.fromCharCode(...big) overflows
@@ -2778,9 +3407,6 @@ function toBase64(b: Uint8Array): string {
 function mimeOf(b: Uint8Array): string {
   if (b[0] === 0xff && b[1] === 0xd8) return "image/jpeg";
   return "image/png";
-}
-function truncate(s: string, n: number): string {
-  return s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s;
 }
 
 // ── Rendering ───────────────────────────────────────────────────────────────
@@ -2813,7 +3439,7 @@ export function jsonPerScript(v: unknown): string {
 /// RICARICA soltanto, e su iOS gli Universal Links non scattano su una
 /// navigazione nello stesso dominio. L'intent apre l'app se c'è (con questo
 /// URL, ref compreso), altrimenti Chrome segue S.browser_fallback_url.
-function collegamentiSeme(rowHash: string, ref: string) {
+function collegamentiSeme(rowHash: string, ref: string, u: Testi) {
   const androidLive = (Deno.env.get("ANDROID_STORE_LIVE") ?? "") === "true";
   const referrer = `s=${rowHash}${ref ? `&ref=${ref}` : ""}`;
   const playUrl = androidLive
@@ -2825,7 +3451,7 @@ function collegamentiSeme(rowHash: string, ref: string) {
   // Il link che l'app riceve: porta il ref, perché l'attribuzione è sua.
   const appLink = `https://share.fluera.dev/s/${rowHash}${refQ}`;
   const androidIntent = `intent://share.fluera.dev/s/${rowHash}${refQ}#Intent;scheme=https;package=${BUNDLE_ID};S.browser_fallback_url=${
-    encodeURIComponent(playUrl ?? `${SITE}/beta`)
+    encodeURIComponent(playUrl ?? u.beta)
   };end`;
   // 🖥️ Da computer (29/09): lo schema custom, che l'app desktop registra
   // (Windows MSIX protocol_activation, macOS CFBundleURLTypes, Linux
@@ -2835,7 +3461,7 @@ function collegamentiSeme(rowHash: string, ref: string) {
   const desktopUrl = `fluera://s/${rowHash}${refQ}`;
   const script = `<script>
     (function () {
-      var c = ${jsonPerScript({ android: androidIntent, ios: iosUrl, desktop: desktopUrl, apri: "Apri in Fluera" })};
+      var c = ${jsonPerScript({ android: androidIntent, ios: iosUrl, desktop: desktopUrl, apri: u.apri })};
       var ua = navigator.userAgent || "";
       var a = document.getElementById("apri");
       if (!a) return;
@@ -2853,8 +3479,7 @@ function collegamentiSeme(rowHash: string, ref: string) {
 
 /// La nota sotto «Apri in Fluera», nascosta nell'HTML (uguale per ogni
 /// user-agent) e mostrata dallo script di collegamentiSeme solo da computer.
-const NOTA_APRI =
-  `<p class="apri-nota" id="apri-nota" hidden>Si apre Fluera sul tuo computer, se è installata. Non ce l'hai? Entra nella beta.</p>`;
+const notaApri = (u: Testi) => `<p class="apri-nota" id="apri-nota" hidden>${u.notaApri}</p>`;
 
 /// Il meta del banner di Safari: SOLO con un id vero. Prima usciva
 /// «app-id=fluera», che non è un id App Store.
@@ -2864,19 +3489,19 @@ function metaAppleItunes(appLink: string): string {
     : "";
 }
 
-/// og:image (S9): se la riga ha og_path, l'immagine nello Storage — senza far
-/// girare resvg a ogni unfurl (Deno Deploy Free: 10 ore di CPU al mese).
-/// Le dimensioni si dichiarano solo dove sono VERE: /s/{hash}/og.png compone
-/// a 1200×630, e `<hash>-og.png` è il percorso che l'app carica dopo
-/// `SeedThumbnailRenderer.renderOgImage` (1200×630 fissi). Un
-/// `official/<hash>_og.png` viene da `publish_curated_seed.mjs --og`, cioè da
-/// un file qualunque: lì niente dimensioni.
+/// og:image (S9): la card che compone /s/{hash}/og.png, 1200×630.
+/// L'eccezione è una card ufficiale scelta a mano, `official/<hash>_og.png`
+/// (`publish_curated_seed.mjs --og`): quella si dà dallo Storage così com'è,
+/// e senza dimensioni, perché è un file qualunque.
+///
+/// `<hash>-og.png`, la card che l'app disegnava e caricava fino al 2026-09-29,
+/// non si usa più: aveva un logo finto e colori estranei al marchio (VIS-03).
+/// Costa una composizione con resvg a ogni unfurl che la cache non copre,
+/// ~0,3 s di CPU (misurati il 2026-09-29): con le 10 ore al mese di Deno
+/// Deploy Free sono ~120 000 anteprime.
 function ogImmagine(row: SeedRow): { url: string; dimensioni: boolean } {
-  if (row.og_path) {
-    return {
-      url: publicUrl(row.og_path),
-      dimensioni: /^[A-Za-z0-9]+-og\.png$/.test(row.og_path),
-    };
+  if (row.og_path?.startsWith("official/")) {
+    return { url: publicUrl(row.og_path), dimensioni: false };
   }
   return { url: `https://share.fluera.dev/s/${row.hash}/og.png`, dimensioni: true };
 }
@@ -2885,11 +3510,11 @@ function ogImmagine(row: SeedRow): { url: string; dimensioni: boolean } {
 /// ma non porta titolo, descrizione, immagine, autore né og specifici.
 function renderPaginaRiservata(row: SeedRow, ref: string): string {
   const self = `https://share.fluera.dev/s/${row.hash}`;
-  const l = collegamentiSeme(row.hash, ref);
-  const title = "Contenuto disponibile nell'app";
-  const desc = "Questo contenuto è disponibile nell'app Fluera.";
+  const u = testiDi(linguaDi(row.locale));
+  const l = collegamentiSeme(row.hash, ref, u);
+  const [title, desc, invito] = u.riservata;
   return `<!doctype html>
-<html lang="it">
+<html lang="${u.lingua}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
@@ -2913,18 +3538,18 @@ function renderPaginaRiservata(row: SeedRow, ref: string): string {
     .cta{display:flex;flex-direction:column;gap:12px}`)}
 </head>
 <body>
-  ${testata()}
+  ${testata(u)}
   <main class="in"><div class="riservata">
     <h1>${esc(title)}</h1>
-    <p class="desc">Per vederlo apri il link in Fluera.</p>
+    <p class="desc">${esc(invito)}</p>
     <div class="cta">
-      <a class="btn primary" id="apri" href="${esc(SITE)}">Scopri Fluera</a>
-      ${l.playUrl ? `<a class="btn ghost" href="${esc(l.playUrl)}">Google Play</a>` : `<a class="btn ghost" href="${esc(SITE)}/beta">Entra nella beta</a>`}
+      <a class="btn primary" id="apri" href="${esc(u.sito)}">${u.scopri}</a>
+      ${l.playUrl ? `<a class="btn ghost" href="${esc(l.playUrl)}">Google Play</a>` : `<a class="btn ghost" href="${esc(u.beta)}">${u.entraBeta}</a>`}
       ${l.iosUrl ? `<a class="btn ghost" href="${esc(l.iosUrl)}">App Store</a>` : ""}
     </div>
-    ${NOTA_APRI}
+    ${notaApri(u)}
   </div></main>
-  ${piede(row.hash)}
+  ${piede(u, row.hash)}
   ${l.script}
 </body>
 </html>`;
@@ -2946,10 +3571,13 @@ export function linguaContenuto(row: { locale: string | null }): string | null {
   }
 }
 
-/// ` lang="…"` per un blocco del seme, o "" quando è italiano come la pagina.
-function attrLingua(row: { locale: string | null }): string {
+/// Gli attributi di un blocco scritto da chi pubblica (titolo, descrizione,
+/// etichette): ` lang="…"` quando la sua lingua non è quella
+/// dell'interfaccia, e sempre ` dir="auto"`, così un titolo in arabo va da
+/// destra anche dentro una pagina inglese (I18N-04).
+function attrContenuto(row: { locale: string | null }, u: Testi): string {
   const l = linguaContenuto(row);
-  return l && l.split("-")[0].toLowerCase() !== "it" ? ` lang="${esc(l)}"` : "";
+  return `${l && l.split("-")[0].toLowerCase() !== u.lingua ? ` lang="${esc(l)}"` : ""} dir="auto"`;
 }
 
 /// 🧾 Dati strutturati (F1, 2026-09-24), SOLO per le pagine indicizzabili:
@@ -2991,8 +3619,8 @@ function jsonLdSeme(
         description: d.description,
         image: d.image,
         // La stessa scelta del lang dei blocchi: senza tag valido il contenuto
-        // eredita lang="it" dalla pagina, e il markup dice lo stesso.
-        inLanguage: linguaContenuto(row) ?? "it",
+        // eredita il lang della pagina, e il markup dice lo stesso.
+        inLanguage: linguaContenuto(row) ?? uiDi(linguaDi(row.locale)),
         url: d.self,
         isAccessibleForFree: (row.price_cents ?? 0) === 0,
         publisher: { "@type": "Organization", name: "Fluera", url: SITE },
@@ -3019,17 +3647,21 @@ const etichette = (s: SchedaWeb | null): string[] =>
 /// «Ti potrebbero interessare», «Tutti gli appunti di …» e il catalogo: solo
 /// sui pack visibili (F4: anche noindex). Verso un pack o un elenco che Google
 /// non prende il link è nofollow.
-function sezioneCorrelati(v: Vicini): string {
-  const schede = v.correlati.map((r) => schedaSeme(r, false)).join("");
+function sezioneCorrelati(v: Vicini, u: Testi): string {
+  const schede = v.correlati.map((r) => schedaSeme(u, r, false)).join("");
   const elenco = schede
-    ? `<h2 id="t-correlati">Ti potrebbero interessare</h2>${striscia("Ti potrebbero interessare", schede)}`
+    ? `<h2 id="t-correlati">${u.potrebbero}</h2>${striscia(u.potrebbero, schede)}`
     : "";
   const tutti = v.tutti
-    ? `<p><a href="${esc(v.tutti.href)}"${relElenco(v.tutti)}>Tutti gli appunti di ${esc(v.tutti.nome)} →</a></p>`
+    ? `<p><a href="${esc(v.tutti.href)}"${relElenco(v.tutti)}>${
+      // Il nome viene dal database, nella lingua dell'elenco: <bdi> lo isola,
+      // così un nome in arabo dentro una frase inglese non ne rigira l'ordine.
+      u.tuttiGliAppuntiDi(`<bdi>${esc(v.tutti.nome)}</bdi>`)
+    }</a></p>`
     : "";
-  return `<nav class="correlati" aria-label="Altri template">${elenco}<div class="link-el">${tutti}<p><a href="${
+  return `<nav class="correlati" aria-label="${u.altriTemplate}">${elenco}<div class="link-el">${tutti}<p><a href="${
     esc(v.catalogo)
-  }"${relElenco({ nofollow: v.catalogoNofollow })}>Tutto il catalogo →</a></p></div></nav>`;
+  }"${relElenco({ nofollow: v.catalogoNofollow })}>${u.tuttoCatalogo}</a></p></div></nav>`;
 }
 
 function renderPage(
@@ -3048,12 +3680,15 @@ function renderPage(
   // anche se Google non lo prende; indicizzabile ⇒ visibile.
   const siVede = visibile(row);
   const og = ogImmagine(row);
-  const l = collegamentiSeme(hash, ref);
-  const title = (row.title ?? "Template di studio").trim() || "Template di studio";
+  // L'interfaccia nella lingua del pack (I18N-01): italiano per i pack
+  // italiani, inglese per tutti gli altri.
+  const u = testiDi(linguaDi(row.locale));
+  const l = collegamentiSeme(hash, ref, u);
+  const title = (row.title ?? u.templateDiStudio).trim() || u.templateDiStudio;
   // Come l'app: «@» + 6 caratteri del codice (MW:179-207); «Fluera» solo dal
   // bit is_official. Dalla F4 l'autore di uno studente sta anche sulle /s/
   // indicizzate (Creator Terms 2.5: il codice pseudonimo).
-  const author = autoreMostrato(row) ?? "@anonimo";
+  const author = autoreMostrato(row) ?? u.anonimo;
   const concepts = Math.max(0, row.concept_count ?? 0);
   // S7: install_count MAI (si gonfia con chiamate anonime, 047). Sui pack
   // visibili voto ed efficacia arrivano da get_web_scheda, già sotto le
@@ -3066,11 +3701,11 @@ function renderPage(
   const nConcetti = numero(scheda?.concept_count) ?? (concepts > 0 ? concepts : null);
   const eff = numero(scheda?.efficacia_pct);
   const effN = numero(scheda?.efficacia_studenti);
-  const cat = categoriaDi(scheda?.category);
+  const cat = categoriaDi(scheda?.category, u);
   const tags = etichette(scheda);
   // Tre stati (186): NULL = non dichiarato, e non si scrive niente.
   const ia = row.ai_generated === true;
-  const lingua = attrLingua(row);
+  const lingua = attrContenuto(row, u);
   // In pagina la pagina degli appunti (miniatura 3:4) quando c'è: la card og
   // ha il banner di un'altra grafica. Gli og:* restano quelli di ogImmagine.
   const foglio = row.thumb_path ? publicUrl(row.thumb_path) : null;
@@ -3080,17 +3715,16 @@ function renderPage(
   // they never reach the chat-preview card. Build a compact proof prefix
   // (e.g. "★4,8 (12) · 5 concetti") and prepend it.
   const proofParts = [
-    voto !== null ? `★${votoIt(voto)}${voti !== null ? ` (${numeroIt(voti)})` : ""}` : "",
-    nConcetti !== null ? concetti(nConcetti) : "",
+    voto !== null ? `★${votoUi(voto, u)}${voti !== null ? ` (${numeroUi(voti, u)})` : ""}` : "",
+    nConcetti !== null ? concetti(nConcetti, u) : "",
   ].filter(Boolean);
   const proof = proofParts.join(" · ");
 
   // Il nome della materia, mai la chiave grezza («math»): nel chip e nella
   // descrizione di ripiego, che finisce anche negli og e nel JSON-LD.
-  const disciplina = nomeDisciplina(row.discipline);
-  const disciplinaInFrase = disciplina && materiaDi(row.discipline) ? disciplina.toLowerCase() : disciplina;
-  const baseDescription = (row.description ?? "").trim() ||
-    `Un template di studio${disciplinaInFrase ? ` di ${disciplinaInFrase}` : ""} con ${concepts} concett${concepts === 1 ? "o" : "i"}. Installalo in Fluera e parte un ripasso programmato — il trapianto cognitivo nel tuo modello di studio.`;
+  const disciplina = nomeDisciplina(row.discipline, u);
+  const disciplinaInFrase = disciplina && materiaDi(row.discipline) ? u.materiaInFrase(disciplina) : disciplina;
+  const baseDescription = (row.description ?? "").trim() || u.descPack(disciplinaInFrase, concepts);
   // og:* / twitter:* SOCIAL-PROOF-augmented strings (the card). On-page <title>
   // and the visible <p class="desc"> stay clean (chips already show the proof).
   const ogTitle = proof ? `${title} · ${proof}` : title;
@@ -3099,9 +3733,9 @@ function renderPage(
   const dove = vicini.corso ?? disciplina;
 
   const distintivo = row.is_official === true
-    ? `<span class="distintivo uff">${ic("verified")}Ufficiale</span>`
+    ? `<span class="distintivo uff">${ic("verified")}${u.ufficiale}</span>`
     : scheda?.is_featured === true
-    ? `<span class="distintivo evid">${ic("auto_awesome")}In evidenza</span>`
+    ? `<span class="distintivo evid">${ic("auto_awesome")}${u.inEvidenza}</span>`
     : "";
   // --em: la parola più lunga della materia in em, perché il CSS scelga il
   // corpo che la tiene su una riga («Matemat / ica» a 320 px).
@@ -3116,19 +3750,19 @@ function renderPage(
   // dei voti non è nell'etichetta, come nell'app: resta per il lettore di
   // schermo e al passaggio del mouse. «Compare da 5 voti» solo dove può
   // comparire: su un pack non visibile sarebbe una promessa falsa.
-  const nVoti = voti !== null ? `${voti} vot${voti === 1 ? "o" : "i"}` : null;
+  const nVoti = voti !== null ? u.voti(voti) : null;
   const riquadro = `<div class="riquadro">
-          <div class="cella"${nVoti ? ` title="${nVoti}"` : ""}>${ic("star")}<span class="v"${voto === null && siVede ? ` title="Il voto compare da 5 voti"` : ""}>${
-    voto !== null ? votoIt(voto) : "—"
-  }</span><span class="e">Valutazione</span>${nVoti ? `<span class="vh">, ${nVoti}</span>` : ""}</div>
-          <div class="cella">${ic("hub")}<span class="v">${nConcetti !== null ? esc(numeroIt(nConcetti)) : "—"}</span><span class="e">Concetti</span></div>
-          <div class="cella">${ic(iconaMateria(materiaDi(row.discipline)))}${materiaV}<span class="e">Materia</span></div>
+          <div class="cella"${nVoti ? ` title="${nVoti}"` : ""}>${ic("star")}<span class="v"${voto === null && siVede ? ` title="${u.votoDa5}"` : ""}>${
+    voto !== null ? votoUi(voto, u) : "—"
+  }</span><span class="e">${u.valutazione}</span>${nVoti ? `<span class="vh">, ${nVoti}</span>` : ""}</div>
+          <div class="cella">${ic("hub")}<span class="v">${nConcetti !== null ? esc(numeroUi(nConcetti, u)) : "—"}</span><span class="e">${u.concettiNome}</span></div>
+          <div class="cella">${ic(iconaMateria(materiaDi(row.discipline)))}${materiaV}<span class="e">${u.materia}</span></div>
         </div>`;
   const briciole = vicini.briciole.map((b) => `<a href="${esc(b.url)}"${relElenco(b)}>${esc(b.nome)}</a>`).join(`<span class="sep" aria-hidden="true">›</span>`);
 
-  const dentro = `${testata(vicini.catalogo, false, vicini.catalogoNofollow)}
+  const dentro = `${testata(u, vicini.catalogo, false, vicini.catalogoNofollow)}
   <main class="in">
-    ${briciole ? `<nav class="briciole" aria-label="Percorso">${briciole}</nav>` : ""}
+    ${briciole ? `<nav class="briciole" aria-label="${u.percorso}">${briciole}</nav>` : ""}
     <div class="pack">
       <figure class="pack-img"><span class="foglio-g">${
     foglio
@@ -3137,41 +3771,41 @@ function renderPage(
   }</span></figure>
       <div class="pack-info">
         <div class="titolo-riga"><h1${lingua}>${esc(title)}</h1>${distintivo}</div>
-        ${ia ? `<span class="ia">Generato dall'IA</span>` : ""}
-        <p class="di">${ic("person")}di ${esc(author)}</p>
+        ${ia ? `<span class="ia">${u.generatoIa}</span>` : ""}
+        <p class="di">${ic("person")}${esc(u.di(author))}</p>
         ${riquadro}
         ${
     eff !== null
-      ? `<div class="eff"><span class="pillola">${ic("trending")}+${Math.round(eff)}% ritenzione</span>${
-        effN !== null ? `<span>misurato su ${esc(numeroIt(effN))} studenti</span>` : ""
+      ? `<div class="eff"><span class="pillola">${ic("trending")}${u.ritenzione(Math.round(eff))}</span>${
+        effN !== null ? `<span>${esc(u.misuratoSu(numeroUi(effN, u), effN === 1))}</span>` : ""
       }</div>`
       : ""
   }
         <div class="azioni">
-          <a class="btn primary" id="apri" href="${esc(SITE)}">Scopri Fluera</a>
-          ${l.playUrl ? `<a class="btn ghost" href="${esc(l.playUrl)}">Google Play</a>` : `<a class="btn ghost" href="${esc(SITE)}/beta">Entra nella beta</a>`}
+          <a class="btn primary" id="apri" href="${esc(u.sito)}">${u.scopri}</a>
+          ${l.playUrl ? `<a class="btn ghost" href="${esc(l.playUrl)}">Google Play</a>` : `<a class="btn ghost" href="${esc(u.beta)}">${u.entraBeta}</a>`}
           ${l.iosUrl ? `<a class="btn ghost" href="${esc(l.iosUrl)}">App Store</a>` : ""}
         </div>
-        ${NOTA_APRI}
-        <p class="segnala-riga"><a class="segnala" href="https://share.fluera.dev/report?hash=${esc(hash)}">${ic("flag")}Segnala</a></p>
+        ${notaApri(u)}
+        <p class="segnala-riga"><a class="segnala" href="${urlSegnala(u, hash)}">${ic("flag")}${u.segnala}</a></p>
         ${
     cat || tags.length
-      ? `<section class="blocco" aria-labelledby="t-argomenti"><h2 id="t-argomenti">Argomenti</h2><ul class="tag-l">${
+      ? `<section class="blocco" aria-labelledby="t-argomenti"><h2 id="t-argomenti">${u.argomenti}</h2><ul class="tag-l">${
         cat ? `<li class="tag cat">${ic(cat[1])}${esc(cat[0])}</li>` : ""
       }${tags.map((t) => `<li class="tag"${lingua}>${esc(t)}</li>`).join("")}</ul></section>`
       : ""
   }
-        <section class="blocco" aria-labelledby="t-descrizione"><h2 id="t-descrizione">Descrizione</h2>${
-    descrizione ? `<p class="desc"${lingua}>${esc(descrizione)}</p>` : `<p class="desc-vuota">Nessuna descrizione disponibile.</p>`
+        <section class="blocco" aria-labelledby="t-descrizione"><h2 id="t-descrizione">${u.descrizione}</h2>${
+    descrizione ? `<p class="desc"${lingua}>${esc(descrizione)}</p>` : `<p class="desc-vuota">${u.nessunaDesc}</p>`
   }</section>
-        <div class="nota">${ic("psychology_o")}<p>Aprendolo in Fluera, i concetti di questo template entrano nel tuo modello di studio, con un primo ripasso programmato per domani.</p></div>
-      </div>${siVede ? `\n      ${sezioneCorrelati(vicini)}` : ""}
+        <div class="nota">${ic("psychology_o")}<p>${u.notaModello}</p></div>
+      </div>${siVede ? `\n      ${sezioneCorrelati(vicini, u)}` : ""}
     </div>
   </main>
-  ${piede(hash)}`;
+  ${piede(u, hash)}`;
 
   return `<!doctype html>
-<html lang="it">
+<html lang="${u.lingua}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}${siIndicizza ? "" : `\n  <meta name="robots" content="noindex" />`}
@@ -3239,7 +3873,8 @@ const STILE_WEB =
     @media(prefers-color-scheme:dark){:root{--carta:#221E16;--carta-alta:#322C22;--foglio:#2A251C;--lavata:#302B21;--rialzo:#3A3327;--inchiostro:#F2ECE0;--inchiostro-2:#A79E8A;--accento-t:#A8C7FA;--accento-h:#3B74F0;--accento-velo:#1E3054;--su-accento-velo:#C7D9FF;--taupe:#322D22;--filo:#3D3629;--filo-2:#322D23;--stella-vuota:rgb(167 158 138/.7);--pal-sunset:#43342B;--pal-sunset-t:#E6C7B4;--pal-amber:#3F3825;--pal-amber-t:#E2CFA0;--pal-rose:#422E33;--pal-rose-t:#E6C0C8;--pal-grape:#362F44;--pal-grape-t:#CCC0E0}}
     *{box-sizing:border-box}
     html{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;-webkit-text-size-adjust:100%}
-    body{margin:0;background:var(--carta);color:var(--inchiostro);font:16px/1.5 var(--sans);overflow-wrap:break-word}
+    body{margin:0;min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;background:var(--carta);color:var(--inchiostro);font:16px/1.5 var(--sans);overflow-wrap:break-word}
+    body>main{flex:1 0 auto;width:100%}
     a{color:var(--accento-t);text-underline-offset:3px}
     .in{max-width:1168px;margin:0 auto;padding-inline:16px}
     .sprite{position:absolute;width:0;height:0;overflow:hidden}
@@ -3532,10 +4167,12 @@ function testaWeb(css: string): string {
 /// al posto della AppBar «Catalogo» dell'app, il link all'indice e la beta.
 /// [catalogoNofollow]: l'indice non va su Google (nessun elenco indicizzabile),
 /// quindi il link «Catalogo» non va seguito — lo sa chi ha letto gli elenchi.
-function testata(indice = urlElenco("it"), suIndice = false, catalogoNofollow = false): string {
-  return `<header class="testata"><div class="in"><a class="marchio" href="${SITE}" aria-label="Fluera"><b aria-hidden="true">Flu</b><i aria-hidden="true">era</i></a><nav class="testata-nav" aria-label="Sezioni"><a class="sez" href="${
+/// Marchio e beta portano a fluera.dev nella lingua della pagina (I18N-03):
+/// prima portavano tutti alle pagine inglesi, e /beta costava anche un 301.
+function testata(u: Testi, indice = urlElenco("it"), suIndice = false, catalogoNofollow = false): string {
+  return `<header class="testata"><div class="in"><a class="marchio" href="${u.sito}" aria-label="Fluera"><b aria-hidden="true">Flu</b><i aria-hidden="true">era</i></a><nav class="testata-nav" aria-label="${u.sezioni}"><a class="sez" href="${
     esc(indice)
-  }"${suIndice ? ` aria-current="page"` : ""}${relElenco({ nofollow: catalogoNofollow })}>Catalogo</a><a class="btn-beta" href="${SITE}/beta">Entra nella beta</a></nav></div></header>`;
+  }"${suIndice ? ` aria-current="page"` : ""}${relElenco({ nofollow: catalogoNofollow })}>${u.catalogo}</a><a class="btn-beta" href="${u.beta}">${u.entraBeta}</a></nav></div></header>`;
 }
 
 /// Il piede di ogni pagina del catalogo, delle pagine di stato e del pack
@@ -3543,31 +4180,37 @@ function testata(indice = urlElenco("it"), suIndice = false, catalogoNofollow = 
 /// pubblica che raccoglie dati (i log del server, il modulo Segnala) deve dire
 /// chi è il titolare e dove sono informativa, termini e un contatto — gli
 /// stessi dati dell'informativa pubblicata (fluera.dev/legal/privacy/, § 1).
-function piede(hash?: string): string {
+function piede(u: Testi, hash?: string): string {
   return `<footer class="piede"><div class="in">
-  <div class="piede-riga"><a href="${SITE}/it/">Che cos'è Fluera →</a>${
-    hash ? `<a href="https://share.fluera.dev/report?hash=${esc(hash)}">Segnala questo contenuto</a>` : ""
+  <div class="piede-riga"><a href="${u.sito}">${u.cheCos}</a>${
+    hash ? `<a href="${urlSegnala(u, hash)}">${u.segnalaContenuto}</a>` : ""
   }</div>
-  <nav class="piede-riga" aria-label="Informazioni legali"><a href="${SITE}/legal/privacy/">Privacy</a><a href="${SITE}/legal/terms/">Termini</a><a href="mailto:support@fluera.dev">Contatti</a></nav>
-  <p class="titolare">© ${new Date().getUTCFullYear()} Fluera · Titolare: Lorenco Shametaj, Via Boccaccio 44, 35128 Padova (PD)</p>
+  <nav class="piede-riga" aria-label="${u.infoLegali}"><a href="${u.privacy}">${u.privacyNome}</a><a href="${u.termini}">${u.terminiNome}</a><a href="mailto:support@fluera.dev">${u.contatti}</a></nav>
+  <p class="titolare">© ${new Date().getUTCFullYear()} Fluera · ${u.titolare}</p>
 </div></footer>`;
 }
+
+/// Il modulo Segnala di un pack, nella lingua della pagina da cui si parte.
+/// L'italiano è la lingua del modulo senza parametro.
+const urlSegnala = (u: Testi, hash: string) =>
+  `https://share.fluera.dev/report?hash=${esc(hash)}${u.lingua === "it" ? "" : `&amp;lingua=${u.lingua}`}`;
 
 /// 404, 410, 500 e 503 delle pagine /s/ e degli elenchi, come gli stati vuoti
 /// dell'app. Le altre rotte (OAuth, /c…) restano su statusPage; /report ha
 /// la sua cornice, paginaSegnala.
 function paginaStato(
+  u: Testi,
   headline: string,
   body: string,
   o: { icona?: string; azione?: { testo: string; href: string } } = {},
 ): string {
-  const dentro = `${testata()}
+  const dentro = `${testata(u)}
   <main class="in"><div class="stato">${
-    statoVuoto(o.icona ?? "eco", headline, body, o.azione ?? { testo: "Tutti i template", href: urlElenco("it") }, 1)
+    statoVuoto(o.icona ?? "eco", headline, body, o.azione ?? { testo: u.tuttiTemplate, href: urlElenco("it") }, 1)
   }</div></main>
-  ${piede()}`;
+  ${piede(u)}`;
   return `<!doctype html>
-<html lang="it">
+<html lang="${u.lingua}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
@@ -3580,8 +4223,13 @@ function paginaStato(
 </html>`;
 }
 
+/// Gli errori delle rotte fuori dal catalogo (OAuth del connettore, /c/…):
+/// dal 2026-09-29 con la stessa cornice di paginaStato — testata, piede, la
+/// grafica del catalogo — invece della pagina nera e viola di prima. In
+/// italiano: quelle rotte non sanno la lingua di chi arriva, e il loro testo
+/// è ancora solo italiano.
 function statusPage(headline: string, body: string): string {
-  return `<!doctype html><html lang="it"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}<meta name="robots" content="noindex" /><title>${esc(headline)} · Fluera</title><style>body{margin:0;background:#0a0a0b;color:#f4f4f5;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center}div{max-width:420px;padding:24px}h1{font-size:22px;margin:0 0 8px}p{color:#a1a1aa;margin:0 0 20px}a{color:#818cf8}</style></head><body><div><h1>${esc(headline)}</h1><p>${esc(body)}</p><a href="${SITE}">Vai a Fluera →</a></div></body></html>`;
+  return paginaStato(TESTI_IT, headline, body, { icona: "eco", azione: { testo: TESTI_IT.vaiAFluera, href: TESTI_IT.sito } });
 }
 
 // ── Public report channel (DSA Art.16 / DMCA) ────────────────────────────────
@@ -3598,20 +4246,123 @@ function statusPage(headline: string, body: string): string {
 // rate-limit below is only a per-isolate floor.
 
 const REPORT_HASH_RE = /^[a-f0-9]{8,64}$/;
-// Reason taxonomy (value → visible IT label). Mirrors the seed_takedown_notices
-// reason set; a 'copyright' report maps to notice_type 'dmca', everything else
-// to 'illegal_content'.
-const REPORT_REASONS: ReadonlyArray<[string, string]> = [
-  ["child-safety", "Sicurezza dei minori (abusi o adescamento)"],
-  ["sexual", "Contenuto sessuale o esplicito"],
-  ["violence", "Violenza o incitamento alla violenza"],
-  ["hate", "Incitamento all'odio"],
-  ["copyright", "Violazione del diritto d'autore"],
-  ["pii", "Dati personali di qualcuno, pubblicati senza permesso"],
-  ["spam", "Spam o truffa"],
-  ["other", "Altro"],
+// Reason taxonomy (value → visible label, IT and EN). Mirrors the
+// seed_takedown_notices reason set; a 'copyright' report maps to notice_type
+// 'dmca', everything else to 'illegal_content'.
+const REPORT_REASONS: ReadonlyArray<[string, string, string]> = [
+  ["child-safety", "Sicurezza dei minori (abusi o adescamento)", "Child safety (abuse or grooming)"],
+  ["sexual", "Contenuto sessuale o esplicito", "Sexual or explicit content"],
+  ["violence", "Violenza o incitamento alla violenza", "Violence or incitement to violence"],
+  ["hate", "Incitamento all'odio", "Hate speech"],
+  ["copyright", "Violazione del diritto d'autore", "Copyright infringement"],
+  ["pii", "Dati personali di qualcuno, pubblicati senza permesso", "Someone's personal data, published without permission"],
+  ["spam", "Spam o truffa", "Spam or scam"],
+  ["other", "Altro", "Other"],
 ];
 const REPORT_REASON_SET = new Set(REPORT_REASONS.map(([v]) => v));
+
+/// Le parole del modulo Segnala (I18N-01, 2026-09-29): italiano e inglese,
+/// come il resto di share. Le dichiarazioni legali in inglese seguono il testo
+/// inglese ufficiale del DSA (art. 16, par. 2, lett. d: «accurate and
+/// complete») e del GDPR (art. 6, par. 1, lett. c e f): tradotte, non
+/// riscritte. La lingua arriva col link della pagina da cui si parte
+/// (`&lingua=en`), passa nel modulo e torna nella ricevuta; senza, italiano.
+const SEGNALA_TESTI = {
+  it: {
+    titolo: "Segnala un contenuto",
+    titoloModulo: "Segnala questo contenuto",
+    lead: "Puoi segnalare un template anche senza account. Ogni segnalazione viene esaminata da una persona.",
+    motivo: "Motivo",
+    scegli: "Scegli un motivo…",
+    perche: "Perché questo contenuto è illecito o viola le regole",
+    percheAiuto:
+      "Indica che cosa, e dove nel contenuto; per il diritto d'autore, anche quale opera è protetta. Obbligatoria, tranne per le segnalazioni sulla sicurezza dei minori.",
+    nome: "Nome e cognome, o ente",
+    nomeFac: "(facoltativo, tranne per il diritto d'autore)",
+    email: "Email",
+    emailFac: "(facoltativa, tranne per il diritto d'autore)",
+    emailAiuto: "Se la lasci, ti scriviamo per confermare la ricezione e per comunicarti la decisione.",
+    informativa:
+      "I dati di questo modulo li tratta il titolare, Lorenco Shametaj, solo per esaminare la segnalazione e risponderti, come chiede il DSA (Regolamento UE 2022/2065; base giuridica: art. 6.1.c GDPR e, per prevenire gli abusi, art. 6.1.f). Restano nel registro delle segnalazioni per il tempo necessario a gestire eventuali reclami o ricorsi. Per accedervi, correggerli, opporti o chiederne la cancellazione scrivi a",
+    informativaLink: "Informativa completa",
+    buonaFede:
+      "Dichiaro in buona fede che le informazioni di questa segnalazione sono esatte e complete e, se segnalo una violazione del diritto d'autore, di esserne il titolare o di essere autorizzato ad agire per suo conto.",
+    invia: "Invia la segnalazione",
+    scrivi: "Puoi anche scrivere a",
+    scriviDopo: ", l'indirizzo per segnalazioni e richieste di rimozione.",
+    senzaContenuto: "Per segnalare un template apri la sua pagina e usa «Segnala»: così sappiamo di quale contenuto si tratta.",
+    ricevuta: "Segnalazione ricevuta",
+    numero: "Numero della segnalazione:",
+    esaminiamo: "La esaminiamo e decidiamo il prima possibile.",
+    conEmail: "Ti scriviamo all'indirizzo che hai lasciato per confermare che l'abbiamo ricevuta e per comunicarti la decisione.",
+    senzaEmail: "Non hai lasciato un indirizzo email: la esaminiamo lo stesso, ma non potremo comunicarti la decisione.",
+    indicaNumero: "per questa segnalazione, indica il numero.",
+    seScrivi: "Se scrivi a",
+    tornaContenuto: "Torna al contenuto",
+    tornaModulo: "Torna al modulo",
+    nonValida: ["Segnalazione non valida", "Il modulo non si è potuto leggere. Riprova."],
+    troppe: ["Troppe segnalazioni", "Troppe segnalazioni da questa rete. Riprova fra qualche minuto."],
+    errMotivo: "Scegli il motivo della segnalazione.",
+    errSpiega: "Spiega perché il contenuto è illecito o viola le regole: senza una spiegazione la segnalazione non si può esaminare.",
+    errEmail: "L'indirizzo email non sembra valido. Correggilo, oppure lascia il campo vuoto.",
+    errFirma:
+      "Per una violazione del diritto d'autore servono il nome di chi ne è titolare (o di chi agisce per suo conto) e un'email: valgono come firma e recapito della segnalazione.",
+    errBuonaFede: "Per inviare la segnalazione serve la dichiarazione di buona fede in fondo al modulo.",
+    errServer: ["Errore", "Il server non è configurato. Riprova più tardi."],
+    errInvio: ["Invio non riuscito", "C'è stato un problema tecnico e la segnalazione non è arrivata. Riprova fra poco."],
+  },
+  en: {
+    titolo: "Report content",
+    titoloModulo: "Report this content",
+    lead: "You can report a template without an account. Every report is reviewed by a person.",
+    motivo: "Reason",
+    scegli: "Choose a reason…",
+    perche: "Why this content is illegal or breaks the rules",
+    percheAiuto:
+      "Say what it is and where it appears in the content; for copyright, also which work is protected. Required, except for child-safety reports.",
+    nome: "Full name, or organisation",
+    nomeFac: "(optional, except for copyright)",
+    email: "Email",
+    emailFac: "(optional, except for copyright)",
+    emailAiuto: "If you leave it, we'll write to confirm we received your report and to tell you our decision.",
+    informativa:
+      "The data in this form is processed by the controller, Lorenco Shametaj, only to review the report and reply to you, as required by the DSA (Regulation (EU) 2022/2065; legal basis: Article 6(1)(c) GDPR and, to prevent abuse, Article 6(1)(f)). It stays in the register of reports for as long as needed to handle any complaints or appeals. To access or correct it, to object, or to ask for it to be erased, write to",
+    informativaLink: "Full privacy notice",
+    buonaFede:
+      "I declare in good faith that the information and allegations in this report are accurate and complete and, if I am reporting a copyright infringement, that I am the rightsholder or am authorised to act on their behalf.",
+    invia: "Send the report",
+    scrivi: "You can also write to",
+    scriviDopo: ", the address for reports and removal requests.",
+    senzaContenuto: "To report a template, open its page and use “Report”: that way we know which content it is.",
+    ricevuta: "Report received",
+    numero: "Report number:",
+    esaminiamo: "We'll review it and decide as soon as possible.",
+    conEmail: "We'll write to the address you left to confirm we received it and to tell you our decision.",
+    senzaEmail: "You didn't leave an email address: we'll still review it, but we won't be able to tell you our decision.",
+    indicaNumero: "about this report, include the number.",
+    seScrivi: "If you write to",
+    tornaContenuto: "Back to the content",
+    tornaModulo: "Back to the form",
+    nonValida: ["Invalid report", "The form couldn't be read. Please try again."],
+    troppe: ["Too many reports", "Too many reports from this network. Please try again in a few minutes."],
+    errMotivo: "Choose the reason for the report.",
+    errSpiega: "Explain why the content is illegal or breaks the rules: without an explanation the report can't be reviewed.",
+    errEmail: "The email address doesn't look valid. Correct it, or leave the field empty.",
+    errFirma:
+      "For a copyright infringement we need the name of the rightsholder (or of whoever acts on their behalf) and an email: they serve as the signature and contact for the report.",
+    errBuonaFede: "To send the report, tick the good-faith declaration at the end of the form.",
+    errServer: ["Error", "The server is not configured. Please try again later."],
+    errInvio: ["Sending failed", "A technical problem stopped the report from arriving. Please try again shortly."],
+  },
+} satisfies Record<Ui, Record<string, string | string[]>>;
+
+/// La lingua del modulo dal parametro `lingua` (query o campo nascosto):
+/// solo un codice di 2-3 lettere, e vale come per il resto di share.
+function uiSegnala(v: unknown): Ui {
+  return uiDi(typeof v === "string" && /^[a-z]{2,3}$/.test(v) ? v : null);
+}
+/// `&lingua=en` per gli indirizzi del modulo, niente per l'italiano.
+const qLingua = (ui: Ui) => (ui === "it" ? "" : `&lingua=${ui}`);
 // Fluera's choice, not the law's: a child-safety report is accepted without an
 // explanation (a witness may not want to describe the material). Art. 16(2)(c)
 // DSA exempts only name and email for those offences — and here name and email
@@ -3686,8 +4437,11 @@ async function handleReportPost(req: Request): Promise<Response> {
   try {
     form = await req.formData();
   } catch {
-    return htmlSegnala(400, paginaSegnalaMessaggio("Segnalazione non valida", "Il modulo non si è potuto leggere. Riprova."));
+    const t = SEGNALA_TESTI.it;
+    return htmlSegnala(400, paginaSegnalaMessaggio("it", t.nonValida[0], t.nonValida[1]));
   }
+  const ui = uiSegnala(form.get("lingua"));
+  const t = SEGNALA_TESTI[ui];
   const hash = String(form.get("hash") ?? "").trim().toLowerCase();
   const invio = String(form.get("invio") ?? "").trim().toLowerCase();
   const v: ValoriSegnala = {
@@ -3705,31 +4459,31 @@ async function handleReportPost(req: Request): Promise<Response> {
   // throttled too (a spammer can't dodge the limiter by sending an invalid
   // reason and getting a cheap 400 before the limiter runs).
   if (reportRateLimited(clientIp(req))) {
-    return htmlSegnala(429, paginaSegnalaMessaggio("Troppe segnalazioni", "Troppe segnalazioni da questa rete. Riprova fra qualche minuto.", hash));
+    return htmlSegnala(429, paginaSegnalaMessaggio(ui, t.troppe[0], t.troppe[1], hash));
   }
 
-  if (!REPORT_HASH_RE.test(hash)) return htmlSegnala(400, reportSenzaContenuto());
+  if (!REPORT_HASH_RE.test(hash)) return htmlSegnala(400, reportSenzaContenuto(ui));
   if (!REPORT_REASON_SET.has(v.reason)) {
-    return htmlSegnala(400, reportForm(hash, "Scegli il motivo della segnalazione.", v));
+    return htmlSegnala(400, reportForm(ui, hash, t.errMotivo, v));
   }
   if (v.reason !== REPORT_SPIEGAZIONE_FACOLTATIVA && v.detail.length < 10) {
-    return htmlSegnala(400, reportForm(hash, "Spiega perché il contenuto è illecito o viola le regole: senza una spiegazione la segnalazione non si può esaminare.", v));
+    return htmlSegnala(400, reportForm(ui, hash, t.errSpiega, v));
   }
   if (v.email && !REPORT_EMAIL_RE.test(v.email)) {
-    return htmlSegnala(400, reportForm(hash, "L'indirizzo email non sembra valido. Correggilo, oppure lascia il campo vuoto.", v));
+    return htmlSegnala(400, reportForm(ui, hash, t.errEmail, v));
   }
   if (v.reason === REPORT_CON_FIRMA && (!v.name || !v.email)) {
-    return htmlSegnala(400, reportForm(hash, "Per una violazione del diritto d'autore servono il nome di chi ne è titolare (o di chi agisce per suo conto) e un'email: valgono come firma e recapito della segnalazione.", v));
+    return htmlSegnala(400, reportForm(ui, hash, t.errFirma, v));
   }
   if (!v.goodFaith) {
-    return htmlSegnala(400, reportForm(hash, "Per inviare la segnalazione serve la dichiarazione di buona fede in fondo al modulo.", v));
+    return htmlSegnala(400, reportForm(ui, hash, t.errBuonaFede, v));
   }
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    return htmlSegnala(500, paginaSegnalaMessaggio("Errore", "Il server non è configurato. Riprova più tardi.", hash));
+    return htmlSegnala(500, paginaSegnalaMessaggio(ui, t.errServer[0], t.errServer[1], hash));
   }
   const id = await fileTakedownNotice(hash, v);
   if (id === null) {
-    return htmlSegnala(502, paginaSegnalaMessaggio("Invio non riuscito", "C'è stato un problema tecnico e la segnalazione non è arrivata. Riprova fra poco.", hash));
+    return htmlSegnala(502, paginaSegnalaMessaggio(ui, t.errInvio[0], t.errInvio[1], hash));
   }
   // Post/Redirect/Get: the receipt is a GET, so reloading it (or coming back to
   // it with «Indietro») never re-sends the form. The Location is relative: it
@@ -3738,7 +4492,7 @@ async function handleReportPost(req: Request): Promise<Response> {
   return new Response(null, {
     status: 303,
     headers: {
-      Location: `?hash=${hash}&numero=${id}${v.email ? "&email=1" : ""}`,
+      Location: `?hash=${hash}&numero=${id}${v.email ? "&email=1" : ""}${qLingua(ui)}`,
       "Cache-Control": "no-store",
     },
   });
@@ -3805,12 +4559,12 @@ const STILE_SEGNALA = `
 /// Page shell of the report channel, in the catalogue's look (testata, piede).
 /// The piede carries no «Segnala questo contenuto»: here it would point at the
 /// page itself, and from the receipt it would invite a duplicate.
-function paginaSegnala(titolo: string, dentro: string): string {
-  const corpo = `${testata()}
+function paginaSegnala(ui: Ui, titolo: string, dentro: string): string {
+  const corpo = `${testata(TESTI[ui])}
   <main class="in"><div class="modulo">${dentro}</div></main>
-  ${piede()}`;
+  ${piede(TESTI[ui])}`;
   return `<!doctype html>
-<html lang="it">
+<html lang="${ui}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
@@ -3824,38 +4578,39 @@ function paginaSegnala(titolo: string, dentro: string): string {
 }
 
 /// A short message (errors, limits) with a way back.
-function paginaSegnalaMessaggio(titolo: string, testo: string, hash = ""): string {
+function paginaSegnalaMessaggio(ui: Ui, titolo: string, testo: string, hash = ""): string {
   const indietro = hash
-    ? `<a class="btn ghost" href="?hash=${esc(hash)}">Torna al modulo</a>`
-    : `<a class="btn ghost" href="${esc(urlElenco("it"))}">Tutti i template</a>`;
-  return paginaSegnala(titolo, `<h1>${esc(titolo)}</h1><p class="lead">${esc(testo)}</p><div class="azioni">${indietro}</div>`);
+    ? `<a class="btn ghost" href="?hash=${esc(hash)}${esc(qLingua(ui))}">${SEGNALA_TESTI[ui].tornaModulo}</a>`
+    : `<a class="btn ghost" href="${esc(urlElenco("it"))}">${TESTI[ui].tuttiTemplate}</a>`;
+  return paginaSegnala(ui, titolo, `<h1>${esc(titolo)}</h1><p class="lead">${esc(testo)}</p><div class="azioni">${indietro}</div>`);
 }
 
 /// /report without a content reference: the form would be a dead end (the
 /// notice needs to know WHICH content), so say where to start instead.
-function reportSenzaContenuto(): string {
+function reportSenzaContenuto(ui: Ui): string {
+  const t = SEGNALA_TESTI[ui];
   return paginaSegnala(
-    "Segnala un contenuto",
-    `<h1>Segnala un contenuto</h1>
-    <p class="lead">Per segnalare un template apri la sua pagina e usa «Segnala»: così sappiamo di quale contenuto si tratta.</p>
-    <p class="nota">Puoi anche scrivere a <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a>, l'indirizzo per segnalazioni e richieste di rimozione.</p>
-    <div class="azioni"><a class="btn ghost" href="${esc(urlElenco("it"))}">Tutti i template</a></div>`,
+    ui,
+    t.titolo,
+    `<h1>${esc(t.titolo)}</h1>
+    <p class="lead">${esc(t.senzaContenuto)}</p>
+    <p class="nota">${esc(t.scrivi)} <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a>${esc(t.scriviDopo)}</p>
+    <div class="azioni"><a class="btn ghost" href="${esc(urlElenco("it"))}">${TESTI[ui].tuttiTemplate}</a></div>`,
   );
 }
 
 /// The receipt, reached by the 303 after a POST (GET /report?hash=…&numero=…).
 /// It reads only the URL: a hand-made URL shows a number, nothing else.
-function reportRicevuta(hash: string, numero: string, conEmail: boolean): string {
-  const seguito = conEmail
-    ? `Ti scriviamo all'indirizzo che hai lasciato per confermare che l'abbiamo ricevuta e per comunicarti la decisione.`
-    : `Non hai lasciato un indirizzo email: la esaminiamo lo stesso, ma non potremo comunicarti la decisione.`;
+function reportRicevuta(ui: Ui, hash: string, numero: string, conEmail: boolean): string {
+  const t = SEGNALA_TESTI[ui];
   return paginaSegnala(
-    "Segnalazione ricevuta",
-    `<h1>Segnalazione ricevuta</h1>
-    <p class="numero">Numero della segnalazione: ${esc(numero)}</p>
-    <p class="lead">La esaminiamo e decidiamo il prima possibile. ${seguito}</p>
-    <p class="nota">Se scrivi a <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a> per questa segnalazione, indica il numero.</p>
-    <div class="azioni"><a class="btn ghost" href="s/${esc(hash)}">Torna al contenuto</a></div>`,
+    ui,
+    t.ricevuta,
+    `<h1>${esc(t.ricevuta)}</h1>
+    <p class="numero">${esc(t.numero)} ${esc(numero)}</p>
+    <p class="lead">${esc(t.esaminiamo)} ${esc(conEmail ? t.conEmail : t.senzaEmail)}</p>
+    <p class="nota">${esc(t.seScrivi)} <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a> ${esc(t.indicaNumero)}</p>
+    <div class="azioni"><a class="btn ghost" href="s/${esc(hash)}">${esc(t.tornaContenuto)}</a></div>`,
   );
 }
 
@@ -3864,40 +4619,43 @@ function reportRicevuta(hash: string, numero: string, conEmail: boolean): string
 /// un'anteprima locale il clic su «Invia» ha depositato una segnalazione finta
 /// nel registro di PRODUZIONE. Senza `action` il POST resta dove sta la pagina
 /// (locale, anteprima di Deno Deploy, prefisso di Supabase).
-function reportForm(hash: string, error?: string, v: ValoriSegnala = SEGNALA_VUOTO): string {
-  if (!hash) return reportSenzaContenuto();
+function reportForm(ui: Ui, hash: string, error?: string, v: ValoriSegnala = SEGNALA_VUOTO): string {
+  if (!hash) return reportSenzaContenuto(ui);
+  const t = SEGNALA_TESTI[ui];
   // One token per form: re-rendered with an error it stays the same (nothing
   // was filed), a fresh visit gets a new one.
   const invio = v.invio || crypto.randomUUID();
   const options = REPORT_REASONS
-    .map(([val, label]) => `<option value="${esc(val)}"${val === v.reason ? " selected" : ""}>${esc(label)}</option>`)
+    .map(([val, it, en]) => `<option value="${esc(val)}"${val === v.reason ? " selected" : ""}>${esc(ui === "it" ? it : en)}</option>`)
     .join("");
   return paginaSegnala(
-    "Segnala un contenuto",
-    `<h1>Segnala questo contenuto</h1>
-    <p class="lead">Puoi segnalare un template anche senza account. Ogni segnalazione viene esaminata da una persona.</p>
+    ui,
+    t.titolo,
+    `<h1>${esc(t.titoloModulo)}</h1>
+    <p class="lead">${esc(t.lead)}</p>
     ${error ? `<p class="errore" role="alert">${esc(error)}</p>` : ""}
     <form method="post">
       <input type="hidden" name="hash" value="${esc(hash)}" />
-      <input type="hidden" name="invio" value="${esc(invio)}" />
-      <label for="reason">Motivo</label>
+      <input type="hidden" name="invio" value="${esc(invio)}" />${ui === "it" ? "" : `
+      <input type="hidden" name="lingua" value="${ui}" />`}
+      <label for="reason">${esc(t.motivo)}</label>
       <select id="reason" name="reason" required>
-        <option value="" disabled${v.reason ? "" : " selected"}>Scegli un motivo…</option>
+        <option value="" disabled${v.reason ? "" : " selected"}>${esc(t.scegli)}</option>
         ${options}
       </select>
-      <label for="detail">Perché questo contenuto è illecito o viola le regole</label>
+      <label for="detail">${esc(t.perche)}</label>
       <textarea id="detail" name="detail" maxlength="5000" aria-describedby="detail-aiuto">${esc(v.detail)}</textarea>
-      <p class="aiuto" id="detail-aiuto">Indica che cosa, e dove nel contenuto; per il diritto d'autore, anche quale opera è protetta. Obbligatoria, tranne per le segnalazioni sulla sicurezza dei minori.</p>
-      <label for="name">Nome e cognome, o ente <span class="fac">(facoltativo, tranne per il diritto d'autore)</span></label>
+      <p class="aiuto" id="detail-aiuto">${esc(t.percheAiuto)}</p>
+      <label for="name">${esc(t.nome)} <span class="fac">${esc(t.nomeFac)}</span></label>
       <input id="name" name="name" type="text" maxlength="200" autocomplete="name" value="${esc(v.name)}" />
-      <label for="email">Email <span class="fac">(facoltativa, tranne per il diritto d'autore)</span></label>
+      <label for="email">${esc(t.email)} <span class="fac">${esc(t.emailFac)}</span></label>
       <input id="email" name="email" type="email" maxlength="320" autocomplete="email" value="${esc(v.email)}" aria-describedby="email-aiuto" />
-      <p class="aiuto" id="email-aiuto">Se la lasci, ti scriviamo per confermare la ricezione e per comunicarti la decisione.</p>
-      <p class="informativa">I dati di questo modulo li tratta il titolare, Lorenco Shametaj, solo per esaminare la segnalazione e risponderti, come chiede il DSA (Regolamento UE 2022/2065; base giuridica: art. 6.1.c GDPR e, per prevenire gli abusi, art. 6.1.f). Restano nel registro delle segnalazioni per il tempo necessario a gestire eventuali reclami o ricorsi. Per accedervi, correggerli, opporti o chiederne la cancellazione scrivi a <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a>. <a href="${SITE}/legal/privacy/">Informativa completa</a>.</p>
-      <label class="dichiara"><input type="checkbox" name="good_faith" value="1" required${v.goodFaith ? " checked" : ""} /><span>Dichiaro in buona fede che le informazioni di questa segnalazione sono esatte e complete e, se segnalo una violazione del diritto d'autore, di esserne il titolare o di essere autorizzato ad agire per suo conto.</span></label>
-      <button class="btn primary invia" type="submit">Invia la segnalazione</button>
+      <p class="aiuto" id="email-aiuto">${esc(t.emailAiuto)}</p>
+      <p class="informativa">${esc(t.informativa)} <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a>. <a href="${TESTI[ui].privacy}">${esc(t.informativaLink)}</a>.</p>
+      <label class="dichiara"><input type="checkbox" name="good_faith" value="1" required${v.goodFaith ? " checked" : ""} /><span>${esc(t.buonaFede)}</span></label>
+      <button class="btn primary invia" type="submit">${esc(t.invia)}</button>
     </form>
-    <p class="nota">Puoi anche scrivere a <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a>, l'indirizzo per segnalazioni e richieste di rimozione.</p>`,
+    <p class="nota">${esc(t.scrivi)} <a href="mailto:lorenco@fluera.dev">lorenco@fluera.dev</a>${esc(t.scriviDopo)}</p>`,
   );
 }
 
