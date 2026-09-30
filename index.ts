@@ -326,26 +326,19 @@ export const servi = async (req: Request): Promise<Response> => {
   // invito discreto in fondo.
   const cm = path.match(new RegExp(`/c/(${HASH_RE.source})/?$`));
   if (cm) {
+    const u = TESTI[uiRichiesta(req, reqUrl)];
     if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-      return html(500, statusPage("Errore", "Server non configurato."));
+      return html(500, statusPage(u, u.errore[0], u.errore[1]));
     }
     const share = await fetchGhostShare(cm[1]);
-    if (!share) {
-      return html(
-        410,
-        statusPage(
-          "Non più disponibile",
-          "Questa mappa è stata rimossa o non è più pubblica.",
-        ),
-      );
-    }
+    if (!share) return html(410, statusPage(u, u.mappa.rimossa[0], u.mappa.rimossa[1]));
     // Il conteggio si incrementa solo per i VISITATORI, non per i crawler che
     // fanno l'unfurl: chi condivide deve leggere visite, non lavoro di bot.
     // (Un'anteprima incollata in una chat di gruppo genera N fetch di bot.)
     if (!BOT_UA_RE.test(req.headers.get("user-agent") ?? "")) {
       bumpGhostView(cm[1]);
     }
-    return html(200, renderGhostPage(share, cm[1]));
+    return html(200, renderGhostPage(share, cm[1], u));
   }
 
   // ── /p → una scheda del catalogo PRIVATO ───────────────────────────────────
@@ -389,17 +382,24 @@ export const servi = async (req: Request): Promise<Response> => {
   // La card dell'unfurl per una scheda privata. Va PRIMA del confronto su
   // "/p", che e' esatto e quindi non la intercetterebbe comunque — ma tenerle
   // adiacenti evita che un domani qualcuno allarghi "/p" e se la mangi.
-  if (rotta === "/p/og.png") return await privateOgResponse();
+  // La lingua della card solo dal link che la pagina ha scritto: chi la
+  // scarica è il robot dell'anteprima, e il suo browser non è quello di chi
+  // riceve il link.
+  if (rotta === "/p/og.png") {
+    const lq = reqUrl.searchParams.get("lingua");
+    return await privateOgResponse(TESTI[uiDi(lq && /^[a-z]{2,3}$/.test(lq) ? lq : null)]);
+  }
 
   if (rotta === "/p" || rotta === "/p/") {
+    const u = TESTI[uiRichiesta(req, reqUrl)];
     const platform = classify(req.headers.get("user-agent") ?? "");
     const androidLive = (Deno.env.get("ANDROID_STORE_LIVE") ?? "") === "true";
     const store = platform === "android" && androidLive
       ? `https://play.google.com/store/apps/details?id=${BUNDLE_ID}`
       : platform === "ios" && APPLE_APP_ID
       ? `https://apps.apple.com/app/id${APPLE_APP_ID}`
-      : `${SITE}/beta`;
-    return html(200, renderPrivateSeedPage(store, platform));
+      : u.beta;
+    return htmlPerDispositivo(renderPrivateSeedPage(store, platform, u));
   }
 
   // ── /collab/{roomId} → invito a una sessione P2P dal vivo ──────────────────
@@ -446,13 +446,14 @@ export const servi = async (req: Request): Promise<Response> => {
   // 8 caratteri: è un identificatore lungo, spesso un UUID.
   const colm = path.match(/\/collab\/([A-Za-z0-9_-]{4,64})\/?$/);
   if (colm) {
+    const u = TESTI[uiRichiesta(req, reqUrl)];
     const platform = classify(req.headers.get("user-agent") ?? "");
     const androidLive = (Deno.env.get("ANDROID_STORE_LIVE") ?? "") === "true";
     const store = platform === "android" && androidLive
       ? `https://play.google.com/store/apps/details?id=${BUNDLE_ID}`
       : platform === "ios" && APPLE_APP_ID
       ? `https://apps.apple.com/app/id${APPLE_APP_ID}`
-      : `${SITE}/beta`;
+      : u.beta;
     // Solo i parametri del contratto d'invito, ri-serializzati: rimbalzare la
     // query grezza dentro un href significherebbe far scrivere a un estraneo
     // dentro l'attributo di un tag.
@@ -461,10 +462,7 @@ export const servi = async (req: Request): Promise<Response> => {
       const v = reqUrl.searchParams.get(k);
       if (v && /^[A-Za-z0-9_-]{1,128}$/.test(v)) invite.set(k, v);
     }
-    return html(
-      200,
-      renderCollabPage(colm[1], store, platform, invite.toString()),
-    );
+    return htmlPerDispositivo(renderCollabPage(colm[1], store, platform, invite.toString(), u));
   }
 
   // ── /r/{canvasId} → RIENTRO su una tela propria («Atlas risponde», §5) ─────
@@ -489,7 +487,7 @@ export const servi = async (req: Request): Promise<Response> => {
   if (/\/connect\/?$/.test(path)) return html(200, renderConnectPage(req));
   if (/\/oauth\/register\/?$/.test(path)) return await oauthRegister(req);
   if (/\/oauth\/authorize\/?$/.test(path)) return await oauthAuthorize(req, reqUrl);
-  if (/\/oauth\/callback\/?$/.test(path)) return await oauthCallback(reqUrl);
+  if (/\/oauth\/callback\/?$/.test(path)) return await oauthCallback(req, reqUrl);
   if (/\/oauth\/approve\/?$/.test(path)) return await oauthApprove(req);
   if (/\/oauth\/token\/?$/.test(path)) return await oauthToken(req);
   if (/\/oauth\/revoke\/?$/.test(path)) return await oauthRevoke(req);
@@ -517,13 +515,14 @@ export const servi = async (req: Request): Promise<Response> => {
 
   const rem = path.match(/\/r\/([A-Za-z0-9_-]{4,64})\/?$/);
   if (rem) {
+    const u = TESTI[uiRichiesta(req, reqUrl)];
     const platform = classify(req.headers.get("user-agent") ?? "");
     const androidLive = (Deno.env.get("ANDROID_STORE_LIVE") ?? "") === "true";
     const store = platform === "android" && androidLive
       ? `https://play.google.com/store/apps/details?id=${BUNDLE_ID}`
       : platform === "ios" && APPLE_APP_ID
       ? `https://apps.apple.com/app/id${APPLE_APP_ID}`
-      : `${SITE}/beta`;
+      : u.beta;
     const q = new URLSearchParams();
     const rawConcept = reqUrl.searchParams.get("concept");
     // 🔤 L'apostrofo NON e' un carattere pericoloso qui: esce solo dentro
@@ -537,49 +536,7 @@ export const servi = async (req: Request): Promise<Response> => {
         : null;
     if (concept) q.set("concept", concept);
     const appHref = `fluera://r/${rem[1]}${q.size ? `?${q.toString()}` : ""}`;
-    // 🌍 Chi arriva QUI non ha l'app (con l'app installata il link la apre
-    // direttamente: App/Universal Links). La pagina parlava al device
-    // sbagliato — «se l'app è installata, aprilo da lì» — e buttava via il
-    // concetto, che è l'unica cosa che rende il link diverso dagli altri
-    // (audit «Atlas al setaccio», P3). Lingua dal browser: l'italiano fisso
-    // su una pagina pubblica è un'isola.
-    const it = (req.headers.get("accept-language") ?? "").toLowerCase().startsWith("it");
-    const t = it
-      ? {
-        lang: "it",
-        titolo: concept ? `«${concept}» ti aspetta` : "Il tuo ripasso ti aspetta",
-        corpo: concept
-          ? "Questo link riapre i tuoi appunti su questo concetto, dentro Fluera."
-          : "Questo link riapre un tuo quaderno dentro Fluera.",
-        gia: "Ho già l'app",
-        store: "Scarica Fluera",
-        nota: "Il ripasso che conta si fa qui: a libro chiuso, con la tua calligrafia.",
-      }
-      : {
-        lang: "en",
-        titolo: concept ? `“${concept}” is waiting` : "Your review is waiting",
-        corpo: concept
-          ? "This link reopens your notes on this concept, inside Fluera."
-          : "This link reopens one of your notebooks inside Fluera.",
-        gia: "I already have the app",
-        store: "Get Fluera",
-        nota: "The review that counts happens here: closed-book, in your own handwriting.",
-      };
-    return html(
-      200,
-      `<!doctype html><html lang="${t.lang}"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">${ICONE_SITO}
-<meta name="robots" content="noindex">
-<title>${esc(t.titolo)} — Fluera</title>
-<style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#F6F7F9;color:#1B2030}main{text-align:center;padding:2rem;max-width:26rem}h1{font-size:1.5rem;line-height:1.25}a.btn{display:inline-block;margin-top:1rem;padding:.7rem 1.4rem;border-radius:10px;background:#2F4DC0;color:#fff;text-decoration:none;font-weight:600}a.alt{display:inline-block;margin-top:1rem;color:#2F4DC0}p{color:#5C6475}@media(prefers-color-scheme:dark){body{background:#101319;color:#E8EAF1}p{color:#9AA3B5}}</style>
-</head><body><main>
-<h1>${esc(t.titolo)}</h1>
-<p>${esc(t.corpo)}</p>
-<a class="btn" href="${store}">${esc(t.store)}</a>
-<p style="margin-top:1.5rem"><a class="alt" href="${appHref}">${esc(t.gia)}</a></p>
-<p style="font-size:.85rem;margin-top:1.5rem">${esc(t.nota)}</p>
-</main></body></html>`,
-    );
+    return htmlPerDispositivo(renderRientro(u, concept, store, appHref));
   }
 
   // ── /get → «portami l'app», senza attribuzione ─────────────────────────────
@@ -1138,6 +1095,78 @@ const TESTI_IT = {
   tuttiGliAppuntiDi: (m: string) => `Tutti gli appunti di ${m} →`,
   tuttoCatalogo: "Tutto il catalogo →",
   riservata: ["Contenuto disponibile nell'app", "Questo contenuto è disponibile nell'app Fluera.", "Per vederlo apri il link in Fluera."],
+  // Le pagine di consegna (2026-09-30): scheda privata, invito, Ghost Map,
+  // rientro dall'assistente, collegamento OAuth del connettore.
+  installa: (computer: boolean): string => (computer ? "Non ce l'hai? Scopri Fluera" : "Non ce l'hai? Installa Fluera"),
+  privata: {
+    titolo: "Qualcuno ti ha condiviso una scheda di studio",
+    desc: "Una scheda privata su Fluera. Solo chi ha il link può vederla, e chi l'ha mandata può togliere l'accesso quando vuole.",
+    etichetta: "Privata · revocabile · non compare in nessuna ricerca",
+    rotto: "Il link sembra incompleto: manca la parte dopo il #. Chiedi a chi te l'ha mandato di reincollarlo per intero.",
+    anteprima: "Vedrai l'anteprima prima di decidere se installarla nei tuoi appunti.",
+    riapri: ["Se installi Fluera adesso, ", "riapri questo link", " dopo: la parte segreta non sopravvive al passaggio dallo store."],
+    og: ["Scheda privata", "Qualcuno ti ha condiviso i suoi appunti", "Solo chi ha il link può vederla"],
+  },
+  invito: {
+    titolo: "Ti hanno invitato a studiare insieme",
+    quaderno: "Un quaderno condiviso su Fluera: si scrive sullo stesso foglio, ognuno dal proprio dispositivo.",
+    tela: "Una tela condivisa su Fluera: due persone che scrivono sullo stesso foglio, in tempo reale.",
+    stanza: "Stanza",
+    scadeQuaderno: "L'invito scade: se lo apri più tardi, chiedi un link nuovo a chi te l'ha mandato.",
+    scadeTela: "La sessione è dal vivo: l'invito vale finché chi ti ha invitato tiene aperta la tela.",
+  },
+  mappa: {
+    titolo: "Una mappa di cosa manca",
+    aperta: "Una Ghost Map di Fluera: cosa è capito, cosa manca, e i collegamenti fra i concetti.",
+    oscurata: "Una Ghost Map di Fluera: la forma di quello che serve ancora studiare. I titoli sono oscurati.",
+    fatta: ["Fatta con ", " — il learning canvas che ti ri-studia."],
+    rimossa: ["Non più disponibile", "Questa mappa è stata rimossa o non è più pubblica."],
+  },
+  rientro: {
+    titolo: (concetto: string | null) => (concetto ? `«${concetto}» ti aspetta` : "Il tuo ripasso ti aspetta"),
+    corpo: (concetto: boolean): string =>
+      concetto ? "Questo link riapre i tuoi appunti su questo concetto, dentro Fluera." : "Questo link riapre un tuo quaderno dentro Fluera.",
+    gia: "Ho già l'app",
+    scarica: "Scarica Fluera",
+    nota: "Il ripasso che conta si fa qui: a libro chiuso, con la tua calligrafia.",
+  },
+  oauth: {
+    collega: "Collega il tuo assistente",
+    vuole: (app: string) => `${app} vuole collegarsi a Fluera`,
+    accedi: "Per continuare, accedi con l'account che usi su Fluera. Non serve una password: si entra con Google o Apple, come nell'app.",
+    accediBtn: "Accedi a Fluera",
+    password: "Fluera non riceve la tua password: l'accesso avviene sul provider che hai scelto.",
+    autorizzare: "Autorizzare?",
+    potra: (app: string) => `${app} potrà leggere il tuo stato di studio`,
+    consegnato: ["L'accesso verrà consegnato a ", ". Se il collegamento non l'hai avviato tu, annulla."],
+    questoComputer: "un programma su questo computer",
+    vedra: "Cosa vedrà:",
+    voci: [
+      "i tuoi corsi, con date d'esame ed esiti;",
+      "quanti concetti sono sopra soglia, a rischio o mai studiati;",
+      "i titoli dei concetti da ripassare e quando scadono;",
+      "i topic su cui vai peggio.",
+    ],
+    maiTitolo: "Cosa non vedrà mai:",
+    mai: "i tuoi appunti, la tua calligrafia, il testo riconosciuto, le immagini. E non può scrivere nulla: il ripasso che conta si fa dentro Fluera, a libro chiuso.",
+    autorizza: "Autorizza",
+    annulla: "Annulla",
+    come: (email: string) =>
+      `Accesso come ${email} · Puoi revocare quando vuoi da Impostazioni → Funzioni cognitive → Collega il tuo assistente.`,
+    nonValida: "Richiesta non valida",
+    tipoRisposta: "response_type deve essere «code».",
+    mancano: "Mancano client_id o redirect_uri.",
+    sconosciuta: ["Applicazione sconosciuta", "Questo client non è registrato."],
+    ritorno: ["Indirizzo di ritorno non valido", "Non corrisponde a quelli registrati."],
+    scaduta: "Sessione scaduta",
+    daCapo: "Riprova il collegamento dall'inizio.",
+    daCapoBreve: "Riprova dall'inizio.",
+    accessoKo: ["Accesso non riuscito", "Riprova il collegamento."],
+    ora: ["Riprova", "Non è stato possibile completare ora."],
+    manca: ["Manca un passaggio", "Prima attiva «Assistente AI collegato»"],
+    mancaPerche: "Il collegamento legge il tuo estratto di studio, e quell'estratto viene pubblicato solo con il tuo consenso.",
+    mancaPassi: ["Apri Fluera → Impostazioni → Privacy → ", "Assistente AI collegato", ", poi riprova da qui."],
+  },
   categorie: {
     study: "Studio",
     planner: "Agenda",
@@ -1258,6 +1287,76 @@ const TESTI_EN: Testi = {
   tuttiGliAppuntiDi: (m: string) => `All ${m} notes →`,
   tuttoCatalogo: "The whole catalogue →",
   riservata: ["Content available in the app", "This content is available in the Fluera app.", "To see it, open the link in Fluera."],
+  installa: (computer: boolean): string => (computer ? "Don't have it? Discover Fluera" : "Don't have it? Install Fluera"),
+  privata: {
+    titolo: "Someone shared a study template with you",
+    desc: "A private template on Fluera. Only people with the link can see it, and whoever sent it can remove access at any time.",
+    etichetta: "Private · revocable · never appears in any search",
+    rotto: "The link looks incomplete: the part after the # is missing. Ask whoever sent it to paste it again in full.",
+    anteprima: "You'll see a preview before deciding whether to add it to your notes.",
+    riapri: ["If you install Fluera now, ", "open this link again", " afterwards: the secret part doesn't survive the trip through the store."],
+    og: ["Private template", "Someone shared their notes with you", "Only people with the link can see it"],
+  },
+  invito: {
+    titolo: "You've been invited to study together",
+    quaderno: "A shared notebook on Fluera: everyone writes on the same page, each from their own device.",
+    tela: "A shared canvas on Fluera: two people writing on the same page, in real time.",
+    stanza: "Room",
+    scadeQuaderno: "The invitation expires: if you open it later, ask whoever sent it for a new link.",
+    scadeTela: "The session is live: the invitation works as long as whoever invited you keeps the canvas open.",
+  },
+  mappa: {
+    titolo: "A map of what's missing",
+    aperta: "A Fluera Ghost Map: what's understood, what's missing, and the links between concepts.",
+    oscurata: "A Fluera Ghost Map: the shape of what still needs studying. The titles are hidden.",
+    fatta: ["Made with ", " — the learning canvas that studies you back."],
+    rimossa: ["No longer available", "This map has been removed or is no longer public."],
+  },
+  rientro: {
+    titolo: (concetto: string | null) => (concetto ? `“${concetto}” is waiting` : "Your review is waiting"),
+    corpo: (concetto: boolean): string =>
+      concetto ? "This link reopens your notes on this concept, inside Fluera." : "This link reopens one of your notebooks inside Fluera.",
+    gia: "I already have the app",
+    scarica: "Get Fluera",
+    nota: "The review that counts happens here: closed-book, in your own handwriting.",
+  },
+  oauth: {
+    collega: "Connect your assistant",
+    vuole: (app: string) => `${app} wants to connect to Fluera`,
+    accedi: "To continue, sign in with the account you use on Fluera. No password needed: you sign in with Google or Apple, as in the app.",
+    accediBtn: "Sign in to Fluera",
+    password: "Fluera never receives your password: you sign in with the provider you chose.",
+    autorizzare: "Authorise?",
+    potra: (app: string) => `${app} will be able to read your study status`,
+    consegnato: ["Access will be handed to ", ". If you didn't start this connection, cancel."],
+    questoComputer: "a program on this computer",
+    vedra: "What it will see:",
+    voci: [
+      "your courses, with exam dates and results;",
+      "how many concepts are above the threshold, at risk or never studied;",
+      "the titles of the concepts to review and when they're due;",
+      "the topics you're weakest on.",
+    ],
+    maiTitolo: "What it will never see:",
+    mai: "your notes, your handwriting, the recognised text, the images. And it can't write anything: the review that counts happens inside Fluera, closed-book.",
+    autorizza: "Authorise",
+    annulla: "Cancel",
+    come: (email: string) =>
+      `Signed in as ${email} · You can revoke at any time from Settings → Cognitive features → Connect your assistant.`,
+    nonValida: "Invalid request",
+    tipoRisposta: "response_type must be “code”.",
+    mancano: "client_id or redirect_uri is missing.",
+    sconosciuta: ["Unknown application", "This client isn't registered."],
+    ritorno: ["Invalid return address", "It doesn't match the registered ones."],
+    scaduta: "Session expired",
+    daCapo: "Start the connection again from the beginning.",
+    daCapoBreve: "Start again from the beginning.",
+    accessoKo: ["Sign-in failed", "Try connecting again."],
+    ora: ["Try again", "It couldn't be completed right now."],
+    manca: ["One step missing", "First turn on “Connected AI assistant”"],
+    mancaPerche: "The connection reads your study digest, and that digest is published only with your consent.",
+    mancaPassi: ["Open Fluera → Settings → Privacy → ", "Connected AI assistant", ", then try again from here."],
+  },
   categorie: {
     study: "Study",
     planner: "Planner",
@@ -1490,7 +1589,18 @@ type Ordine = "consigliati" | "efficaci" | "votati" | "recenti";
 /// Le etichette stanno in TESTI (ordini, notaEfficaci): qui i valori del
 /// parametro, nell'ordine del menu.
 const ORDINI: ReadonlyArray<Ordine> = ["consigliati", "efficaci", "votati", "recenti"];
-const ordineDi = (s: string | null): Ordine => ORDINI.find((o) => o === s) ?? "consigliati";
+
+/// ⚠️ EFFICACIA PUBBLICA SPENTA (2026-09-30, docs/efficacia_dei_pack.md §9, E0).
+/// La misura di oggi (mastery-lift v2) confronta con il «non studiare» e cambia
+/// col piano di chi studia: non regge «Più efficaci», «Provati efficaci» né
+/// «+N% ritenzione». Si riaccende con EFFICACIA_PUBBLICA=true quando la v3 del
+/// documento è misurata e provata. Letta a ogni richiesta, come
+/// ANDROID_STORE_LIVE: i test la accendono per provare le superfici.
+const efficaciaPubblica = () => (Deno.env.get("EFFICACIA_PUBBLICA") ?? "") === "true";
+/// Gli ordini del menu: senza «efficaci» finché l'efficacia è spenta. Un
+/// ?ordine=efficaci allora torna la pagina base (301), come un ordine ignoto.
+const ordiniVisibili = (): ReadonlyArray<Ordine> => ORDINI.filter((o) => o !== "efficaci" || efficaciaPubblica());
+const ordineDi = (s: string | null): Ordine => ordiniVisibili().find((o) => o === s) ?? "consigliati";
 
 /// Due query con gli stessi parametri NELLO STESSO ORDINE, decodificati: «%20»
 /// e «+» sono la stessa cosa, «?pagina=2&ordine=x» e «?ordine=x&pagina=2» no.
@@ -1605,6 +1715,10 @@ const ICONE: Record<string, string> = {
     "M14.02 6 13.27 4.55C13.12 4.22 12.75 3.98 12.38 3.98H6C5.44 3.98 5.02 4.45 5.02 5.02V20.02C5.02 20.53 5.44 21 6 21C6.56 21 6.98 20.53 6.98 20.02V14.02H12L12.7 15.47C12.89 15.8 13.22 15.98 13.59 15.98H18.98C19.55 15.98 20.02 15.56 20.02 15V6.98C20.02 6.47 19.55 6 18.98 6H14.02ZM18 14.02H14.02L12.98 12H6.98V6H12L12.98 8.02H18V14.02Z",
   gavel:
     "M2.02 21H12C12.56 21 12.98 21.47 12.98 21.98C12.98 22.55 12.56 23.02 12 23.02H2.02C1.45 23.02 0.98 22.55 0.98 21.98C0.98 21.47 1.45 21 2.02 21ZM5.25 8.06 8.06 5.25 20.81 17.95C21.56 18.75 21.56 20.02 20.81 20.81C20.02 21.56 18.75 21.56 17.95 20.81L5.25 8.06ZM13.73 2.39 16.55 5.25C17.34 6 17.34 7.31 16.55 8.06L15.14 9.47L9.47 3.84L10.92 2.44C11.67 1.64 12.94 1.64 13.73 2.39ZM3.84 9.47 9.47 15.14 8.06 16.55C7.31 17.34 6.05 17.34 5.25 16.55L2.44 13.73C1.64 12.94 1.64 11.67 2.44 10.88L3.84 9.47Z",
+  group:
+    "M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z",
+  lock:
+    "M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z",
   grid:
     "M5.02 11.02H9C10.08 11.02 11.02 10.08 11.02 9V5.02C11.02 3.89 10.08 3 9 3H5.02C3.89 3 3 3.89 3 5.02V9C3 10.08 3.89 11.02 5.02 11.02ZM5.02 21H9C10.08 21 11.02 20.11 11.02 18.98V15C11.02 13.92 10.08 12.98 9 12.98H5.02C3.89 12.98 3 13.92 3 15V18.98C3 20.11 3.89 21 5.02 21ZM12.98 5.02V9C12.98 10.08 13.92 11.02 15 11.02H18.98C20.11 11.02 21 10.08 21 9V5.02C21 3.89 20.11 3 18.98 3H15C13.92 3 12.98 3.89 12.98 5.02ZM15 21H18.98C20.11 21 21 20.11 21 18.98V15C21 13.92 20.11 12.98 18.98 12.98H15C13.92 12.98 12.98 13.92 12.98 15V18.98C12.98 20.11 13.92 21 15 21Z",
   healing:
@@ -1812,7 +1926,7 @@ function schedaSeme(u: Testi, r: SemeWeb, griglia: boolean, subito = false): str
   // autore, come nell'app: il codice pseudonimo (Creator Terms 2.5), mai un
   // distintivo. «Fluera» e «Ufficiale» solo dal bit is_official.
   const autore = autoreMostrato(r);
-  const eff = griglia ? numero(r.efficacia_pct) : null;
+  const eff = griglia && efficaciaPubblica() ? numero(r.efficacia_pct) : null;
   const voto = numero(r.voto_medio);
   const n = numero(r.concept_count);
   return `<li><a class="scheda" href="${SHARE}/s/${esc(r.hash)}"${relSeNonIndicizzabile(r)}>${anteprima(r, subito, sopra, u)}<span class="testi"><h3 class="t"${attrContenuto(r, u)}>${esc(t)}</h3>${
@@ -1945,7 +2059,7 @@ function menuOrdina(u: Testi, base: string, ordine: Ordine, resto?: URLSearchPar
     if (o !== "consigliati") q.set("ordine", o);
     return `${base}${q.size ? `?${q}` : ""}`;
   };
-  const voci = ORDINI.map((o) =>
+  const voci = ordiniVisibili().map((o) =>
     `<li><a href="${esc(href(o))}#tutti"${o === ordine ? ` aria-current="true"` : ""}${
       o === "consigliati" ? "" : ` rel="nofollow"`
     }>${u.ordini[o]}${o === "efficaci" ? `<small>${u.notaEfficaci}</small>` : ""}</a></li>`
@@ -2167,6 +2281,8 @@ function vetrineDi(rows: VetrinaWeb[]): Vetrina[] {
   const valide = rows.filter((r) => r && typeof r.hash === "string" && HASH_INTERO_RE.test(r.hash));
   return [...new Set(valide.map((r) => r.vetrina))]
     .filter((n) => typeof n === "string" && Object.hasOwn(VETRINE, n))
+    // «Provati efficaci» solo con l'efficacia pubblica accesa (E0).
+    .filter((n) => n !== "piu_efficaci" || efficaciaPubblica())
     .map((nome) => ({
       nome,
       righe: valide.filter((r) => r.vetrina === nome).sort((a, b) => (Number(a.posto) || 0) - (Number(b.posto) || 0)),
@@ -2532,65 +2648,148 @@ function bumpGhostView(hash: string): void {
   if (er && typeof er.waitUntil === "function") er.waitUntil(p);
 }
 
-function renderGhostPage(row: GhostShareRow, hash: string): string {
+// ── Le pagine di consegna (2026-09-30) ──────────────────────────────────────
+// La scheda privata (/p), l'invito a studiare insieme (/collab/…), la Ghost
+// Map (/c/…), il rientro dall'assistente (/r/…), il connettore (/connect) e
+// il suo collegamento OAuth. Fino a questa data ognuna aveva la sua grafica —
+// nera e indaco le prime tre, grigia e blu le altre — e le prime tre erano
+// solo in italiano. Ora hanno la cornice del catalogo: carta, testata, piede.
+//
+// La lingua: queste pagine non vanno su Google (noindex o Disallow) e sono
+// consegne a UNA persona, quindi qui può venire dal browser (Accept-Language;
+// html() manda già Vary su quell'intestazione). Prima vince `lingua=` nel
+// link, se chi lo produce la conosce; senza niente, italiano.
+function uiRichiesta(req: Request, url?: URL): Ui {
+  const q = url?.searchParams.get("lingua");
+  if (q && /^[a-z]{2,3}$/.test(q)) return uiDi(q);
+  const primo = (req.headers.get("accept-language") ?? "").split(",")[0].trim().toLowerCase();
+  const m = primo.match(/^([a-z]{2,3})(?:-|$)/);
+  return m ? uiDi(m[1]) : "it";
+}
+
+/// Una pagina che sceglie i bottoni dal dispositivo (lo store di Android o di
+/// iOS) E la lingua dal browser: la cache di bordo deve tenerle separate su
+/// entrambe le intestazioni. Con il solo Vary: Accept-Language poteva servire
+/// a un iPhone il bottone di Google Play di chi l'aveva scaldata.
+function htmlPerDispositivo(body: string): Response {
+  const r = html(200, body);
+  r.headers.set("Vary", "Accept-Language, User-Agent");
+  return r;
+}
+
+const STILE_CONSEGNA = `
+    .consegna{max-width:30rem;margin:0 auto;padding:clamp(32px,9vw,72px) 0 8px;text-align:center}
+    .consegna.larga{max-width:56rem}
+    .consegna.testo{max-width:40rem;text-align:left}
+    .consegna .cerchio{display:grid;place-items:center;width:76px;height:76px;margin:0 auto 20px;border-radius:50%;background:var(--lavata);color:var(--inchiostro-2)}
+    .consegna .cerchio .ic{width:34px;height:34px}
+    .consegna.testo .cerchio{margin-left:0}
+    .consegna h1{font-size:clamp(1.75rem,7vw,2.5rem)}
+    .consegna h2{margin:32px 0 8px;font-size:1.3rem}
+    .consegna p{margin:14px 0 0;color:var(--inchiostro-2);font-size:1.0625rem}
+    .consegna .etichetta{display:inline-flex;margin:20px 0 0;padding:6px 12px;border:1px solid var(--filo-2);border-radius:999px;background:var(--taupe);color:var(--inchiostro);font:600 13px/1.3 var(--sans)}
+    .consegna .stanza{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.12em}
+    .consegna .cta{display:flex;flex-direction:column;gap:12px;margin-top:28px}
+    .consegna p.nota{font-size:14px}
+    .consegna .avviso{display:none;margin:22px 0 0;padding:12px 14px;border:1px solid #E2B8A5;border-radius:12px;background:#FBEDE6;color:#7A2E14;font-size:14px;text-align:left}
+    .consegna .mappa{display:block;width:100%;height:auto;margin:0 0 24px;border:1px solid var(--filo);border-radius:16px;background:var(--foglio)}
+    .consegna ul,.consegna ol{margin:12px 0 0;padding-left:1.25rem;color:var(--inchiostro-2);text-align:left}
+    .consegna li{margin-bottom:6px}
+    .consegna ul.chiedi{list-style:none;padding:0}
+    .consegna ul.chiedi li{padding:8px 12px;border:1px solid var(--filo-2);border-radius:10px;background:var(--foglio);color:var(--inchiostro)}
+    .consegna strong{color:var(--inchiostro)}
+    .consegna code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--lavata);border-radius:6px;padding:2px 6px;word-break:break-all;color:var(--inchiostro)}
+    .consegna form{display:flex;flex-direction:column;gap:12px;margin-top:28px}
+    .consegna button.btn{cursor:pointer;font-family:inherit}
+    .consegna button.btn.primary{border:0}
+    .consegna p.chi{margin-top:24px;padding-top:16px;border-top:1px solid var(--filo-2);font-size:13px}
+    @media(prefers-color-scheme:dark){.consegna .avviso{border-color:#6E3A28;background:#3A231A;color:#F4C9B8}}`;
+
+/// La testata senza «Catalogo» né «Entra nella beta»: nel collegamento di un
+/// assistente un invito a esplorare il sito è una distrazione.
+const testataMarchio = (u: Testi) =>
+  `<header class="testata"><div class="in"><a class="marchio" href="${u.sito}" aria-label="Fluera"><b aria-hidden="true">Flu</b><i aria-hidden="true">era</i></a></div></header>`;
+
+/// La cornice di ogni pagina di consegna: testata, una colonna, piede.
+function paginaConsegna(u: Testi, o: {
+  titolo: string;
+  descrizione: string;
+  corpo: string;
+  self?: string;
+  og?: { titolo: string; immagine: string; dimensioni: boolean; tipo: "website" | "article" };
+  noindex?: boolean;
+  noReferrer?: boolean;
+  soloMarchio?: boolean;
+  classe?: string;
+  script?: string;
+}): string {
+  const dentro = `${o.soloMarchio ? testataMarchio(u) : testata(u)}
+  <main class="in"><div class="consegna${o.classe ? ` ${o.classe}` : ""}">
+    ${o.corpo}
+  </div></main>
+  ${piede(u)}`;
+  const og = o.og
+    ? `
+  <meta property="og:type" content="${o.og.tipo}" />
+  <meta property="og:site_name" content="Fluera" />${o.self ? `\n  <meta property="og:url" content="${esc(o.self)}" />` : ""}
+  <meta property="og:title" content="${esc(o.og.titolo)}" />
+  <meta property="og:description" content="${esc(o.descrizione)}" />
+  <meta property="og:image" content="${esc(o.og.immagine)}" />${
+      o.og.dimensioni ? `\n  <meta property="og:image:width" content="1200" />\n  <meta property="og:image:height" content="630" />` : ""
+    }
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${esc(o.og.titolo)}" />
+  <meta name="twitter:description" content="${esc(o.descrizione)}" />
+  <meta name="twitter:image" content="${esc(o.og.immagine)}" />`
+    : "";
+  return `<!doctype html>
+<html lang="${u.lingua}">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}${
+    o.noindex === false ? "" : `\n  <meta name="robots" content="noindex" />`
+  }${o.noReferrer ? `\n  <meta name="referrer" content="no-referrer" />` : ""}
+  <title>${esc(o.titolo)} · Fluera</title>
+  <meta name="description" content="${esc(o.descrizione)}" />${o.self ? `\n  <link rel="canonical" href="${esc(o.self)}" />` : ""}${og}${
+    testaWeb(STILE_CONSEGNA)
+  }
+</head>
+<body>
+  ${spriteIcone(dentro)}${dentro}${o.script ? `\n  ${o.script}` : ""}
+</body>
+</html>`;
+}
+
+/// La pagina di una Ghost Map condivisa. Una mappa non è un artefatto da
+/// installare, è qualcosa da GUARDARE: niente bottone verso lo store come
+/// azione primaria — l'immagine è il contenuto, il link a Fluera è un invito
+/// discreto in fondo. Niente noindex: /c/ è in Disallow, e un noindex che il
+/// crawler non può leggere non cambierebbe niente.
+function renderGhostPage(row: GhostShareRow, hash: string, u: Testi): string {
   const self = `https://share.fluera.dev/c/${hash}`;
   const img = row.og_path ? ghostUrl(row.og_path) : OG_FALLBACK;
   const full = row.png_path ? ghostUrl(row.png_path) : img;
-  const title = "Una mappa di cosa manca";
-  const desc = row.summary_redacted === false
-    ? "Una Ghost Map di Fluera: cosa è capito, cosa manca, e i collegamenti fra i concetti."
-    : "Una Ghost Map di Fluera: la forma di quello che serve ancora studiare. I titoli sono oscurati.";
-
-  return `<!doctype html>
-<html lang="it">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
-  <title>${esc(title)} · Fluera</title>
-  <meta name="description" content="${esc(desc)}" />
-  <link rel="canonical" href="${esc(self)}" />
-  <meta property="og:type" content="article" />
-  <meta property="og:site_name" content="Fluera" />
-  <meta property="og:url" content="${esc(self)}" />
-  <meta property="og:title" content="${esc(title)}" />
-  <meta property="og:description" content="${esc(desc)}" />
-  <meta property="og:image" content="${esc(img)}" />
-  <meta property="og:image:width" content="1200" />
-  <meta property="og:image:height" content="630" />
-  <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="${esc(title)}" />
-  <meta name="twitter:description" content="${esc(desc)}" />
-  <meta name="twitter:image" content="${esc(img)}" />
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body { margin:0; background:#0a0a0b; color:#f4f4f5; font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-    .wrap { max-width:900px; margin:0 auto; padding:24px 20px 64px; }
-    .brand { display:flex; align-items:center; gap:8px; font-weight:600; color:#a1a1aa; margin-bottom:20px; }
-    .map { width:100%; border-radius:16px; border:1px solid #ffffff14; background:#18181b; display:block; }
-    h1 { font-size:24px; line-height:1.25; margin:22px 0 6px; }
-    p.desc { color:#d4d4d8; margin:0 0 20px; }
-    .foot { color:#71717a; font-size:13px; margin-top:26px; text-align:center; }
-    .foot a { color:#818cf8; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="brand">🗺️ Fluera · Ghost Map</div>
-    <img class="map" src="${esc(full)}" alt="${esc(title)}" loading="eager" />
-    <h1>${esc(title)}</h1>
-    <p class="desc">${esc(desc)}</p>
-    <p class="foot">Fatta con <a href="${SITE}">Fluera</a> — il learning canvas che ti ri-studia.</p>
-  </div>
-</body>
-</html>`;
+  const t = u.mappa;
+  const desc = row.summary_redacted === false ? t.aperta : t.oscurata;
+  return paginaConsegna(u, {
+    titolo: t.titolo,
+    descrizione: desc,
+    self,
+    og: { titolo: t.titolo, immagine: img, dimensioni: true, tipo: "article" },
+    noindex: false,
+    classe: "larga",
+    corpo: `<img class="mappa" src="${esc(full)}" alt="${esc(t.titolo)}" loading="eager" />
+    <h1>${esc(t.titolo)}</h1>
+    <p>${esc(desc)}</p>
+    <p class="nota">${esc(t.fatta[0])}<a href="${u.sito}">Fluera</a>${esc(t.fatta[1])}</p>`,
+  });
 }
 
 /// La card della scheda privata, nello stile del catalogo come quella dei
 /// pack: carta crema, il lucchetto in un cerchio come le pagine di stato, il
 /// titolo in Instrument Serif, il marchio in basso. Fino al 2026-09-29 era
 /// nera, con un indaco che il marchio non usa da nessuna parte.
-export function svgOgPrivato(): string {
+export function svgOgPrivato(u: Testi = TESTI_IT): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">` +
     `<rect width="1200" height="630" fill="${OG_CARTA}"/>` +
     `<circle cx="600" cy="190" r="78" fill="${OG_RIALZO}"/>` +
@@ -2602,9 +2801,9 @@ export function svgOgPrivato(): string {
     `<circle cx="60" cy="98" r="10" fill="${OG_RIALZO}"/>` +
     `<rect x="55" y="102" width="10" height="24" rx="5" fill="${OG_RIALZO}"/>` +
     `</g>` +
-    `<text x="600" y="358" text-anchor="middle" font-family="Instrument Serif" font-size="76" fill="${OG_INCHIOSTRO}">Scheda privata</text>` +
-    `<text x="600" y="420" text-anchor="middle" font-family="Noto Sans" font-size="30" fill="${OG_INCHIOSTRO_2}">Qualcuno ti ha condiviso i suoi appunti</text>` +
-    `<text x="600" y="462" text-anchor="middle" font-family="Noto Sans" font-size="30" fill="${OG_INCHIOSTRO_2}">Solo chi ha il link può vederla</text>` +
+    `<text x="600" y="358" text-anchor="middle" font-family="Instrument Serif" font-size="76" fill="${OG_INCHIOSTRO}">${esc(u.privata.og[0])}</text>` +
+    `<text x="600" y="420" text-anchor="middle" font-family="Noto Sans" font-size="30" fill="${OG_INCHIOSTRO_2}">${esc(u.privata.og[1])}</text>` +
+    `<text x="600" y="462" text-anchor="middle" font-family="Noto Sans" font-size="30" fill="${OG_INCHIOSTRO_2}">${esc(u.privata.og[2])}</text>` +
     marchioOg(600, 560, 36, "middle") +
     `</svg>`;
 }
@@ -2621,10 +2820,10 @@ export function svgOgPrivato(): string {
 // Degrada come la sorella: qualunque guasto del WASM o del font diventa un 302
 // verso il banner generico, mai un 500 su un link che qualcuno ha appena
 // toccato.
-async function privateOgResponse(): Promise<Response> {
+async function privateOgResponse(u: Testi): Promise<Response> {
   try {
     const { Resvg, font } = await loadResvg();
-    const resvg = new Resvg(svgOgPrivato(), opzioniResvg(font));
+    const resvg = new Resvg(svgOgPrivato(u), opzioniResvg(font));
     return new Response(new Uint8Array(resvg.render().asPng()), {
       status: 200,
       headers: {
@@ -2651,99 +2850,32 @@ async function privateOgResponse(): Promise<Response> {
 function renderPrivateSeedPage(
   storeUrl: string,
   platform: "android" | "ios" | "other",
+  u: Testi,
 ): string {
+  const t = u.privata;
   const self = "https://share.fluera.dev/p";
-  // ⚠️ NON `OG_FALLBACK`: quello e' il banner marketing della home, e chi
-  // riceveva un link privato vedeva in chat l'immagine del sito — il link si
-  // leggeva come «ti ho mandato la homepage». Questa card e' generica quanto
-  // quella (non puo' mostrare contenuto: il token e' nel frammento e qui non
-  // arriva) ma dice CHE COS'E', che e' la differenza fra generico e sbagliato.
-  const ogImg = "https://share.fluera.dev/p/og.png";
-  const title = "Qualcuno ti ha condiviso una scheda di studio";
-  // ⚠️ Descrizione VOLUTAMENTE priva di contenuto: e' cio' che l'unfurl mostra
-  // in chat. Dire di piu' significherebbe dirlo a tutto il gruppo.
-  const desc =
-    "Una scheda privata su Fluera. Solo chi ha il link puo' vederla, e chi l'ha " +
-    "mandata puo' togliere l'accesso quando vuole.";
-  const installLabel = platform === "other"
-    ? "Non ce l'hai? Scopri Fluera"
-    : "Non ce l'hai? Installa Fluera";
-
-  return `<!doctype html>
-<html lang="it">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
-  <meta name="robots" content="noindex" />
-  <meta name="referrer" content="no-referrer" />
-  <title>${esc(title)} \u00b7 Fluera</title>
-  <meta name="description" content="${esc(desc)}" />
-  <link rel="canonical" href="${esc(self)}" />
-  <meta property="og:type" content="website" />
-  <meta property="og:site_name" content="Fluera" />
-  <meta property="og:url" content="${esc(self)}" />
-  <meta property="og:title" content="${esc(title)}" />
-  <meta property="og:description" content="${esc(desc)}" />
-  <meta property="og:image" content="${esc(ogImg)}" />
-  <meta property="og:image:width" content="1200" />
-  <meta property="og:image:height" content="630" />
-  <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="${esc(title)}" />
-  <meta name="twitter:description" content="${esc(desc)}" />
-  <meta name="twitter:image" content="${esc(ogImg)}" />
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body { margin:0; background:#0a0a0b; color:#f4f4f5; font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-    .wrap { max-width:520px; margin:0 auto; padding:56px 20px 64px; text-align:center; }
-    .brand { display:flex; align-items:center; justify-content:center; gap:8px; font-weight:600; color:#a1a1aa; margin-bottom:32px; }
-    h1 { font-size:26px; line-height:1.25; margin:0 0 10px; }
-    p.desc { color:#d4d4d8; margin:0 0 8px; }
-    .lock { display:inline-block; font:600 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; letter-spacing:.04em; color:#a5b4fc; background:#ffffff0d; border:1px solid #ffffff14; border-radius:999px; padding:9px 16px; margin:16px 0 30px; }
-    .cta { display:block; padding:15px 20px; border-radius:14px; font-weight:600; text-decoration:none; margin-bottom:12px; }
-    .primary { background:#6366f1; color:#fff; }
-    .secondary { background:#ffffff0d; border:1px solid #ffffff1f; color:#e4e4e7; }
-    .note { color:#71717a; font-size:13px; margin-top:26px; }
-    .warn { display:none; color:#fca5a5; font-size:14px; background:#7f1d1d26; border:1px solid #7f1d1d; border-radius:12px; padding:14px 16px; margin:0 0 22px; }
-    .foot { color:#52525b; font-size:12px; margin-top:34px; }
-    .foot a { color:#818cf8; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="brand">\u270d\ufe0f Fluera</div>
-    <h1>${esc(title)}</h1>
-    <p class="desc">${esc(desc)}</p>
-    <div class="lock">\ud83d\udd12 Privata \u00b7 revocabile \u00b7 non compare in nessuna ricerca</div>
-
+  const og = `https://share.fluera.dev/p/og.png${u.lingua === "it" ? "" : `?lingua=${u.lingua}`}`;
+  return paginaConsegna(u, {
+    titolo: t.titolo,
+    descrizione: t.desc,
+    self,
+    og: { titolo: t.titolo, immagine: og, dimensioni: true, tipo: "website" },
+    noReferrer: true,
+    corpo: `<span class="cerchio">${ic("lock")}</span>
+    <h1>${esc(t.titolo)}</h1>
+    <p>${esc(t.desc)}</p>
+    <span class="etichetta">${esc(t.etichetta)}</span>
     <!-- Compare SOLO se il frammento manca: alcuni client accorciano un URL e
          tagliano via tutto dopo il '#'. Senza questo avviso il destinatario
          installerebbe l'app per poi non trovare nulla, e darebbe la colpa
          all'app invece che al link mutilato. -->
-    <div class="warn" id="rotto">
-      Il link sembra incompleto: manca la parte dopo il <code>#</code>.
-      Chiedi a chi te l'ha mandato di reincollarlo per intero.
+    <p class="avviso" id="rotto" role="alert">${esc(t.rotto)}</p>
+    <div class="cta">
+      <a class="btn primary" id="apri" href="#">${esc(u.apri)}</a>
+      <a class="btn ghost" href="${esc(storeUrl)}" rel="noreferrer">${esc(u.installa(platform === "other"))}</a>
     </div>
-
-    <a class="cta primary" id="apri" href="#">Apri in Fluera</a>
-    <a class="cta secondary" href="${esc(storeUrl)}" rel="noreferrer">${esc(installLabel)}</a>
-
-    <p class="note">
-      Vedrai l'anteprima prima di decidere se installarla nei tuoi appunti.
-      <br />
-      Se installi Fluera adesso, <strong>riapri questo link</strong> dopo:
-      la parte segreta non sopravvive al passaggio dallo store.
-    </p>
-
-    <p class="foot">
-      Fluera \u00b7 <a href="${esc(SITE)}">fluera.dev</a>
-    </p>
-  </div>
-
-  <script>
-    // Il token vive SOLO qui, nel browser. Non viene inviato da nessuna parte:
-    // non c'e' fetch, non c'e' analytics, e il bottone dello store porta
-    // rel="noreferrer". L'unica cosa che ne facciamo e' passarlo all'app.
+    <p class="nota">${esc(t.anteprima)}<br />${esc(t.riapri[0])}<strong>${esc(t.riapri[1])}</strong>${esc(t.riapri[2])}</p>`,
+    script: `<script>
     (function () {
       var tok = (location.hash || "").replace(/^#/, "");
       var apri = document.getElementById("apri");
@@ -2754,12 +2886,11 @@ function renderPrivateSeedPage(
         apri.style.display = "none";
       }
     })();
-  </script>
-</body>
-</html>`;
+  </script>`,
+  });
 }
 
-// ── Pagina di consegna di un invito alla collaborazione ──────────────────────
+// ── Pagina d'invito a studiare insieme ──────────────────────────────────────
 // Il server non sa NULLA della stanza: la sessione è P2P e il segnale passa da
 // Supabase Realtime, non da qui. Quindi questa pagina non può — e non deve —
 // promettere che la sessione sia ancora aperta. Dice cosa sta per succedere e
@@ -2771,98 +2902,55 @@ function renderPrivateSeedPage(
 // destinatario capisce l'invito PRIMA di decidere se toccarlo.
 //
 // noindex: le stanze sono private. Non c'è nulla da indicizzare e un roomId in
-// un motore di ricerca sarebbe un invito aperto a chiunque.
+// un motore di ricerca sarebbe un invito aperto a chiunque. no-referrer: il
+// token dell'invito vive nell'URL, e un clic sul bottone dello store lo
+// spedirebbe a Google o Apple nell'header Referer.
 function renderCollabPage(
   roomId: string,
   storeUrl: string,
   platform: "android" | "ios" | "other",
   inviteQuery: string,
+  u: Testi,
 ): string {
-  // Il canonical NON riporta la query: il token è un segreto, e un canonical
-  // che lo contenesse lo consegnerebbe a qualunque strumento legga l'HTML.
+  const t = u.invito;
   const self = `https://share.fluera.dev/collab/${roomId}`;
   const isCanvasInvite = inviteQuery.length > 0;
-  const title = "Ti hanno invitato a studiare insieme";
-  const desc = isCanvasInvite
-    ? "Un quaderno condiviso su Fluera: si scrive sullo stesso foglio, ognuno dal proprio dispositivo."
-    : "Una tela condivisa su Fluera: due persone che scrivono sullo stesso foglio, in tempo reale.";
-  // Lo schema custom sopravvive per UNA ragione precisa: i browser interni di
-  // Instagram/Facebook non onorano gli App Links, quindi chi HA l'app e apre
-  // l'invito lì dentro atterra qui invece che nell'app. Per loro questo
-  // bottone è l'unica via, ed è anche l'unico contesto in cui `fluera://`
-  // funziona meglio dell'https.
-  const appUrl = `fluera://collab/${roomId}${
-    isCanvasInvite ? `?${inviteQuery}` : ""
-  }`;
-  const installLabel = platform === "other"
-    ? "Non ce l'hai? Scopri Fluera"
-    : "Non ce l'hai? Installa Fluera";
-  // Un invito su tela salvata aspetta: si può installare l'app, fare l'accesso
-  // e riaprire il link entro la scadenza. Una stanza P2P no — vive solo finché
-  // l'altro tiene aperta la tela, e prometterlo sarebbe una bugia.
-  const durationNote = isCanvasInvite
-    ? "L'invito scade: se lo apri più tardi, chiedi un link nuovo a chi te l'ha mandato."
-    : "La sessione è dal vivo: l'invito vale finché chi ti ha invitato tiene aperta la tela.";
+  const desc = isCanvasInvite ? t.quaderno : t.tela;
+  const appUrl = `fluera://collab/${roomId}${isCanvasInvite ? `?${inviteQuery}` : ""}`;
+  return paginaConsegna(u, {
+    titolo: t.titolo,
+    descrizione: desc,
+    self,
+    og: { titolo: t.titolo, immagine: OG_FALLBACK, dimensioni: true, tipo: "website" },
+    noReferrer: true,
+    corpo: `<span class="cerchio">${ic("group")}</span>
+    <h1>${esc(t.titolo)}</h1>
+    <p>${esc(desc)}</p>
+    ${isCanvasInvite ? "" : `<span class="etichetta stanza">${esc(`${t.stanza} ${roomId}`.toUpperCase())}</span>`}
+    <div class="cta">
+      <a class="btn primary" href="${esc(appUrl)}">${esc(u.apri)}</a>
+      <a class="btn ghost" href="${esc(storeUrl)}">${esc(u.installa(platform === "other"))}</a>
+    </div>
+    <p class="nota">${esc(isCanvasInvite ? t.scadeQuaderno : t.scadeTela)}</p>`,
+  });
+}
 
-  return `<!doctype html>
-<html lang="it">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />${ICONE_SITO}
-  <meta name="robots" content="noindex" />
-  <!-- Il token dell'invito vive nell'URL. Senza questo, ogni clic sul bottone
-       dello store lo spedirebbe a Google/Apple nell'header Referer — e i
-       riferimenti finiscono nei log di terzi, dove non si revocano. -->
-  <meta name="referrer" content="no-referrer" />
-  <title>${esc(title)} · Fluera</title>
-  <meta name="description" content="${esc(desc)}" />
-  <link rel="canonical" href="${esc(self)}" />
-  <meta property="og:type" content="website" />
-  <meta property="og:site_name" content="Fluera" />
-  <meta property="og:url" content="${esc(self)}" />
-  <meta property="og:title" content="${esc(title)}" />
-  <meta property="og:description" content="${esc(desc)}" />
-  <meta property="og:image" content="${esc(OG_FALLBACK)}" />
-  <meta property="og:image:width" content="1200" />
-  <meta property="og:image:height" content="630" />
-  <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="${esc(title)}" />
-  <meta name="twitter:description" content="${esc(desc)}" />
-  <meta name="twitter:image" content="${esc(OG_FALLBACK)}" />
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body { margin:0; background:#0a0a0b; color:#f4f4f5; font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-    .wrap { max-width:520px; margin:0 auto; padding:56px 20px 64px; text-align:center; }
-    .brand { display:flex; align-items:center; justify-content:center; gap:8px; font-weight:600; color:#a1a1aa; margin-bottom:32px; }
-    h1 { font-size:26px; line-height:1.25; margin:0 0 10px; }
-    p.desc { color:#d4d4d8; margin:0 0 8px; }
-    .room { display:inline-block; font:600 14px/1 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.12em; color:#a5b4fc; background:#ffffff0d; border:1px solid #ffffff14; border-radius:999px; padding:9px 16px; margin:14px 0 30px; }
-    .cta { display:block; padding:15px 20px; border-radius:14px; font-weight:600; text-decoration:none; margin-bottom:12px; }
-    .primary { background:#6366f1; color:#fff; }
-    .secondary { background:#ffffff0d; border:1px solid #ffffff1f; color:#e4e4e7; }
-    .note { color:#71717a; font-size:13px; margin-top:26px; }
-    .foot { color:#52525b; font-size:12px; margin-top:34px; }
-    .foot a { color:#818cf8; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="brand">✍️ Fluera</div>
-    <h1>${esc(title)}</h1>
-    <p class="desc">${esc(desc)}</p>
-    ${
-    isCanvasInvite
-      ? ""
-      : `<div class="room">STANZA ${esc(roomId.toUpperCase())}</div>`
-  }
-    <a class="cta primary" href="${esc(appUrl)}">Apri in Fluera</a>
-    <a class="cta secondary" href="${esc(storeUrl)}">${esc(installLabel)}</a>
-    <p class="note">${esc(durationNote)}</p>
-    <p class="foot">Con <a href="${SITE}">Fluera</a> — il learning canvas che ti ri-studia.</p>
-  </div>
-</body>
-</html>`;
+/// /r/{canvasId}: il RIENTRO su una tela propria dall'assistente («Atlas
+/// risponde», §5). La pagina la vede chi apre il link senza l'app.
+function renderRientro(u: Testi, concetto: string | null, storeUrl: string, appHref: string): string {
+  const t = u.rientro;
+  return paginaConsegna(u, {
+    titolo: t.titolo(concetto),
+    descrizione: t.corpo(concetto !== null),
+    corpo: `<span class="cerchio">${ic("auto_stories")}</span>
+    <h1>${esc(t.titolo(concetto))}</h1>
+    <p>${esc(t.corpo(concetto !== null))}</p>
+    <div class="cta">
+      <a class="btn primary" href="${esc(storeUrl)}">${esc(t.scarica)}</a>
+      <a class="btn ghost" href="${esc(appHref)}">${esc(t.gia)}</a>
+    </div>
+    <p class="nota">${esc(t.nota)}</p>`,
+  });
 }
 
 // ── sitemap ──────────────────────────────────────────────────────────────────
@@ -3196,7 +3284,10 @@ export function svgOg(c: CartaOg, serif: MetricheFont, sans: MetricheFont): stri
     const t = c.voto !== null ? `  ·  ${c.concetti}` : c.concetti;
     numeri += `<text x="${Math.round(xn)}" y="${yn}" font-family="Noto Sans" font-size="28" fill="${OG_INCHIOSTRO_2}" xml:space="preserve">${esc(t)}</text>`;
   }
-  const tipo = conTitolo
+  // Il tipo sotto il titolo, tranne quando il titolo è il tipo stesso (un
+  // pack lasciato col titolo predefinito): scritto due volte sembra un errore.
+  const ripete = titolo.toLocaleLowerCase() === c.tipo.trim().toLocaleLowerCase();
+  const tipo = conTitolo && !ripete
     ? `<text x="${x0}" y="554" font-family="Noto Sans" font-size="24" fill="${OG_INCHIOSTRO_2}">${esc(c.tipo)}</text>`
     : "";
 
@@ -3699,8 +3790,9 @@ function renderPage(
   const voto = siVede ? numero(scheda?.voto_medio) : null;
   const voti = siVede ? numero(scheda?.voti) : null;
   const nConcetti = numero(scheda?.concept_count) ?? (concepts > 0 ? concepts : null);
-  const eff = numero(scheda?.efficacia_pct);
-  const effN = numero(scheda?.efficacia_studenti);
+  // E0: niente efficacia finché la misura v3 non c'è (efficaciaPubblica).
+  const eff = efficaciaPubblica() ? numero(scheda?.efficacia_pct) : null;
+  const effN = efficaciaPubblica() ? numero(scheda?.efficacia_studenti) : null;
   const cat = categoriaDi(scheda?.category, u);
   const tags = etichette(scheda);
   // Tre stati (186): NULL = non dichiarato, e non si scrive niente.
@@ -4225,11 +4317,10 @@ function paginaStato(
 
 /// Gli errori delle rotte fuori dal catalogo (OAuth del connettore, /c/…):
 /// dal 2026-09-29 con la stessa cornice di paginaStato — testata, piede, la
-/// grafica del catalogo — invece della pagina nera e viola di prima. In
-/// italiano: quelle rotte non sanno la lingua di chi arriva, e il loro testo
-/// è ancora solo italiano.
-function statusPage(headline: string, body: string): string {
-  return paginaStato(TESTI_IT, headline, body, { icona: "eco", azione: { testo: TESTI_IT.vaiAFluera, href: TESTI_IT.sito } });
+/// grafica del catalogo — invece della pagina nera e viola di prima. Nella
+/// lingua del browser, come le pagine di consegna (uiRichiesta).
+function statusPage(u: Testi, headline: string, body: string): string {
+  return paginaStato(u, headline, body, { icona: "eco", azione: { testo: u.vaiAFluera, href: u.sito } });
 }
 
 // ── Public report channel (DSA Art.16 / DMCA) ────────────────────────────────
@@ -6066,6 +6157,7 @@ function oauthRateLimited(key: string, max: number): boolean {
 // col codice di Supabase, lo si scambia per l'identità e si mostra la
 // schermata di consenso, che è l'unico punto in cui l'utente decide.
 async function oauthAuthorize(req: Request, url: URL): Promise<Response> {
+  const tx = TESTI[uiRichiesta(req)];
   const p = url.searchParams;
   const clientId = p.get("client_id") ?? "";
   const redirectUri = p.get("redirect_uri") ?? "";
@@ -6077,19 +6169,19 @@ async function oauthAuthorize(req: Request, url: URL): Promise<Response> {
   // 🔑 Gli errori PRIMA di aver validato client+redirect NON si rimandano al
   // redirect_uri (sarebbe un open redirect): si mostrano qui.
   if (p.get("response_type") !== "code") {
-    return htmlOauth(400, statusPage("Richiesta non valida", "response_type deve essere «code»."));
+    return htmlOauth(400, statusPage(tx, tx.oauth.nonValida, tx.oauth.tipoRisposta));
   }
   if (!clientId || !redirectUri) {
-    return htmlOauth(400, statusPage("Richiesta non valida", "Mancano client_id o redirect_uri."));
+    return htmlOauth(400, statusPage(tx, tx.oauth.nonValida, tx.oauth.mancano));
   }
   const client = await oauthLoadClient(clientId);
   if (!client) {
-    return htmlOauth(400, statusPage("Applicazione sconosciuta", "Questo client non è registrato."));
+    return htmlOauth(400, statusPage(tx, tx.oauth.sconosciuta[0], tx.oauth.sconosciuta[1]));
   }
   if (!client.redirect_uris.includes(redirectUri)) {
     // Confronto ESATTO, mai per prefisso: un match parziale è la via classica
     // per farsi consegnare i codici altrove.
-    return htmlOauth(400, statusPage("Indirizzo di ritorno non valido", "Non corrisponde a quelli registrati."));
+    return htmlOauth(400, statusPage(tx, tx.oauth.ritorno[0], tx.oauth.ritorno[1]));
   }
   // Da qui in poi l'errore può tornare al client, che è registrato.
   const back = (err: string, desc: string) => {
@@ -6137,7 +6229,7 @@ async function oauthAuthorize(req: Request, url: URL): Promise<Response> {
     "code_challenge", b64url(await sha256(await pkceVerifierFor(statoFirmato))),
   );
   sbAuth.searchParams.set("code_challenge_method", "s256");
-  return htmlOauth(200, renderOauthSignIn(client.client_name || clientId, sbAuth.toString()));
+  return htmlOauth(200, renderOauthSignIn(tx, client.client_name || clientId, sbAuth.toString()));
 }
 
 type OauthRichiesta = {
@@ -6272,46 +6364,35 @@ async function supabaseIdentityFromCode(
 }
 
 // ── Le due pagine del flusso ────────────────────────────────────────────────
-// Stile sobrio e coerente con la pagina /r; nessuno script di terze parti.
+// Nella cornice delle pagine di consegna (2026-09-30), con la sola testata del
+// marchio; nessuno script di terze parti. La lingua dal browser: il flusso
+// passa per la pagina di accesso del provider e torna qui, e l'unica cosa che
+// resta uguale lungo tutto il giro è il browser di chi si collega.
 
-const oauthShell = (titolo: string, corpo: string) =>
-  `<!doctype html><html lang="it"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">${ICONE_SITO}
-<meta name="robots" content="noindex">
-<title>${esc(titolo)} — Fluera</title>
-<style>
-body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#F6F7F9;color:#1B2030}
-main{max-width:26rem;padding:2rem;text-align:left}
-h1{font-size:1.4rem;line-height:1.25;margin:0 0 .5rem}
-p{color:#5C6475;line-height:1.6}
-ul{color:#5C6475;line-height:1.6;padding-left:1.1rem}
-li{margin-bottom:.35rem}
-.btn{display:inline-block;margin-top:1rem;padding:.7rem 1.4rem;border-radius:10px;background:#2F4DC0;color:#fff;text-decoration:none;font-weight:600;border:0;font-size:1rem;cursor:pointer}
-.ghost{background:none;color:#5C6475;font-weight:500;padding:.7rem 1rem}
-.who{font-size:.85rem;color:#5C6475;margin-top:1.5rem;padding-top:1rem;border-top:1px solid #DDE1E9}
-@media(prefers-color-scheme:dark){body{background:#101319;color:#E8EAF1}p,ul,.who{color:#9AA3B5}.who{border-color:#2A3040}}
-</style></head><body><main>${corpo}</main></body></html>`;
+const oauthShell = (u: Testi, titolo: string, corpo: string, classe?: string) =>
+  paginaConsegna(u, { titolo, descrizione: titolo, corpo, soloMarchio: true, classe });
 
-function renderOauthSignIn(clientName: string, signInUrl: string): string {
+function renderOauthSignIn(u: Testi, clientName: string, signInUrl: string): string {
+  const t = u.oauth;
   return oauthShell(
-    "Collega il tuo assistente",
-    `<h1>${esc(clientName)} vuole collegarsi a Fluera</h1>
-<p>Per continuare, accedi con l'account che usi su Fluera. Non serve una
-password: si entra con Google o Apple, come nell'app.</p>
-<p><a class="btn" href="${esc(signInUrl)}">Accedi a Fluera</a></p>
-<p class="who">Fluera non riceve la tua password: l'accesso avviene sul
-provider che hai scelto.</p>`,
+    u,
+    t.collega,
+    `<span class="cerchio">${ic("hub")}</span>
+    <h1>${esc(t.vuole(clientName))}</h1>
+    <p>${esc(t.accedi)}</p>
+    <div class="cta"><a class="btn primary" href="${esc(signInUrl)}">${esc(t.accediBtn)}</a></div>
+    <p class="chi">${esc(t.password)}</p>`,
   );
 }
 
 /// Dove finirà l'accesso, detto in parole. Il nome dell'app lo scrive chi la
 /// registra e può mentire (chiunque può chiamarsi «Claude»); l'host di ritorno
 /// è dove il codice arriva davvero.
-function destinatarioOauth(redirectUri: string): string {
+function destinatarioOauth(redirectUri: string, t: Testi): string {
   try {
     const u = new URL(redirectUri);
     if (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]") {
-      return "un programma su questo computer";
+      return t.oauth.questoComputer;
     }
     return u.host;
   } catch {
@@ -6319,51 +6400,45 @@ function destinatarioOauth(redirectUri: string): string {
   }
 }
 
-function renderOauthConsent(
+export function renderOauthConsent(
+  u: Testi,
   clientName: string,
   email: string,
   r: OauthRichiesta,
   statoConsenso: string,
 ): string {
-  // Identità e richiesta vengono solo dallo stato firmato; dal modulo
-  // /oauth/approve legge soltanto la scelta Autorizza/Annulla.
+  const t = u.oauth;
   return oauthShell(
-    "Autorizzare?",
-    `<h1>${esc(clientName)} potrà leggere il tuo stato di studio</h1>
-<p>L'accesso verrà consegnato a <strong>${esc(destinatarioOauth(r.redirectUri))}</strong>.
-Se il collegamento non l'hai avviato tu, annulla.</p>
-<p>Cosa vedrà:</p>
-<ul>
-  <li>i tuoi corsi, con date d'esame ed esiti;</li>
-  <li>quanti concetti sono sopra soglia, a rischio o mai studiati;</li>
-  <li>i titoli dei concetti da ripassare e quando scadono;</li>
-  <li>i topic su cui vai peggio.</li>
-</ul>
-<p><strong>Cosa non vedrà mai:</strong> i tuoi appunti, la tua calligrafia, il
-testo riconosciuto, le immagini. E non può scrivere nulla: il ripasso che
-conta si fa dentro Fluera, a libro chiuso.</p>
-<form method="POST" action="/oauth/approve">
-  <input type="hidden" name="req" value="${esc(statoConsenso)}">
-  <button class="btn" type="submit" name="ok" value="1">Autorizza</button>
-  <button class="btn ghost" type="submit" name="ok" value="0">Annulla</button>
-</form>
-<p class="who">Accesso come ${esc(email)} · Puoi revocare quando vuoi da
-Impostazioni → Funzioni cognitive → Collega il tuo assistente.</p>`,
+    u,
+    t.autorizzare,
+    `<h1>${esc(t.potra(clientName))}</h1>
+    <p>${esc(t.consegnato[0])}<strong>${esc(destinatarioOauth(r.redirectUri, u))}</strong>${esc(t.consegnato[1])}</p>
+    <p>${esc(t.vedra)}</p>
+    <ul>${t.voci.map((v) => `<li>${esc(v)}</li>`).join("")}</ul>
+    <p><strong>${esc(t.maiTitolo)}</strong> ${esc(t.mai)}</p>
+    <form method="POST" action="/oauth/approve">
+      <input type="hidden" name="req" value="${esc(statoConsenso)}">
+      <button class="btn primary" type="submit" name="ok" value="1">${esc(t.autorizza)}</button>
+      <button class="btn ghost" type="submit" name="ok" value="0">${esc(t.annulla)}</button>
+    </form>
+    <p class="chi">${esc(t.come(email))}</p>`,
+    "testo",
   );
 }
 
 // ── /oauth/callback — si torna da Supabase, si mostra il consenso ───────────
-async function oauthCallback(url: URL): Promise<Response> {
+async function oauthCallback(req: Request, url: URL): Promise<Response> {
+  const tx = TESTI[uiRichiesta(req)];
   const signed = url.searchParams.get("fluera_state") ?? "";
   const r = await oauthOpenState(signed);
   if (!r) {
     return await oauthExpiredRedirect(signed, false) ??
-      htmlOauth(400, statusPage("Sessione scaduta", "Riprova il collegamento dall'inizio."));
+      htmlOauth(400, statusPage(tx, tx.oauth.scaduta, tx.oauth.daCapo));
   }
   // Qui torna solo lo stato dell'ANDATA: uno che porta già un utente è uno
   // stato del consenso rimesso in circolo.
   if (r.userId !== undefined) {
-    return htmlOauth(400, statusPage("Sessione scaduta", "Riprova il collegamento dall'inizio."));
+    return htmlOauth(400, statusPage(tx, tx.oauth.scaduta, tx.oauth.daCapo));
   }
   const code = url.searchParams.get("code") ?? "";
   if (!code) {
@@ -6375,7 +6450,7 @@ async function oauthCallback(url: URL): Promise<Response> {
   }
   const ident = await supabaseIdentityFromCode(code, signed);
   if (!ident) {
-    return htmlOauth(400, statusPage("Accesso non riuscito", "Riprova il collegamento."));
+    return htmlOauth(400, statusPage(tx, tx.oauth.accessoKo[0], tx.oauth.accessoKo[1]));
   }
   const client = await oauthLoadClient(r.clientId);
   // 🔑 L'identità entra nella FIRMA qui, e da nessun'altra parte: è l'unico
@@ -6383,31 +6458,32 @@ async function oauthCallback(url: URL): Promise<Response> {
   const statoConsenso = await oauthSignState({ ...r, userId: ident.userId });
   return htmlOauth(
     200,
-    renderOauthConsent(client?.client_name || r.clientId, ident.email, r, statoConsenso),
+    renderOauthConsent(tx, client?.client_name || r.clientId, ident.email, r, statoConsenso),
   );
 }
 
 // ── /oauth/approve — l'utente ha deciso: si conia il codice ────────────────
 async function oauthApprove(req: Request): Promise<Response> {
   if (req.method !== "POST") return oauthError("invalid_request", "usa POST", 405);
+  const tx = TESTI[uiRichiesta(req)];
   let form: FormData;
   try {
     form = await req.formData();
   } catch {
-    return htmlOauth(400, statusPage("Richiesta non valida", "Riprova dall'inizio."));
+    return htmlOauth(400, statusPage(tx, tx.oauth.nonValida, tx.oauth.daCapoBreve));
   }
   const stato = String(form.get("req") ?? "");
   const r = await oauthOpenState(stato);
   if (!r) {
     return await oauthExpiredRedirect(stato, true) ??
-      htmlOauth(400, statusPage("Sessione scaduta", "Riprova dall'inizio."));
+      htmlOauth(400, statusPage(tx, tx.oauth.scaduta, tx.oauth.daCapoBreve));
   }
   // 🔴 L'utente viene SOLO dallo stato firmato del consenso. Un campo del
   // modulo lo scrive chiunque; lo stato dell'andata non ha utente e qui non
   // vale (vedi OauthRichiesta.userId).
   const uid = r.userId ?? "";
   if (!UUID_RE.test(uid)) {
-    return htmlOauth(400, statusPage("Sessione scaduta", "Riprova dall'inizio."));
+    return htmlOauth(400, statusPage(tx, tx.oauth.scaduta, tx.oauth.daCapoBreve));
   }
   const u = new URL(r.redirectUri);
   if (r.state) u.searchParams.set("state", r.state);
@@ -6423,13 +6499,14 @@ async function oauthApprove(req: Request): Promise<Response> {
   // server rifiuterebbe comunque) sarebbe una porta che non porta da nessuna
   // parte. Meglio dirlo qui.
   if (!await oauthUserHasDigestConsent(uid)) {
+    const t = tx.oauth;
     return htmlOauth(200, oauthShell(
-      "Manca un passaggio",
-      `<h1>Prima attiva «Assistente AI collegato»</h1>
-<p>Il collegamento legge il tuo estratto di studio, e quell'estratto viene
-pubblicato solo con il tuo consenso.</p>
-<p>Apri Fluera → Impostazioni → Privacy → <strong>Assistente AI
-collegato</strong>, poi riprova da qui.</p>`,
+      tx,
+      t.manca[0],
+      `<span class="cerchio">${ic("psychology_o")}</span>
+    <h1>${esc(t.manca[1])}</h1>
+    <p>${esc(t.mancaPerche)}</p>
+    <p>${esc(t.mancaPassi[0])}<strong>${esc(t.mancaPassi[1])}</strong>${esc(t.mancaPassi[2])}</p>`,
     ));
   }
 
@@ -6449,7 +6526,7 @@ collegato</strong>, poi riprova da qui.</p>`,
     }),
   });
   if (!ins || !ins.ok) {
-    return htmlOauth(503, statusPage("Riprova", "Non è stato possibile completare ora."));
+    return htmlOauth(503, statusPage(tx, tx.oauth.ora[0], tx.oauth.ora[1]));
   }
   u.searchParams.set("code", code);
   return Response.redirect(u.toString(), 302);
@@ -6686,32 +6763,29 @@ function renderConnectPage(req: Request): string {
       honp: "An empty list is never a promise. If nothing is due but you have concepts you have never opened and an exam coming, it tells you — instead of answering «you are all set». If there is not enough evidence to call a concept weak, it says it does not know, not that everything is fine. And counts never turn into percentages: «one at risk, two never seen» is something you can check; «you are at 62%» is not.",
       rev: "You can revoke at any time from the app. Revoking consent closes every session and deletes the stored digest. The review that counts still happens here: closed-book, in your own handwriting.",
     };
-  return `<!doctype html><html lang="${it ? "it" : "en"}"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">${ICONE_SITO}
-<title>${esc(t.h)} — Fluera</title>
-<style>body{font-family:system-ui,sans-serif;margin:0;background:#F6F7F9;color:#1B2030;line-height:1.6}
-main{max-width:38rem;margin:0 auto;padding:3rem 1.25rem 4rem}
-h1{font-size:1.7rem;line-height:1.2;margin:0 0 .75rem}h2{font-size:1.05rem;margin:2rem 0 .5rem}
-p,li{color:#5C6475}ol{padding-left:1.2rem}li{margin-bottom:.4rem}
-code{background:#EEF0F5;border-radius:5px;padding:.15em .4em;font-size:.9em;word-break:break-all}
-.note{margin-top:2rem;padding-top:1rem;border-top:1px solid #DDE1E9;font-size:.9rem}\nul.ask{list-style:none;padding:0;margin:.5rem 0 0}\nul.ask li{margin:0 0 .5rem;padding:.5rem .8rem;background:#EEF0F5;border-radius:8px;color:#1B2030}
-@media(prefers-color-scheme:dark){body{background:#101319;color:#E8EAF1}p,li{color:#9AA3B5}code{background:#1F2532}.note{border-color:#2A3040}ul.ask li{background:#1A1F29;color:#E8EAF1}}</style>
-</head><body><main>
-<h1>${esc(t.h)}</h1>
-<p>${t.p}</p>
-<h2>${esc(t.pre)}</h2>
-<ol><li>${t.s1}</li><li>${t.s2}</li></ol>
-<h2>${esc(t.web)}</h2>
-<p>${esc(t.webp)}</p>
-<p><code>${MCP_RESOURCE}</code></p>
-<h2>${esc(t.cli)}</h2>
-<p>${esc(t.clip)}</p>
-<p><code>claude mcp add --transport http fluera-study ${MCP_RESOURCE} --header "Authorization: Bearer fmcp_…"</code></p>
-<h2>${esc(t.ask)}</h2>
-<p>${esc(t.askp)}</p>
-<ul class="ask">${t.q.map((d) => `<li>${esc(d)}</li>`).join("")}</ul>
-<h2>${esc(t.hon)}</h2>
-<p>${esc(t.honp)}</p>
-<p class="note">${esc(t.rev)}</p>
-</main></body></html>`;
+  // La lingua come prima (italiano solo a chi lo chiede): /connect è aperta
+  // ai motori, e cambiarne la lingua predefinita cambierebbe cosa vede Google.
+  return paginaConsegna(TESTI[it ? "it" : "en"], {
+    titolo: t.h,
+    descrizione: t.h,
+    noindex: false,
+    classe: "testo",
+    corpo: `<span class="cerchio">${ic("hub")}</span>
+    <h1>${esc(t.h)}</h1>
+    <p>${t.p}</p>
+    <h2>${esc(t.pre)}</h2>
+    <ol><li>${t.s1}</li><li>${t.s2}</li></ol>
+    <h2>${esc(t.web)}</h2>
+    <p>${esc(t.webp)}</p>
+    <p><code>${MCP_RESOURCE}</code></p>
+    <h2>${esc(t.cli)}</h2>
+    <p>${esc(t.clip)}</p>
+    <p><code>claude mcp add --transport http fluera-study ${MCP_RESOURCE} --header "Authorization: Bearer fmcp_…"</code></p>
+    <h2>${esc(t.ask)}</h2>
+    <p>${esc(t.askp)}</p>
+    <ul class="chiedi">${t.q.map((d) => `<li>${esc(d)}</li>`).join("")}</ul>
+    <h2>${esc(t.hon)}</h2>
+    <p>${esc(t.honp)}</p>
+    <p class="chi">${esc(t.rev)}</p>`,
+  });
 }
